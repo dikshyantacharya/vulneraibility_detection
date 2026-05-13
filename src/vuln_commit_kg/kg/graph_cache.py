@@ -12,6 +12,8 @@ from .project_graph_builder import ProjectGraphBuilder
 from .codekg_adapter import build_codekg_graph, load_codekg_as_project_graph
 
 
+
+
 class GraphCache:
     def __init__(self, cfg: KGConfig, logger: logging.Logger):
         self.cfg = cfg
@@ -50,6 +52,28 @@ class GraphCache:
             data.pop(key, None)
         return data
 
+    def _refresh_codekg_dashboard(self, out_dir: Path, graph: ProjectGraph | None = None) -> None:
+        """Rewrite cached CodeKG dashboards with the current dashboard template.
+
+        CodeKG graphs are intentionally cached across runs.  Without this refresh,
+        a cached snapshot built with an older dashboard HTML would keep showing
+        the old UI even after the Python package was upgraded.  The graph
+        artifacts remain unchanged; only ``dashboard/index.html`` and
+        ``dashboard/graph_data.json`` are regenerated from ``graph.json``.
+        """
+        out_dir = Path(out_dir)
+        if not (out_dir / "graph.json").exists():
+            return
+        try:
+            from codekg.dashboard import rebuild_dashboard_from_graph_dir
+
+            dashboard_path = rebuild_dashboard_from_graph_dir(out_dir, logger=self.logger)
+            if graph is not None:
+                graph.manifest["dashboard_path"] = str(dashboard_path.resolve())
+                graph.manifest["codekg_graph_dir"] = str(out_dir.resolve())
+        except Exception as exc:  # dashboard refresh should not block analysis
+            self.logger.warning("Could not refresh cached CodeKG dashboard at %s: %s", out_dir, exc)
+
 
     # Compatibility helpers for older orchestration paths. New code should call
     # graph_dir()/get_or_build() with separate project and project_url values.
@@ -63,6 +87,7 @@ class GraphCache:
                 graph = load_codekg_as_project_graph(out_dir)
                 graph.manifest.setdefault("codekg_graph_dir", str(out_dir.resolve()))
                 graph.manifest.setdefault("dashboard_path", str((out_dir / "dashboard" / "index.html").resolve()))
+                self._refresh_codekg_dashboard(out_dir, graph)
                 return graph
             return load_graph(out_dir, logger=self.logger, log_every=self.cfg.graph_save_log_every)
         return None
@@ -96,6 +121,8 @@ class GraphCache:
                 graph = load_graph(out_dir, logger=self.logger, log_every=self.cfg.graph_save_log_every)
             graph.manifest.setdefault("codekg_graph_dir", str(out_dir.resolve()))
             graph.manifest.setdefault("dashboard_path", str((out_dir / "dashboard" / "index.html").resolve()))
+            if (out_dir / "graph.json").exists():
+                self._refresh_codekg_dashboard(out_dir, graph)
             return graph, out_dir, "loaded_cache"
         if not self.cfg.build_if_missing:
             raise FileNotFoundError(f"KG cache missing and build_if_missing=false: {out_dir}")
@@ -117,4 +144,6 @@ class GraphCache:
             # CodeKG and should be used for all new vulnerability-agent runs.
             builder = ProjectGraphBuilder(self.cfg, self.logger)
             graph = builder.build_and_save(snapshot_path, out_dir, project, project_url, commit_id)
+        if use_codekg:
+            self._refresh_codekg_dashboard(out_dir, graph)
         return graph, out_dir, "built"

@@ -86,11 +86,11 @@ button.ghost { background: transparent; }
 .kpi { background: #f8fafc; border: 1px solid #dbe4ef; border-radius: 12px; padding: 9px; }
 .kpi b { font-size: 18px; display: block; }
 .kpi span { color: var(--muted); font-size: 11px; }
-.legend-item, .checkline { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: #cad5e7; margin: 5px 0; }
+.legend-item, .checkline { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: #475569; margin: 5px 0; }
 .legend-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .swatch { width: 11px; height: 11px; border-radius: 4px; flex: 0 0 auto; }
 .checkline input { width: auto; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border: 1px solid #334057; border-radius: 999px; color: #475569; font-size: 11px; background: #0c1320; margin: 2px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border: 1px solid #cbd5e1; border-radius: 999px; color: #334155; font-size: 11px; background: #f8fafc; margin: 2px; }
 .warn { color: var(--warn); } .bad { color: var(--bad); } .good { color: var(--good); }
 #graphCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .toolbar { position: absolute; left: 16px; top: 16px; right: 16px; display: flex; gap: 8px; align-items: center; pointer-events: none; }
@@ -100,7 +100,7 @@ button.ghost { background: transparent; }
 .details h2 { font-size: 15px; margin: 0 0 8px; }
 .meta-grid { display: grid; grid-template-columns: 120px 1fr; gap: 6px 10px; font-size: 12px; }
 .meta-grid .key { color: var(--muted); }
-pre { margin: 0; overflow: auto; background: #050910; border: 1px solid #273244; border-radius: 12px; padding: 12px; color: #d8e4f2; font-size: 12px; line-height: 1.45; max-height: 360px; }
+pre { margin: 0; overflow: auto; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 12px; color: #0f172a; font-size: 12px; line-height: 1.45; max-height: 360px; }
 .table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .table th, .table td { border-bottom: 1px solid #e2e8f0; padding: 7px 5px; text-align: left; vertical-align: top; }
 .table th { color: var(--muted); font-weight: 600; }
@@ -110,14 +110,24 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
 .retrievalbox { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; min-height: 96px; resize: vertical; }
 .query-result { background:#f8fafc; border:1px solid #d6dee9; border-radius:12px; padding:9px; margin-top:9px; }
 .agent-query-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+.agent-query-card-top { border-color:#93c5fd; background:linear-gradient(180deg,#eff6ff,#ffffff); box-shadow:0 12px 34px rgba(37,99,235,.13); }
+.agent-query-card-top h2 { color:#1d4ed8; }
+.agent-query-card-top select { background:#ffffff; border-color:#93c5fd; }
+.agent-query-card-top button.primary { background:linear-gradient(180deg,#2563eb,#1d4ed8); color:#ffffff; }
 .agent-query-panel { border:1px solid #bfdbfe; background:#eff6ff; border-radius:12px; padding:9px; margin-bottom:10px; }
 .agent-query-panel .title { font-weight:700; color:#1e3a8a; margin-bottom:4px; }
-.query-result b { color:#d8e4f2; }
+.query-result b { color:#111827; }
 .pathbox { background:#f8fafc; border:1px solid #bfdbfe; border-radius:12px; padding:9px; margin-top:9px; }
 .path-step { border-left: 2px solid #2563eb; padding: 5px 0 5px 9px; margin: 4px 0; }
 .path-edge { color:#b45309; font-weight:650; }
 .path-node { color:#111827; font-weight:650; }
-kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1px 5px; color:#b8c7dd; font-size:10px; }
+kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1px 5px; color:#334155; font-size:10px; }
+
+.agent-query-status { color:#64748b; font-size:11px; line-height:1.35; margin-bottom:8px; }
+.agent-query-evidence { max-height:260px; overflow:auto; background:#ffffff; border:1px solid #dbe4ef; border-radius:12px; padding:8px; margin-top:8px; }
+.agent-query-evidence .snippet { border-top:1px solid #e2e8f0; padding-top:7px; margin-top:7px; }
+.agent-query-evidence code { white-space:pre-wrap; display:block; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:7px; color:#0f172a; }
+.agent-query-metrics { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; }
 .hidden { display: none !important; }
 @media (max-width: 1100px) { .app { grid-template-columns: 285px 1fr 340px; } }
 </style>
@@ -128,6 +138,21 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     <div class="header">
       <h1>CodeKG Explorer</h1>
       <div class="sub" id="projectSub">Standalone C/C++ code knowledge graph</div>
+    </div>
+
+    <div class="card agent-query-card-top" id="agentQueryCard">
+      <h2>Agent queries</h2>
+      <div id="agentQueryStatus" class="agent-query-status">Waiting for LLM-generated KG queries. This list updates while the audit runs.</div>
+      <label>LLM-generated KG query</label>
+      <select id="agentQuerySelect"><option value="">No saved queries yet</option></select>
+      <div class="row3" style="margin-top:8px">
+        <button class="primary" id="agentHighlightBtn">Highlight</button>
+        <button id="agentFilterBtn">Show only</button>
+        <button id="agentRefreshQueriesBtn">Refresh</button>
+      </div>
+      <button id="agentCopyQueryBtn" style="margin-top:8px">Copy query</button>
+      <div id="agentQueryPanel" class="agent-query-panel small" style="margin-top:10px">No audit query loaded.</div>
+      <div id="agentQueryEvidenceText" class="agent-query-evidence small">Select a saved agent query to see its source-grounded text output.</div>
     </div>
 
     <div class="card">
@@ -151,16 +176,6 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
         <button id="clearRetrievalQueryBtn">Clear slice</button>
       </div>
       <div id="retrievalResult" class="query-result small">Run a query to show only the retrieved evidence subgraph.</div>
-    </div>
-
-    <div class="card" id="agentQueryCard" style="display:none">
-      <h2>Agent query view</h2>
-      <div id="agentQueryPanel" class="agent-query-panel small">No audit query loaded.</div>
-      <div class="agent-query-actions">
-        <button class="primary" id="agentHighlightBtn">Highlight retrieved</button>
-        <button id="agentFilterBtn">Show only retrieved</button>
-      </div>
-      <button id="agentCopyQueryBtn" style="margin-top:8px">Copy query</button>
     </div>
 
     <div class="card">
@@ -296,7 +311,7 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     visibleNodeIds: new Set(), visibleEdgeIds: new Set(), nodeTypeEnabled: new Set(nodeTypes), edgeTypeEnabled: new Set(edgeTypes),
     retrievalNodeIds: new Set(), retrievalEdgeIds: new Set(), retrievalSummary: null,
     relationPathNodeIds: new Set(), relationPathEdgeIds: new Set(), relationPath: null, relationPathOnly: false,
-    externalQueryView: null, externalQueryMode: 'filter', externalQueryText: '',
+    externalQueryView: null, externalQueryMode: 'filter', externalQueryText: '', agentQueryViews: [], agentQueryIndexUpdatedAt: 0,
     transform: {x: 0, y: 0, scale: 1}, dragging: false, dragNode: null, lastMouse: {x:0,y:0}, simulationTicks: 0
   };
   const edgeById = new Map(edges.map(e => [e.id, e]));
@@ -313,7 +328,7 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
   function isFunction(n) { return n && n.type === 'Function' && n.attrs && n.attrs.defined !== false; }
   function initProject() {
     $('projectSub').textContent = `${manifest.project_name || 'project'} • backend: ${manifest.backend_used || 'unknown'} • ${nodes.length} nodes / ${edges.length} edges`;
-    setupFilters(); setupQueries(); renderQuality(); renderTopSignals();
+    setupFilters(); setupQueries(); setupAgentQueryHistory(); renderQuality(); renderTopSignals();
     const countRows = nodes.find(n => n.type === 'Function' && n.name === 'count_rows') || nodes.find(n => n.type === 'Function');
     if (countRows) { state.selectedNode = countRows; state.selectedFunction = countRows.name; state.activeView = 'function'; }
     const initial = DATA.initial_query || {};
@@ -324,6 +339,8 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
       computeView(); fitView(); updatePanels();
     }
     loadExternalQueryViewFromUrl();
+    loadAgentQueryIndex(true);
+    setInterval(() => loadAgentQueryIndex(true), 3000);
     animate();
   }
   function setupFilters() {
@@ -653,6 +670,97 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     }).join('');
     $('relationshipResult').innerHTML = `<b>Path to query target</b><br><span class="pill">anchor ${esc(anchor ? (anchor.name||anchor.label||anchor.id) : path.anchorId)}</span><span class="pill">selected ${esc(dest ? (dest.name||dest.label||dest.id) : path.destId)}</span><span class="pill">${path.edgeIds.length} hops</span><span class="pill">${esc(path.scope)}</span><hr/>${stepsHtml || '<span class="good">Selected node is the anchor.</span>'}<hr/><span class="small">Double-click another node to replace this path. Use <kbd>Path only</kbd> to hide all non-path evidence.</span>`;
   }
+  function agentViewFetchPath(entry) {
+    if (!entry) return '';
+    if (entry.relative_path) return entry.relative_path;
+    if (entry.path) return entry.path;
+    if (entry.filename) return `../retrieval_views/${entry.filename}`;
+    return '';
+  }
+  function agentViewKey(entry) { return String((entry && (entry.relative_path || entry.path || entry.filename || entry.label)) || ''); }
+  function agentOptionLabel(entry, i) {
+    const q = entry.query || {};
+    const label = entry.label || `Q${i+1}`;
+    const kind = entry.kind || q.kind || 'query';
+    const target = q.target_function || q.target || q.file || q.symbol || '';
+    const count = `${entry.node_count ?? entry.query_view_node_count ?? 0}n/${entry.edge_count ?? entry.query_view_edge_count ?? 0}e`;
+    return `${label} · ${kind}${target ? ' · ' + target : ''} · ${count}`;
+  }
+  function renderAgentQueryDropdown(previousKey='') {
+    const sel = $('agentQuerySelect');
+    if (!sel) return;
+    const views = state.agentQueryViews || [];
+    if (!views.length) {
+      sel.disabled = true;
+      sel.innerHTML = '<option value="">No saved queries yet</option>';
+      $('agentQueryStatus').textContent = 'Waiting for LLM-generated KG queries. The list refreshes automatically while the audit runs.';
+      return;
+    }
+    sel.disabled = false;
+    sel.innerHTML = views.map((v,i)=>`<option value="${i}">${esc(agentOptionLabel(v,i))}</option>`).join('');
+    let idx = views.findIndex(v => agentViewKey(v) === previousKey);
+    if (idx < 0) idx = views.length - 1;
+    sel.value = String(idx);
+    const updated = state.agentQueryIndexUpdatedAt ? new Date(state.agentQueryIndexUpdatedAt * 1000).toLocaleTimeString() : 'now';
+    $('agentQueryStatus').textContent = `${views.length} saved LLM KG quer${views.length === 1 ? 'y' : 'ies'} available · last update ${updated}`;
+  }
+  async function loadAgentQueryIndex(silent=false) {
+    const sel = $('agentQuerySelect');
+    const previous = sel && !sel.disabled && sel.value !== '' && state.agentQueryViews[Number(sel.value)] ? agentViewKey(state.agentQueryViews[Number(sel.value)]) : '';
+    try {
+      const r = await fetch(`../retrieval_views/index.json?ts=${Date.now()}`, {cache:'no-store'});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const idx = await r.json();
+      const views = Array.isArray(idx.views) ? idx.views : [];
+      state.agentQueryViews = views.filter(v => agentViewFetchPath(v));
+      state.agentQueryIndexUpdatedAt = Number(idx.updated_at || idx.last_updated_at || 0) || Math.floor(Date.now()/1000);
+      renderAgentQueryDropdown(previous);
+      if (!state.externalQueryView && state.agentQueryViews.length) await loadSelectedAgentQueryView('details');
+    } catch (err) {
+      if (!silent) $('agentQueryStatus').textContent = `No retrieval view index yet (${err.message || err}). Waiting for the agent to issue KG queries.`;
+      if (!state.agentQueryViews.length) renderAgentQueryDropdown(previous);
+    }
+  }
+  function renderAgentQueryEvidence(view) {
+    const diag = view.diagnostics || {};
+    const preview = Array.isArray(view.preview_nodes) ? view.preview_nodes : [];
+    const summary = view.evidence_summary || diag.evidence_summary || null;
+    const snippets = preview.slice(0,10).map((n,i) => {
+      const loc = [n.file, n.function, n.line_start ? `L${n.line_start}${n.line_end && n.line_end !== n.line_start ? '-' + n.line_end : ''}` : ''].filter(Boolean).join(' · ');
+      return `<div class="snippet"><b>${i+1}. ${esc(n.type || 'Node')} · ${esc(n.name || n.id || '')}</b><br><span class="small">${esc(loc)}</span><code>${esc(n.text || '')}</code></div>`;
+    }).join('');
+    $('agentQueryEvidenceText').innerHTML = `${summary ? `<b>Evidence summary</b><pre>${esc(JSON.stringify(summary, null, 2))}</pre>` : ''}${snippets || '<span class="small">No source preview nodes were stored for this query.</span>'}`;
+  }
+  async function loadSelectedAgentQueryView(mode='details') {
+    const sel = $('agentQuerySelect');
+    if (!sel || sel.disabled || sel.value === '') return null;
+    const entry = state.agentQueryViews[Number(sel.value)];
+    if (!entry) return null;
+    const path = agentViewFetchPath(entry);
+    try {
+      const r = await fetch(`${path}?ts=${Date.now()}`, {cache:'no-store'});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const view = await r.json();
+      state.externalQueryView = view;
+      state.externalQueryText = view.query_text || JSON.stringify(view.query || {}, null, 2);
+      $('agentQueryPanel').innerHTML = summarizeExternalQueryView(view);
+      $('retrievalQuery').value = state.externalQueryText;
+      renderAgentQueryEvidence(view);
+      if (mode === 'highlight' || mode === 'filter') applyExternalQueryView(mode, true);
+      else updateStatus();
+      return view;
+    } catch (err) {
+      $('agentQueryPanel').innerHTML = `<span class="bad">Could not load selected agent query:</span><br>${esc(path)}<br>${esc(err.message || err)}`;
+      return null;
+    }
+  }
+  function setupAgentQueryHistory() {
+    const sel = $('agentQuerySelect');
+    if (sel) sel.addEventListener('change', () => loadSelectedAgentQueryView('details'));
+    const refresh = $('agentRefreshQueriesBtn');
+    if (refresh) refresh.onclick = () => loadAgentQueryIndex(false);
+  }
+
   function summarizeExternalQueryView(view) {
     const q = view.query || {};
     const diag = view.diagnostics || {};
@@ -660,8 +768,11 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     const nodeCount = (view.node_ids || []).length || diag.retrieved_node_count || 0;
     const edgeCount = (view.edge_ids || []).length || diag.retrieved_edge_count || 0;
     const reason = view.reason || q.reason || 'No explicit LLM reason was recorded for this query.';
-    const funcs = (diag.important_functions || []).slice(0, 8).map(x=>`<span class="pill">${esc(x)}</span>`).join('');
-    return `<div class="title">${esc(label)} · ${esc(q.kind || view.kind || 'codekg query')}</div><div><b>Why queried:</b> ${esc(reason)}</div><div style="margin-top:6px"><b>Retrieved:</b> ${esc(nodeCount)} nodes / ${esc(edgeCount)} edges</div><div style="margin-top:6px"><b>Query:</b><pre>${esc(JSON.stringify(q, null, 2))}</pre></div><div><b>Important functions</b><br>${funcs || '<span class="small">none</span>'}</div>`;
+    const funcs = (diag.important_functions || []).slice(0, 10).map(x=>`<span class="pill">${esc(x)}</span>`).join('');
+    const vars = (diag.important_variables || []).slice(0, 12).map(x=>`<span class="pill">${esc(x)}</span>`).join('');
+    const nodeDist = Object.entries(diag.node_type_counts || {}).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([k,v])=>`<span class="pill">${esc(k)} ${esc(v)}</span>`).join('');
+    const edgeDist = Object.entries(diag.edge_type_counts || {}).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([k,v])=>`<span class="pill">${esc(k)} ${esc(v)}</span>`).join('');
+    return `<div class="title">${esc(label)} · ${esc(q.kind || view.kind || 'codekg query')}</div><div><b>Why queried:</b> ${esc(reason)}</div><div style="margin-top:6px"><b>Retrieved:</b> ${esc(nodeCount)} nodes / ${esc(edgeCount)} edges</div><div style="margin-top:6px"><b>Query:</b><pre>${esc(view.query_text || JSON.stringify(q, null, 2))}</pre></div><div style="margin-top:6px"><b>Important functions</b><br>${funcs || '<span class="small">none</span>'}</div><div style="margin-top:6px"><b>Important variables</b><br>${vars || '<span class="small">none</span>'}</div><div style="margin-top:6px"><b>Node distribution</b><br><div class="agent-query-metrics">${nodeDist || '<span class="small">none</span>'}</div></div><div style="margin-top:6px"><b>Edge type distribution</b><br><div class="agent-query-metrics">${edgeDist || '<span class="small">none</span>'}</div></div>`;
   }
   function applyExternalQueryView(mode='filter', fit=true) {
     const view = state.externalQueryView; if (!view) return;
@@ -673,6 +784,7 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     state.activeView = mode === 'highlight' ? 'query_highlight' : 'retrieval_query';
     $('agentQueryCard').style.display = '';
     $('agentQueryPanel').innerHTML = summarizeExternalQueryView(view);
+    renderAgentQueryEvidence(view);
     $('retrievalQuery').value = state.externalQueryText || JSON.stringify(view.query || {}, null, 2);
     $('retrievalResult').innerHTML = `<b>${esc(mode === 'highlight' ? 'Highlight mode' : 'Filter mode')}</b><br>${esc(state.retrievalNodeIds.size)} retrieved nodes / ${esc(state.retrievalEdgeIds.size)} retrieved edges from ${esc(view.label || 'agent query')}.`;
     computeView(true); if (fit) fitView(); updatePanels();
@@ -970,8 +1082,8 @@ kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1
     $('neighborhoodTable').innerHTML = '';
   }
   function copyText(txt) { navigator.clipboard?.writeText(txt).then(()=>{ $('statusBar').textContent='Copied.'; }).catch(()=>{ $('statusBar').textContent='Copy failed.'; }); }
-  $('agentHighlightBtn').onclick = () => applyExternalQueryView('highlight', true);
-  $('agentFilterBtn').onclick = () => applyExternalQueryView('filter', true);
+  $('agentHighlightBtn').onclick = () => loadSelectedAgentQueryView('highlight').then(v => { if (!v && state.externalQueryView) applyExternalQueryView('highlight', true); });
+  $('agentFilterBtn').onclick = () => loadSelectedAgentQueryView('filter').then(v => { if (!v && state.externalQueryView) applyExternalQueryView('filter', true); });
   $('agentCopyQueryBtn').onclick = () => copyText(state.externalQueryText || $('retrievalQuery').value || '');
   $('runRetrievalQueryBtn').onclick = () => runRetrievalQuery(true);
   $('retrievalQuery').addEventListener('keydown', ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') runRetrievalQuery(true); });
