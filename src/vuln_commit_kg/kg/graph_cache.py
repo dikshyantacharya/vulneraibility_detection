@@ -22,8 +22,33 @@ class GraphCache:
     def graph_dir(self, project_url: str | None, project: str | None, commit_id: str | None) -> Path:
         project_key = f"{safe_name(project or project_url or 'unknown_project', 48)}__{url_hash(project_url or project or 'unknown')}"
         commit_key = safe_name(commit_id or "unknown_commit", 48)
-        cfg_hash = stable_hash(self.cfg.model_dump(mode="json"), 12)
+        cfg_hash = stable_hash(self._build_fingerprint(), 12)
         return self.root / project_key / commit_key / self.cfg.version / cfg_hash
+
+    def _build_fingerprint(self) -> dict:
+        """Return only graph-content-affecting config for cache identity.
+
+        Runtime paths and UI toggles must not create a new persistent cache key.
+        Without this, every run-local output directory or dashboard option would
+        force a fresh Joern build for the same project snapshot.
+        """
+        try:
+            data = dict(self.cfg.model_dump(mode="json"))
+        except Exception:
+            data = dict(getattr(self.cfg, "__dict__", {}) or {})
+        runtime_only = {
+            "cache_dir", "cache_mode", "persistent_cache_dir", "kg_out_dir",
+            "open_dashboard", "force_rebuild", "build_if_missing",
+            "joern_home", "joern_work_dir", "joern_timeout", "joern_timeout_seconds",
+            "progress_log_every_files", "progress_log_every_seconds",
+            "graph_save_log_every", "log_file_start", "slow_file_log_seconds",
+            "storage_export_graphml", "storage_export_csv", "storage_export_query_examples",
+            "visualization_enabled", "visualization_max_nodes", "visualization_max_edges",
+            "visualization_default_neighborhood_depth",
+        }
+        for key in runtime_only:
+            data.pop(key, None)
+        return data
 
 
     # Compatibility helpers for older orchestration paths. New code should call

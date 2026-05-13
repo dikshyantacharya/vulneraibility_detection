@@ -6,6 +6,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -192,9 +193,15 @@ def joern_available(extra_roots: Optional[Iterable[str | os.PathLike[str]]] = No
 
 def _command_for_subprocess(path: str) -> List[str]:
     p = Path(path)
-    # PowerShell scripts are not directly executable from subprocess on Windows.
-    if platform.system().lower().startswith("win") and p.suffix.lower() == ".ps1":
-        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)]
+    if platform.system().lower().startswith("win"):
+        suffix = p.suffix.lower()
+        # PowerShell scripts are not directly executable from subprocess on Windows.
+        if suffix == ".ps1":
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)]
+        # Running .bat/.cmd via cmd.exe is more robust when paths contain spaces
+        # and avoids CreateProcess quirks around batch-file execution.
+        if suffix in {".bat", ".cmd"}:
+            return ["cmd.exe", "/d", "/s", "/c", str(p)]
     return [str(p)]
 
 
@@ -220,14 +227,24 @@ class JoernBackend(HeuristicBackend):
         out_dir = out_dir.resolve()
         joern_dir = out_dir / "joern"
         joern_dir.mkdir(parents=True, exist_ok=True)
+        # On Windows, the run-local cache path can easily exceed legacy path
+        # limits once the run id, project key, commit hash, KG version, and config
+        # hash are nested together. Java/Joern and subprocess.Popen may then fail
+        # before the process starts with: [WinError 267] The directory name is
+        # invalid. Keep canonical artifacts under out_dir/joern, but run Joern in
+        # a short temporary workspace and copy raw artifacts back afterwards.
+        joern_work_dir = self._select_joern_work_dir(joern_dir, logger)
+        joern_work_dir.mkdir(parents=True, exist_ok=True)
+        if joern_work_dir != joern_dir:
+            logger.info("Using short Joern workspace: %s -> %s", joern_work_dir, joern_dir)
         tools = detect_joern()
         java_info = detect_java()
         logger.info("Joern availability check: %s", json.dumps(tools, indent=2))
         logger.info("Java/JVM check: %s", json.dumps(java_info, indent=2))
         tools_ok = bool(tools.get("joern-parse") and tools.get("joern-export"))
         joern_ok = bool(tools_ok and java_info.get("ok"))
-        cpg_path = joern_dir / "cpg.bin"
-        export_dir = joern_dir / "export"
+        cpg_path = joern_work_dir / "cpg.bin"
+        export_dir = joern_work_dir / "export"
         command_results = []
 
         parse_succeeded = False
@@ -248,16 +265,16 @@ class JoernBackend(HeuristicBackend):
                 _command_for_subprocess(tools["joern-parse"]) + [str(source_dir), "--language", self.language],  # type: ignore[index]
             ]
             for parse_cmd in parse_attempts:
-                result = self._run(parse_cmd, logger, cwd=joern_dir)
+                result = self._run(parse_cmd, logger, cwd=joern_work_dir)
                 command_results.append(result)
-                discovered = self._discover_cpg(joern_dir, preferred=cpg_path)
+                discovered = self._discover_cpg(joern_work_dir, preferred=cpg_path)
                 if result.get("returncode") == 0 and discovered:
                     cpg_path = discovered
                     parse_succeeded = True
                     logger.info("Joern CPG detected: %s", cpg_path)
                     break
             if not parse_succeeded:
-                logger.warning("Joern parse did not produce an expected CPG file in %s", joern_dir)
+                logger.warning("Joern parse did not produce an expected CPG file in %s", joern_work_dir)
 
             if cpg_path.exists():
                 export_attempts = [
@@ -269,7 +286,7 @@ class JoernBackend(HeuristicBackend):
                 for cmd in export_attempts:
                     if export_dir.exists():
                         shutil.rmtree(export_dir, ignore_errors=True)
-                    result = self._run(cmd, logger, cwd=joern_dir)
+                    result = self._run(cmd, logger, cwd=joern_work_dir)
                     command_results.append(result)
                     if result.get("returncode") == 0:
                         export_succeeded = True
@@ -285,6 +302,7 @@ class JoernBackend(HeuristicBackend):
             logger.warning("%s Using deterministic fallback extractor.", msg)
 
         if self.strict and not parse_succeeded:
+            self._sync_joern_workspace(joern_work_dir, joern_dir, logger)
             raise RuntimeError(
                 "Joern was required, but joern-parse did not successfully create a CPG. "
                 f"Check {joern_dir / 'joern_commands.log'} and build.log for command output."
@@ -304,7 +322,10 @@ class JoernBackend(HeuristicBackend):
         diagnostics.counters["joern_parse_succeeded"] = int(parse_succeeded)
         diagnostics.counters["joern_export_succeeded"] = int(export_succeeded)
         diagnostics.tool_versions["joern_language_requested"] = self.language
+        diagnostics.tool_versions["joern_work_dir"] = str(joern_work_dir)
+        diagnostics.tool_versions["joern_artifact_dir"] = str(joern_dir)
         diagnostics.tool_versions["joern_import"] = joern_import_stats
+        self._sync_joern_workspace(joern_work_dir, joern_dir, logger)
         diagnostics.counters["joern_imported_files"] = int(joern_import_stats.get("files", 0) if joern_import_stats else 0)
         diagnostics.counters["joern_imported_nodes"] = int(joern_import_stats.get("nodes", 0) if joern_import_stats else 0)
         diagnostics.counters["joern_imported_edges"] = int(joern_import_stats.get("edges", 0) if joern_import_stats else 0)
@@ -316,6 +337,46 @@ class JoernBackend(HeuristicBackend):
                 "message": "Joern CPG parse succeeded. Normalized dashboard artifacts include deterministic CodeKG entities plus imported Joern export overlay nodes/edges where the export format was readable. Raw Joern artifacts are stored under out_dir/joern.",
             })
         return graph, diagnostics
+
+    def _select_joern_work_dir(self, joern_dir: Path, logger) -> Path:
+        """Return a subprocess-safe workspace for Joern.
+
+        The canonical raw Joern artifact directory remains out_dir/joern. On
+        Windows, using that directory as cwd can fail when the path is long.
+        """
+        if not platform.system().lower().startswith("win"):
+            return joern_dir
+        try:
+            resolved = joern_dir.resolve()
+        except Exception:
+            resolved = joern_dir
+        # Keep well below MAX_PATH because Joern creates nested files below cwd.
+        if len(str(resolved)) < 180:
+            return joern_dir
+        base = Path(tempfile.gettempdir()) / "codekg_joern"
+        base.mkdir(parents=True, exist_ok=True)
+        workspace = Path(tempfile.mkdtemp(prefix="run_", dir=str(base)))
+        logger.warning(
+            "Joern artifact path is long on Windows (%d chars); running Joern in short workspace %s and copying artifacts back to %s",
+            len(str(resolved)), workspace, joern_dir,
+        )
+        return workspace
+
+    def _sync_joern_workspace(self, joern_work_dir: Path, joern_dir: Path, logger) -> None:
+        if joern_work_dir == joern_dir:
+            return
+        try:
+            joern_dir.mkdir(parents=True, exist_ok=True)
+            for child in joern_work_dir.iterdir():
+                dest = joern_dir / child.name
+                if child.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(child, dest)
+                else:
+                    shutil.copy2(child, dest)
+        except Exception as exc:  # pragma: no cover - platform/path dependent
+            logger.warning("Could not copy Joern workspace artifacts back to %s: %s", joern_dir, exc)
 
     def _discover_cpg(self, joern_dir: Path, preferred: Path) -> Optional[Path]:
         if preferred.exists():

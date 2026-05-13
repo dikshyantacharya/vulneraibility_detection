@@ -893,3 +893,37 @@ vckg build-project-kg --source C:\path\to\project --out outputs\kg_inspect\proje
 vckg query-kg --graph-dir outputs\kg_inspect\project --kind semantic_facts --target-function count_rows --risk-terms pointer,size,bounds --write-dashboard
 vckg run --config configs/46_curriculum_1_function_agentic_proof_joern_qwen397b.yaml
 ```
+
+## CodeKG cache and live dashboard links
+
+The integrated pipeline now uses a persistent CodeKG cache by default:
+
+```yaml
+kg:
+  cache_mode: persistent
+  persistent_cache_dir: outputs/runs/_codekg_cache
+  force_rebuild: false
+```
+
+This means the same project / resolved commit / graph-build configuration is built once and reused in later runs. The live dashboard is served at the short URL printed by `vckg run`, normally:
+
+```text
+http://127.0.0.1:8765/current/
+```
+
+Open the **Projects / KG** tab. After each project snapshot finishes building or loading, the table shows compact links named `dashboard`, `manifest`, `graph.json`, and `artifacts`. The `dashboard` link opens the CodeKG Explorer for that exact project/commit snapshot.
+
+To force a fresh CodeKG build for debugging:
+
+```yaml
+kg:
+  force_rebuild: true
+```
+
+To return to per-run CodeKG artifacts:
+
+```yaml
+kg:
+  cache_mode: run_local
+  kg_out_dir: codekg
+```

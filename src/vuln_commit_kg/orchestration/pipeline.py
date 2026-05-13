@@ -57,13 +57,24 @@ class CommitKGPipeline:
         self.cfg = cfg
         self.config_path = config_path
         self.run_dir = make_run_dir(cfg.experiment.output_root, cfg.experiment.name)
-        # Integrated CodeKG artifacts are run-local by default so each audit
-        # report can link to its exact graph, manifest, retrieval views, and
-        # dashboard without relying on a shared global cache.
-        kg_out_dir = str(getattr(cfg.kg, "kg_out_dir", "") or "").strip()
-        if kg_out_dir:
-            kg_root = Path(kg_out_dir)
-            cfg.kg.cache_dir = str(kg_root if kg_root.is_absolute() else (self.run_dir / kg_root))
+        # CodeKG artifacts default to a persistent project/commit/config cache,
+        # so repeated runs reuse the same Joern-enhanced graph instead of
+        # rebuilding it under every run directory.  Set kg.cache_mode=run_local
+        # to recover the earlier per-run artifact layout.
+        kg_cache_mode = str(getattr(cfg.kg, "cache_mode", "persistent") or "persistent").strip().lower()
+        if kg_cache_mode == "run_local":
+            kg_out_dir = str(getattr(cfg.kg, "kg_out_dir", "") or "").strip()
+            if kg_out_dir:
+                kg_root = Path(kg_out_dir)
+                cfg.kg.cache_dir = str(kg_root if kg_root.is_absolute() else (self.run_dir / kg_root))
+        else:
+            # Persistent CodeKG cache belongs under the project cache/ tree, not
+            # under outputs/runs.  Prefer an explicit persistent_cache_dir, but
+            # otherwise honor the existing kg.cache_dir setting from older
+            # configs such as cache/kg.
+            persistent_root = str(getattr(cfg.kg, "persistent_cache_dir", None) or getattr(cfg.kg, "cache_dir", "") or "cache/codekg").strip()
+            kg_root = Path(persistent_root)
+            cfg.kg.cache_dir = str(kg_root if kg_root.is_absolute() else Path(persistent_root))
         self.logger = setup_logging(self.run_dir, cfg.logging.level, cfg.logging.rich)
         save_config(cfg, self.run_dir / "resolved_config.yaml")
         self.sample_graph_keys: dict[str, tuple[str, str]] = {}
@@ -193,7 +204,13 @@ class CommitKGPipeline:
             }
             write_json(report_path.parent / "live_status.json", status_payload)
             if self.live:
-                self.live.update_sample(sample.sample_id, {"agent_report": str(report_path), "agent_report_rel": rel, "current_report_stage": stage, "report_revision": opts.get("report_revision")})
+                self.live.update_sample(sample.sample_id, {
+                    "agent_report": str(report_path),
+                    "agent_report_rel": rel,
+                    "agent_report_url": self._dashboard_url_for_path(report_path),
+                    "current_report_stage": stage,
+                    "report_revision": opts.get("report_revision"),
+                })
             return str(report_path)
         except Exception:
             self.logger.debug("live_agent_report_write_failed | sample=%s | stage=%s", sample.sample_id, stage, exc_info=True)
@@ -660,6 +677,7 @@ class CommitKGPipeline:
                         "usage_estimated": pred.usage.get("estimated", True),
                         "agent_report": trace.report_path,
                         "agent_report_rel": Path(trace.report_path).relative_to(self.run_dir).as_posix() if trace.report_path else None,
+                        "agent_report_url": self._dashboard_url_for_path(trace.report_path) if trace.report_path else None,
                         "posthoc_commit_audit": trace.posthoc_commit_audit,
                         "validation_notes": pred.validation_notes,
                         "final_validator_modifications": trace.final_validator_modifications,
@@ -1246,6 +1264,7 @@ class CommitKGPipeline:
             "usage_estimated": pred.usage.get("estimated", True),
             "agent_report": trace.report_path,
             "agent_report_rel": Path(trace.report_path).relative_to(self.run_dir).as_posix() if trace.report_path else None,
+            "agent_report_url": self._dashboard_url_for_path(trace.report_path) if trace.report_path else None,
             "posthoc_commit_audit": trace.posthoc_commit_audit,
             "validation_notes": pred.validation_notes,
             "final_validator_modifications": trace.final_validator_modifications,
@@ -1724,6 +1743,15 @@ class CommitKGPipeline:
         if extra:
             data.update(extra)
         self.live.update_project(key, data)
+
+
+    def _dashboard_url_for_path(self, path: Any) -> str | None:
+        if not self.live or not path:
+            return None
+        try:
+            return self.live.url_for_path(path)
+        except Exception:
+            return None
 
     def _sample_text_len(self, sample: SecVulEvalSample | None) -> int:
         if sample is None:
@@ -2687,6 +2715,9 @@ class CommitKGPipeline:
             }
             manifest = getattr(graph, "manifest", {}) or {}
             graph_dir_size = dir_size_bytes(Path(graph_dir)) if graph_dir else None
+            dashboard_path = manifest.get("dashboard_path") or (str(Path(graph_dir) / "dashboard" / "index.html") if graph_dir else None)
+            manifest_path = str(Path(graph_dir) / "manifest.json") if graph_dir else None
+            graph_json_path = str(Path(graph_dir) / "graph.json") if graph_dir else None
             self._dashboard_update_kg_status(first.project, first.project_url, getattr(repo_status, "repo_key", None), resolved_commit, status=f"kg_{graph_status}", extra={
                 "graph_status": graph_status,
                 "graph_dir": str(graph_dir) if graph_dir else None,
@@ -2697,7 +2728,15 @@ class CommitKGPipeline:
                 "num_files": manifest.get("num_files"),
                 "num_functions": manifest.get("num_functions"),
                 "num_statements": manifest.get("num_statements"),
+                "backend_used": manifest.get("backend_used") or manifest.get("backend"),
+                "fallback_used": manifest.get("fallback_used"),
+                "cache_hit": graph_status == "loaded_cache",
                 "kg_build_seconds_manifest": manifest.get("elapsed_seconds"),
+                "dashboard_path": dashboard_path,
+                "dashboard_url": self._dashboard_url_for_path(dashboard_path),
+                "manifest_url": self._dashboard_url_for_path(manifest_path),
+                "graph_json_url": self._dashboard_url_for_path(graph_json_path),
+                "graph_dir_url": self._dashboard_url_for_path(graph_dir),
                 "snapshot_status": snapshot_status.__dict__,
                 "snapshot_path": str(snapshot_path),
                 "samples": [s.sample_id for s in group],
@@ -3130,6 +3169,10 @@ class CommitKGPipeline:
                     )
                     if not classify:
                         raise
+            manifest = (getattr(graph, "manifest", {}) or {}) if graph else {}
+            dashboard_path = manifest.get("dashboard_path") or (str(Path(graph_dir) / "dashboard" / "index.html") if graph_dir else None)
+            manifest_path = str(Path(graph_dir) / "manifest.json") if graph_dir else None
+            graph_json_path = str(Path(graph_dir) / "graph.json") if graph_dir else None
             project_runtime = {
                 "project": first.project,
                 "project_url": first.project_url,
@@ -3150,10 +3193,18 @@ class CommitKGPipeline:
                 "graph_dir": str(graph_dir) if graph_dir else None,
                 "graph_dir_size_bytes": dir_size_bytes(graph_dir) if graph_dir else 0,
                 "kg_wall_seconds": kg_wall_seconds,
-                "kg_build_seconds_manifest": (getattr(graph, "manifest", {}) or {}).get("seconds") if graph else None,
-                "num_files": (getattr(graph, "manifest", {}) or {}).get("num_files") if graph else None,
-                "num_functions": (getattr(graph, "manifest", {}) or {}).get("num_functions") if graph else None,
-                "num_statements": (getattr(graph, "manifest", {}) or {}).get("num_statements") if graph else None,
+                "kg_build_seconds_manifest": manifest.get("seconds") or manifest.get("elapsed_seconds"),
+                "num_files": manifest.get("num_files"),
+                "num_functions": manifest.get("num_functions"),
+                "num_statements": manifest.get("num_statements"),
+                "backend_used": manifest.get("backend_used") or manifest.get("backend"),
+                "fallback_used": manifest.get("fallback_used"),
+                "cache_hit": graph_status == "loaded_cache",
+                "dashboard_path": dashboard_path,
+                "dashboard_url": self._dashboard_url_for_path(dashboard_path),
+                "manifest_url": self._dashboard_url_for_path(manifest_path),
+                "graph_json_url": self._dashboard_url_for_path(graph_json_path),
+                "graph_dir_url": self._dashboard_url_for_path(graph_dir),
                 "num_nodes": len(getattr(graph, "nodes", []) or []),
                 "num_edges": len(getattr(graph, "edges", []) or []),
                 "source_file_filters": list(self.cfg.kg.include_file_types),
@@ -3163,8 +3214,8 @@ class CommitKGPipeline:
             self.project_runtime_rows.append(project_runtime)
             append_jsonl(self.run_dir / "project_runtime.jsonl", project_runtime)
             if self.live:
-                self.live.update_project(f"{first.project}@{resolved_commit[:12] if resolved_commit else '?'}", {**project_runtime, "status": graph_status})
-                self.live.event("kg.ready", {"project": first.project, "commit": resolved_commit[:12] if resolved_commit else None, "graph_status": graph_status})
+                self.live.update_project(f"{first.project}@{resolved_commit[:12] if resolved_commit else '?'}", {**project_runtime, "status": f"kg_{graph_status}", "kg_status": f"kg_{graph_status}"})
+                self.live.event("kg.ready", {"project": first.project, "commit": resolved_commit[:12] if resolved_commit else None, "graph_status": graph_status, "dashboard_url": project_runtime.get("dashboard_url")})
             context[(project_key, resolved_commit)] = {
                 "repo_status": repo_status,
                 "snapshot_status": snapshot_status,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +41,17 @@ def _link_if_exists(path: str | None, label: str, root: Path | None = None) -> s
     if not path:
         return ""
     p = Path(path)
-    href = path
+    href = str(path)
     try:
         if root is not None and p.exists():
-            href = p.relative_to(root).as_posix()
+            # Relative links work both in the file:// report and through the
+            # live dashboard server, even when the persistent KG cache is a
+            # sibling of the run directory rather than inside the sample report.
+            href = os.path.relpath(p.resolve(), Path(root).resolve()).replace("\\", "/")
+        elif p.exists():
+            href = p.resolve().as_uri()
     except Exception:
-        href = path
+        href = str(path)
     return f'<a href="{html.escape(str(href))}">{html.escape(label)}</a>'
 
 

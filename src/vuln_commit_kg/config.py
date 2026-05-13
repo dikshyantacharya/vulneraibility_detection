@@ -202,10 +202,15 @@ class KGConfig(BaseModel):
     backend: Literal["auto", "lightweight", "heuristic", "joern", "tree-sitter", "treesitter", "tree_sitter"] = "auto"
     use_codekg: bool = True
 
-    # By default each run writes CodeKG artifacts below <run_dir>/codekg.
-    # The pipeline rewrites cache_dir to that run-local directory unless this is
-    # absolute or kg_out_dir is explicitly disabled.
-    cache_dir: str = "cache/kg"
+    # CodeKG cache policy.  The default is persistent across runs, like the
+    # original project-level KG cache: one project/commit/config snapshot is
+    # built once and then reused by later runs.  The default location is under
+    # the repository-level cache/ tree, alongside repo mirrors, worktrees, and
+    # inventory statistics.
+    cache_mode: Literal["persistent", "run_local"] = "persistent"
+    cache_dir: str = "cache/codekg"
+    persistent_cache_dir: str | None = None
+    # In run_local mode only, this is resolved relative to the current run dir.
     kg_out_dir: str = "codekg"
     open_dashboard: bool = False
     joern_home: str | None = None
