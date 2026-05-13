@@ -51,70 +51,73 @@ DASHBOARD_TEMPLATE = r'''<!doctype html>
 <title>CodeKG Explorer</title>
 <style>
 :root {
-  --bg: #080b12;
-  --panel: #101622;
-  --panel2: #141d2c;
-  --text: #e6edf7;
-  --muted: #8fa0b8;
-  --line: #273244;
-  --accent: #73d0ff;
-  --good: #7ee787;
-  --warn: #f2cc60;
-  --bad: #ff7b72;
-  --shadow: 0 18px 50px rgba(0,0,0,.35);
+  --bg: #f7f9fc;
+  --panel: #ffffff;
+  --panel2: #f1f5f9;
+  --text: #111827;
+  --muted: #64748b;
+  --line: #d6dee9;
+  --accent: #2563eb;
+  --good: #047857;
+  --warn: #b45309;
+  --bad: #b91c1c;
+  --shadow: 0 18px 50px rgba(15,23,42,.12);
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 .app { display: grid; grid-template-columns: 330px minmax(420px, 1fr) 410px; height: 100vh; width: 100vw; overflow: hidden; }
-.sidebar, .details { background: linear-gradient(180deg, rgba(17,25,39,.98), rgba(11,16,25,.98)); border-right: 1px solid var(--line); overflow-y: auto; padding: 18px; }
+.sidebar, .details { background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,250,252,.98)); border-right: 1px solid var(--line); overflow-y: auto; padding: 18px; }
 .details { border-right: none; border-left: 1px solid var(--line); }
-.stage { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at 15% 10%, rgba(115,208,255,.12), transparent 25%), radial-gradient(circle at 85% 80%, rgba(126,231,135,.08), transparent 28%), #080b12; }
+.stage { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at 15% 10%, rgba(37,99,235,.08), transparent 26%), radial-gradient(circle at 85% 80%, rgba(16,185,129,.07), transparent 28%), #f8fafc; }
 .header { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
 .header h1 { margin: 0; font-size: 19px; letter-spacing: .2px; }
 .header .sub { color: var(--muted); font-size: 12px; line-height: 1.45; }
-.card { background: rgba(16,22,34,.84); border: 1px solid rgba(86,110,145,.35); border-radius: 16px; padding: 13px; margin-bottom: 13px; box-shadow: 0 10px 32px rgba(0,0,0,.2); }
-.card h2 { margin: 0 0 10px; font-size: 13px; letter-spacing: .35px; text-transform: uppercase; color: #b8c7dd; }
+.card { background: rgba(255,255,255,.92); border: 1px solid rgba(148,163,184,.45); border-radius: 16px; padding: 13px; margin-bottom: 13px; box-shadow: 0 10px 32px rgba(15,23,42,.08); }
+.card h2 { margin: 0 0 10px; font-size: 13px; letter-spacing: .35px; text-transform: uppercase; color: #475569; }
 label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 6px; }
-input, select, button, textarea { width: 100%; border-radius: 10px; border: 1px solid #334057; background: #0b111c; color: var(--text); padding: 9px 10px; outline: none; }
-button { cursor: pointer; background: linear-gradient(180deg, #162238, #111827); border-color: #3a4b66; font-weight: 650; font-size: 12px; transition: transform .1s ease, border-color .12s ease, background .12s ease; }
+input, select, button, textarea { width: 100%; border-radius: 10px; border: 1px solid #cbd5e1; background: #ffffff; color: var(--text); padding: 9px 10px; outline: none; }
+button { cursor: pointer; background: linear-gradient(180deg, #ffffff, #f1f5f9); border-color: #cbd5e1; font-weight: 650; font-size: 12px; transition: transform .1s ease, border-color .12s ease, background .12s ease; }
 button:hover { transform: translateY(-1px); border-color: var(--accent); }
-button.primary { background: linear-gradient(180deg, #185a7d, #123a59); border-color: #267eb0; }
+button.primary { background: linear-gradient(180deg, #2563eb, #1d4ed8); border-color: #1d4ed8; color: #ffffff; }
 button.ghost { background: transparent; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.kpi { background: #0c1320; border: 1px solid #233148; border-radius: 12px; padding: 9px; }
+.kpi { background: #f8fafc; border: 1px solid #dbe4ef; border-radius: 12px; padding: 9px; }
 .kpi b { font-size: 18px; display: block; }
 .kpi span { color: var(--muted); font-size: 11px; }
 .legend-item, .checkline { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: #cad5e7; margin: 5px 0; }
 .legend-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .swatch { width: 11px; height: 11px; border-radius: 4px; flex: 0 0 auto; }
 .checkline input { width: auto; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border: 1px solid #334057; border-radius: 999px; color: #b8c7dd; font-size: 11px; background: #0c1320; margin: 2px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border: 1px solid #334057; border-radius: 999px; color: #475569; font-size: 11px; background: #0c1320; margin: 2px; }
 .warn { color: var(--warn); } .bad { color: var(--bad); } .good { color: var(--good); }
 #graphCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .toolbar { position: absolute; left: 16px; top: 16px; right: 16px; display: flex; gap: 8px; align-items: center; pointer-events: none; }
-.toolbar .group { pointer-events: auto; backdrop-filter: blur(10px); background: rgba(11,17,28,.8); border: 1px solid rgba(86,110,145,.45); border-radius: 14px; box-shadow: var(--shadow); padding: 8px; display: flex; gap: 7px; align-items: center; }
+.toolbar .group { pointer-events: auto; backdrop-filter: blur(10px); background: rgba(255,255,255,.90); border: 1px solid rgba(148,163,184,.55); border-radius: 14px; box-shadow: var(--shadow); padding: 8px; display: flex; gap: 7px; align-items: center; }
 .toolbar button { width: auto; min-width: 72px; padding: 8px 10px; }
-.statusbar { position: absolute; left: 16px; bottom: 16px; max-width: calc(100% - 32px); pointer-events: none; background: rgba(11,17,28,.82); border: 1px solid rgba(86,110,145,.45); border-radius: 14px; padding: 9px 12px; color: #b8c7dd; font-size: 12px; backdrop-filter: blur(10px); box-shadow: var(--shadow); }
+.statusbar { position: absolute; left: 16px; bottom: 16px; max-width: calc(100% - 32px); pointer-events: none; background: rgba(255,255,255,.92); border: 1px solid rgba(148,163,184,.55); border-radius: 14px; padding: 9px 12px; color: #475569; font-size: 12px; backdrop-filter: blur(10px); box-shadow: var(--shadow); }
 .details h2 { font-size: 15px; margin: 0 0 8px; }
 .meta-grid { display: grid; grid-template-columns: 120px 1fr; gap: 6px 10px; font-size: 12px; }
 .meta-grid .key { color: var(--muted); }
 pre { margin: 0; overflow: auto; background: #050910; border: 1px solid #273244; border-radius: 12px; padding: 12px; color: #d8e4f2; font-size: 12px; line-height: 1.45; max-height: 360px; }
 .table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.table th, .table td { border-bottom: 1px solid #222d3f; padding: 7px 5px; text-align: left; vertical-align: top; }
+.table th, .table td { border-bottom: 1px solid #e2e8f0; padding: 7px 5px; text-align: left; vertical-align: top; }
 .table th { color: var(--muted); font-weight: 600; }
 .small { font-size: 11px; color: var(--muted); line-height: 1.45; }
 hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
 .querybox { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; min-height: 54px; }
 .retrievalbox { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; min-height: 96px; resize: vertical; }
-.query-result { background:#07111d; border:1px solid #24354c; border-radius:12px; padding:9px; margin-top:9px; }
+.query-result { background:#f8fafc; border:1px solid #d6dee9; border-radius:12px; padding:9px; margin-top:9px; }
+.agent-query-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+.agent-query-panel { border:1px solid #bfdbfe; background:#eff6ff; border-radius:12px; padding:9px; margin-bottom:10px; }
+.agent-query-panel .title { font-weight:700; color:#1e3a8a; margin-bottom:4px; }
 .query-result b { color:#d8e4f2; }
-.pathbox { background:#07111d; border:1px solid #2b4361; border-radius:12px; padding:9px; margin-top:9px; }
-.path-step { border-left: 2px solid #73d0ff; padding: 5px 0 5px 9px; margin: 4px 0; }
-.path-edge { color:#f2cc60; font-weight:650; }
-.path-node { color:#e6edf7; font-weight:650; }
-kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1px 5px; color:#b8c7dd; font-size:10px; }
+.pathbox { background:#f8fafc; border:1px solid #bfdbfe; border-radius:12px; padding:9px; margin-top:9px; }
+.path-step { border-left: 2px solid #2563eb; padding: 5px 0 5px 9px; margin: 4px 0; }
+.path-edge { color:#b45309; font-weight:650; }
+.path-node { color:#111827; font-weight:650; }
+kbd { border:1px solid #cbd5e1; background:#f8fafc; border-radius:6px; padding:1px 5px; color:#b8c7dd; font-size:10px; }
 .hidden { display: none !important; }
 @media (max-width: 1100px) { .app { grid-template-columns: 285px 1fr 340px; } }
 </style>
@@ -148,6 +151,16 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
         <button id="clearRetrievalQueryBtn">Clear slice</button>
       </div>
       <div id="retrievalResult" class="query-result small">Run a query to show only the retrieved evidence subgraph.</div>
+    </div>
+
+    <div class="card" id="agentQueryCard" style="display:none">
+      <h2>Agent query view</h2>
+      <div id="agentQueryPanel" class="agent-query-panel small">No audit query loaded.</div>
+      <div class="agent-query-actions">
+        <button class="primary" id="agentHighlightBtn">Highlight retrieved</button>
+        <button id="agentFilterBtn">Show only retrieved</button>
+      </div>
+      <button id="agentCopyQueryBtn" style="margin-top:8px">Copy query</button>
     </div>
 
     <div class="card">
@@ -283,6 +296,7 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     visibleNodeIds: new Set(), visibleEdgeIds: new Set(), nodeTypeEnabled: new Set(nodeTypes), edgeTypeEnabled: new Set(edgeTypes),
     retrievalNodeIds: new Set(), retrievalEdgeIds: new Set(), retrievalSummary: null,
     relationPathNodeIds: new Set(), relationPathEdgeIds: new Set(), relationPath: null, relationPathOnly: false,
+    externalQueryView: null, externalQueryMode: 'filter', externalQueryText: '',
     transform: {x: 0, y: 0, scale: 1}, dragging: false, dragNode: null, lastMouse: {x:0,y:0}, simulationTicks: 0
   };
   const edgeById = new Map(edges.map(e => [e.id, e]));
@@ -309,6 +323,7 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     } else {
       computeView(); fitView(); updatePanels();
     }
+    loadExternalQueryViewFromUrl();
     animate();
   }
   function setupFilters() {
@@ -638,13 +653,54 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     }).join('');
     $('relationshipResult').innerHTML = `<b>Path to query target</b><br><span class="pill">anchor ${esc(anchor ? (anchor.name||anchor.label||anchor.id) : path.anchorId)}</span><span class="pill">selected ${esc(dest ? (dest.name||dest.label||dest.id) : path.destId)}</span><span class="pill">${path.edgeIds.length} hops</span><span class="pill">${esc(path.scope)}</span><hr/>${stepsHtml || '<span class="good">Selected node is the anchor.</span>'}<hr/><span class="small">Double-click another node to replace this path. Use <kbd>Path only</kbd> to hide all non-path evidence.</span>`;
   }
+  function summarizeExternalQueryView(view) {
+    const q = view.query || {};
+    const diag = view.diagnostics || {};
+    const label = view.label || (`Q${view.round_index || ''}.${view.query_index || ''}`);
+    const nodeCount = (view.node_ids || []).length || diag.retrieved_node_count || 0;
+    const edgeCount = (view.edge_ids || []).length || diag.retrieved_edge_count || 0;
+    const reason = view.reason || q.reason || 'No explicit LLM reason was recorded for this query.';
+    const funcs = (diag.important_functions || []).slice(0, 8).map(x=>`<span class="pill">${esc(x)}</span>`).join('');
+    return `<div class="title">${esc(label)} · ${esc(q.kind || view.kind || 'codekg query')}</div><div><b>Why queried:</b> ${esc(reason)}</div><div style="margin-top:6px"><b>Retrieved:</b> ${esc(nodeCount)} nodes / ${esc(edgeCount)} edges</div><div style="margin-top:6px"><b>Query:</b><pre>${esc(JSON.stringify(q, null, 2))}</pre></div><div><b>Important functions</b><br>${funcs || '<span class="small">none</span>'}</div>`;
+  }
+  function applyExternalQueryView(mode='filter', fit=true) {
+    const view = state.externalQueryView; if (!view) return;
+    state.externalQueryMode = mode;
+    state.retrievalNodeIds = new Set((view.node_ids || []).filter(id => nodeById.has(id)));
+    state.retrievalEdgeIds = new Set((view.edge_ids || []).filter(id => edgeById.has(id)));
+    state.retrievalSummary = view.diagnostics || null;
+    state.relationPathNodeIds = new Set(); state.relationPathEdgeIds = new Set(); state.relationPath = null; state.relationPathOnly = false;
+    state.activeView = mode === 'highlight' ? 'query_highlight' : 'retrieval_query';
+    $('agentQueryCard').style.display = '';
+    $('agentQueryPanel').innerHTML = summarizeExternalQueryView(view);
+    $('retrievalQuery').value = state.externalQueryText || JSON.stringify(view.query || {}, null, 2);
+    $('retrievalResult').innerHTML = `<b>${esc(mode === 'highlight' ? 'Highlight mode' : 'Filter mode')}</b><br>${esc(state.retrievalNodeIds.size)} retrieved nodes / ${esc(state.retrievalEdgeIds.size)} retrieved edges from ${esc(view.label || 'agent query')}.`;
+    computeView(true); if (fit) fitView(); updatePanels();
+  }
+  async function loadExternalQueryViewFromUrl() {
+    const params = new URLSearchParams(window.location.search || '');
+    const viewPath = params.get('query_view') || params.get('retrieval_view');
+    if (!viewPath) return;
+    try {
+      const r = await fetch(viewPath, {cache:'no-store'});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const view = await r.json();
+      state.externalQueryView = view;
+      state.externalQueryText = view.query_text || JSON.stringify(view.query || {}, null, 2);
+      const mode = (params.get('mode') || view.mode || 'filter').toLowerCase() === 'highlight' ? 'highlight' : 'filter';
+      applyExternalQueryView(mode, true);
+    } catch (err) {
+      $('agentQueryCard').style.display = '';
+      $('agentQueryPanel').innerHTML = `<span class="bad">Could not load audit query view:</span><br>${esc(viewPath)}<br>${esc(err.message || err)}`;
+    }
+  }
   function renderRetrievalResult(res, kind) {
     if (res.error) { $('retrievalResult').innerHTML = `<span class="bad">${esc(res.error)}</span>`; return; }
     const s=res.summary||{}; const fnList=(s.functions||[]).slice(0,8).map(x=>`<span class="pill">${esc(x)}</span>`).join(''); const ext=(s.external||[]).slice(0,8).map(x=>`<span class="pill warn">${esc(x)}</span>`).join('');
     const trimNote = s.visual_trimmed ? `<br><span class="pill warn">visual subset ${esc(s.node_count)} / ${esc(s.full_node_count)} nodes</span><span class="pill warn">${esc(s.edge_count)} / ${esc(s.full_edge_count)} edges</span>` : '';
     $('retrievalResult').innerHTML = `<b>${esc(kind)}</b><br>${esc(s.node_count ?? res.nodeset.size)} nodes / ${esc(s.edge_count ?? res.edgeset.size)} edges${trimNote}<br><span class="pill">facts ${esc(s.semantic_fact_count || 0)}</span><span class="pill">guards ${esc(s.guard_like_fact_count || 0)}</span><span class="pill">joern ${esc(s.joern_overlay_nodes || 0)}</span><hr/><b>Functions</b><br>${fnList || '<span class="small">none</span>'}<hr/><b>External/unresolved calls</b><br>${ext || '<span class="small">none</span>'}<hr/>${esc(s.note || 'Retrieval evidence only.')}`;
   }
-  function runRetrievalQuery(fit=true) { const parsed=parseDashboardQuery($('retrievalQuery').value); const res=dashboardQuery(parsed.kind, parsed.args); state.retrievalNodeIds = res.nodeset || new Set(); state.retrievalEdgeIds = res.edgeset || new Set(); state.retrievalSummary = res.summary || null; state.relationPathNodeIds = new Set(); state.relationPathEdgeIds = new Set(); state.relationPath = null; state.relationPathOnly = false; state.activeView='retrieval_query'; if (state.retrievalSummary && state.retrievalSummary.target_function) { state.selectedFunction=state.retrievalSummary.target_function; $('relationAnchor').value = state.retrievalSummary.target_function; } $('relationshipResult').innerHTML='Retrieval ready. Double-click a node, click Explain selected, or type a node id/name to explain its path to the target.'; renderRetrievalResult(res, parsed.kind); computeView(true); if (fit) fitView(); }
+  function runRetrievalQuery(fit=true) { const parsed=parseDashboardQuery($('retrievalQuery').value); const res=dashboardQuery(parsed.kind, parsed.args); state.externalQueryMode='filter'; state.retrievalNodeIds = res.nodeset || new Set(); state.retrievalEdgeIds = res.edgeset || new Set(); state.retrievalSummary = res.summary || null; state.relationPathNodeIds = new Set(); state.relationPathEdgeIds = new Set(); state.relationPath = null; state.relationPathOnly = false; state.activeView='retrieval_query'; if (state.retrievalSummary && state.retrievalSummary.target_function) { state.selectedFunction=state.retrievalSummary.target_function; $('relationAnchor').value = state.retrievalSummary.target_function; } $('relationshipResult').innerHTML='Retrieval ready. Double-click a node, click Explain selected, or type a node id/name to explain its path to the target.'; renderRetrievalResult(res, parsed.kind); computeView(true); if (fit) fitView(); }
 
   function computeView(reheat=true) {
     let nodeset = new Set(), edgeset = new Set();
@@ -653,6 +709,14 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     const f = functionNode();
     if (state.activeView === 'retrieval_query') {
       nodeset = new Set(state.retrievalNodeIds); edgeset = new Set(state.retrievalEdgeIds);
+    } else if (state.activeView === 'query_highlight') {
+      const priority = nodes.filter(n => ['Project','File','Function','Struct/Class','SemanticFact'].includes(n.type)).sort((a,b)=>degree(b)-degree(a)).slice(0, Math.min(260, nodes.length));
+      priority.forEach(n => nodeset.add(n.id));
+      for (const id of state.retrievalNodeIds) if (nodeById.has(id)) nodeset.add(id);
+      for (const e of edges) {
+        if (state.retrievalEdgeIds.has(e.id)) addEdgeWithEndpoints(nodeset, edgeset, e);
+        else if (nodeset.has(e.source) && nodeset.has(e.target) && ['PROJECT_HAS_FILE','FILE_HAS_FUNCTION','FILE_HAS_TYPE','TYPE_HAS_FIELD','CALLS','CALLS_INDIRECT','SEMANTICALLY_RELATED'].includes(e.type)) edgeset.add(e.id);
+      }
     } else if (state.activeView === 'project') {
       const priority = nodes.filter(n => ['Project','File','Function','Struct/Class','SemanticFact'].includes(n.type)).sort((a,b)=>degree(b)-degree(a)).slice(0, Math.min(350, nodes.length));
       priority.forEach(n => nodeset.add(n.id));
@@ -824,6 +888,9 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     if (state.relationPathNodeIds.has(e.source) && state.relationPathNodeIds.has(e.target)) return .28;
     return .045;
   }
+  function queryHighlightActive() { return state.activeView === 'query_highlight' && state.retrievalNodeIds && state.retrievalNodeIds.size > 0; }
+  function queryNodeAlpha(n) { if (!queryHighlightActive()) return nodePathAlpha(n); return state.retrievalNodeIds.has(n.id) ? .98 : .20; }
+  function queryEdgeAlpha(e) { if (!queryHighlightActive()) return edgePathAlpha(e); return state.retrievalEdgeIds.has(e.id) ? .90 : .12; }
   function draw() {
     const W = canvas.clientWidth, H = canvas.clientHeight;
     ctx.clearRect(0,0,W,H);
@@ -837,9 +904,9 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
       const mx=(a.x+b.x)/2, my=(a.y+b.y)/2; const dx=b.x-a.x, dy=b.y-a.y; const norm=Math.sqrt(dx*dx+dy*dy)+0.01; const curve=((e.type==='CALLS'||e.type==='CALLS_INDIRECT')?24:8);
       ctx.quadraticCurveTo(mx - dy/norm*curve, my + dx/norm*curve, b.x, b.y);
       const pathEdge = state.relationPathEdgeIds.has(e.id);
-      ctx.strokeStyle = selected ? '#ffffff' : pathEdge ? '#f2cc60' : edgeColor(e);
-      ctx.globalAlpha = selected ? 0.95 : edgePathAlpha(e);
-      ctx.lineWidth = selected ? 3.2/state.transform.scale : pathEdge ? 4.2/state.transform.scale : ((e.type==='CALLS'||e.type==='CALLS_INDIRECT')?1.8:1.0)/state.transform.scale;
+      ctx.strokeStyle = selected ? '#111827' : pathEdge ? '#b45309' : state.retrievalEdgeIds.has(e.id) ? '#2563eb' : edgeColor(e);
+      ctx.globalAlpha = selected ? 0.95 : queryEdgeAlpha(e);
+      ctx.lineWidth = selected ? 3.2/state.transform.scale : pathEdge ? 4.2/state.transform.scale : state.retrievalEdgeIds.has(e.id) ? 3.0/state.transform.scale : ((e.type==='CALLS'||e.type==='CALLS_INDIRECT')?1.8:1.0)/state.transform.scale;
       if (['DEF_USE','DATA_DEPENDS_ON'].includes(e.type)) ctx.setLineDash([5/state.transform.scale,5/state.transform.scale]); else ctx.setLineDash([]);
       ctx.stroke(); ctx.setLineDash([]);
     }
@@ -849,12 +916,12 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
       const r = radius(n); const selected = state.selectedNode && state.selectedNode.id === n.id; const hover = state.hoverNode && state.hoverNode.id === n.id; const matched = state.search && matchesSearch(n, state.search.toLowerCase()); const pathNode = state.relationPathNodeIds.has(n.id);
       ctx.beginPath(); ctx.arc(n.x, n.y, r + (selected?4:pathNode?3:0), 0, Math.PI*2);
       ctx.globalAlpha = pathModeActive() && !pathNode ? .18 : 1;
-      ctx.fillStyle = selected ? 'rgba(255,255,255,.16)' : pathNode ? 'rgba(242,204,96,.18)' : hover ? 'rgba(115,208,255,.12)' : 'rgba(0,0,0,.16)'; ctx.fill(); ctx.globalAlpha = 1;
-      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI*2); ctx.fillStyle = nodeColor(n); ctx.globalAlpha = nodePathAlpha(n); ctx.fill(); ctx.globalAlpha = 1;
-      ctx.strokeStyle = selected ? '#fff' : pathNode ? '#f2cc60' : matched ? '#f2cc60' : 'rgba(255,255,255,.28)'; ctx.lineWidth = (selected||matched||pathNode?2.7:1)/state.transform.scale; ctx.stroke();
-      if (n.pinned) { ctx.beginPath(); ctx.arc(n.x+r*.55, n.y-r*.55, Math.max(2, r*.25), 0, Math.PI*2); ctx.fillStyle='#fff'; ctx.fill(); }
+      ctx.fillStyle = selected ? 'rgba(37,99,235,.18)' : pathNode ? 'rgba(180,83,9,.16)' : state.retrievalNodeIds.has(n.id) ? 'rgba(37,99,235,.14)' : hover ? 'rgba(37,99,235,.10)' : 'rgba(15,23,42,.06)'; ctx.fill(); ctx.globalAlpha = 1;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI*2); ctx.fillStyle = nodeColor(n); ctx.globalAlpha = queryNodeAlpha(n); ctx.fill(); ctx.globalAlpha = 1;
+      ctx.strokeStyle = selected ? '#111827' : pathNode ? '#b45309' : state.retrievalNodeIds.has(n.id) ? '#2563eb' : matched ? '#b45309' : 'rgba(15,23,42,.30)'; ctx.lineWidth = (selected||matched||pathNode||state.retrievalNodeIds.has(n.id)?2.7:1)/state.transform.scale; ctx.stroke();
+      if (n.pinned) { ctx.beginPath(); ctx.arc(n.x+r*.55, n.y-r*.55, Math.max(2, r*.25), 0, Math.PI*2); ctx.fillStyle='#111827'; ctx.fill(); }
       const showLabel = selected || hover || matched || pathNode || state.transform.scale > .85 || (n.type === 'Function' && degree(n) > 2) || n.type === 'Project';
-      if (showLabel) { ctx.font = `${Math.max(10, 12/state.transform.scale)}px ui-sans-serif, system-ui`; ctx.fillStyle = 'rgba(230,237,247,.92)'; ctx.textAlign='center'; ctx.fillText(compact(n.name || n.label || n.id, 28), n.x, n.y + r + 13/state.transform.scale); }
+      if (showLabel) { ctx.font = `${Math.max(10, 12/state.transform.scale)}px ui-sans-serif, system-ui`; ctx.fillStyle = 'rgba(15,23,42,.92)'; ctx.textAlign='center'; ctx.fillText(compact(n.name || n.label || n.id, 28), n.x, n.y + r + 13/state.transform.scale); }
     }
     ctx.restore();
   }
@@ -903,6 +970,9 @@ kbd { border:1px solid #334057; background:#0c1320; border-radius:6px; padding:1
     $('neighborhoodTable').innerHTML = '';
   }
   function copyText(txt) { navigator.clipboard?.writeText(txt).then(()=>{ $('statusBar').textContent='Copied.'; }).catch(()=>{ $('statusBar').textContent='Copy failed.'; }); }
+  $('agentHighlightBtn').onclick = () => applyExternalQueryView('highlight', true);
+  $('agentFilterBtn').onclick = () => applyExternalQueryView('filter', true);
+  $('agentCopyQueryBtn').onclick = () => copyText(state.externalQueryText || $('retrievalQuery').value || '');
   $('runRetrievalQueryBtn').onclick = () => runRetrievalQuery(true);
   $('retrievalQuery').addEventListener('keydown', ev => { if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') runRetrievalQuery(true); });
   $('clearRetrievalQueryBtn').onclick = () => { state.retrievalNodeIds=new Set(); state.retrievalEdgeIds=new Set(); state.retrievalSummary=null; clearRelationPath(false); $('retrievalResult').innerHTML='Retrieval slice cleared.'; state.activeView='function'; computeView(true); fitView(); };

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,37 @@ def _link_if_exists(path: str | None, label: str, root: Path | None = None) -> s
     except Exception:
         href = str(path)
     return f'<a href="{html.escape(str(href))}">{html.escape(label)}</a>'
+
+
+def _kg_dashboard_query_links(step: dict[str, Any], root: Path | None = None) -> str:
+    diag = step.get("diagnostics") if isinstance(step.get("diagnostics"), dict) else {}
+    params = step.get("tool_parameters") if isinstance(step.get("tool_parameters"), dict) else {}
+    dashboard_path = params.get("dashboard_path") or diag.get("dashboard_path")
+    query_view_path = diag.get("query_view_path") or params.get("query_view_path")
+    if not dashboard_path or not query_view_path:
+        return ""
+    try:
+        dash = Path(str(dashboard_path)).resolve()
+        view = Path(str(query_view_path)).resolve()
+        if root is not None and dash.exists():
+            href_base = os.path.relpath(dash, Path(root).resolve()).replace("\\", "/")
+        elif dash.exists():
+            href_base = dash.as_uri()
+        else:
+            href_base = str(dashboard_path)
+        view_rel = os.path.relpath(view, dash.parent).replace("\\", "/")
+        qs_highlight = urllib.parse.urlencode({"query_view": view_rel, "mode": "highlight"})
+        qs_filter = urllib.parse.urlencode({"query_view": view_rel, "mode": "filter"})
+        view_label = _link_if_exists(str(view), "query JSON", root)
+        return (
+            f'<div class="queryLinks">'
+            f'<a class="btn" href="{html.escape(href_base + "?" + qs_highlight)}">highlight in KG dashboard</a>'
+            f'<a class="btn" href="{html.escape(href_base + "?" + qs_filter)}">show only retrieved subgraph</a>'
+            f'{" | " + view_label if view_label else ""}'
+            f'</div>'
+        )
+    except Exception:
+        return ""
 
 
 def _has_placeholder(value: Any) -> bool:
@@ -404,6 +436,8 @@ def _decision_flow(
                 "returned_evidence_ids": [i.get("evidence_id") for i in s.get("items", []) if isinstance(i, dict)],
                 "returned_kind_counts": _kind_counts(s.get("items", [])),
                 "returned_evidence_preview": s.get("items", [])[:20],
+                "kg_dashboard_path": ((s.get("tool_parameters") or {}).get("dashboard_path") if isinstance(s.get("tool_parameters"), dict) else None) or ((s.get("diagnostics") or {}).get("dashboard_path") if isinstance(s.get("diagnostics"), dict) else None),
+                "query_view_path": ((s.get("diagnostics") or {}).get("query_view_path") if isinstance(s.get("diagnostics"), dict) else None),
             }
             for s in trace.kg_tool_steps
         ],
@@ -724,7 +758,7 @@ def _call_section(call: dict[str, Any], index: int) -> str:
         "</section>"
     )
 
-def _tool_section(step: dict[str, Any]) -> str:
+def _tool_section(step: dict[str, Any], *, root: Path | None = None) -> str:
     items = [EvidenceItem.model_validate(x) for x in step.get("items", [])]
     source = str(step.get("source") or "model_generated")
     if source == "fallback_generated":
@@ -733,14 +767,18 @@ def _tool_section(step: dict[str, Any]) -> str:
         source_text = "Source: model_generated_after_json_repair."
     else:
         source_text = "Source: model_generated."
+    query_links = _kg_dashboard_query_links(step, root)
+    reason = step.get('reason') or (step.get('query_object') or {}).get('reason') if isinstance(step.get('query_object'), dict) else step.get('reason')
     return (
-        f"<section><h3>KG query round {html.escape(str(step.get('round_index')))} / query {html.escape(str(step.get('query_index')))}</h3>"
+        f"<section class='kgQueryCard'><h3>Q{html.escape(str(step.get('query_index')))} · KG query round {html.escape(str(step.get('round_index')))}</h3>"
         f"<p><b>{html.escape(source_text)}</b></p>"
-        f"<p><b>Query type:</b> {html.escape(str(step.get('query_type')))} | <b>Status:</b> {html.escape(str(step.get('status')))} | <b>Returned:</b> {len(items)}</p>"
-        f"<p><b>Structured query object:</b></p>{_pre(step.get('query_object') or {'query_type': step.get('query_type'), 'query': step.get('query'), 'reason': step.get('reason')})}"
-        f"<p><b>Actual KG tool parameters:</b></p>{_pre(step.get('tool_parameters') or {'round_index': step.get('round_index'), 'query_index': step.get('query_index'), 'query_type': step.get('query_type'), 'query': step.get('query'), 'max_items': len(items), 'source': source})}"
+        f"<p><b>Why the LLM asked this:</b> {html.escape(str(reason or 'No explicit reason was recorded.'))}</p>"
+        f"<p><b>Query type:</b> {html.escape(str(step.get('query_type')))} | <b>Status:</b> {html.escape(str(step.get('status')))} | <b>Returned evidence rows:</b> {len(items)}</p>"
+        f"{query_links}"
+        f"<details open><summary>Structured query object</summary>{_pre(step.get('query_object') or {'query_type': step.get('query_type'), 'query': step.get('query'), 'reason': step.get('reason')})}</details>"
+        f"<details><summary>Actual KG tool parameters</summary>{_pre(step.get('tool_parameters') or {'round_index': step.get('round_index'), 'query_index': step.get('query_index'), 'query_type': step.get('query_type'), 'query': step.get('query'), 'max_items': len(items), 'source': source})}</details>"
         f"<details><summary>KG tool diagnostics</summary>{_pre(step.get('diagnostics') or {})}</details>"
-        f"<h4>Returned evidence</h4>{_evidence_table(items) if items else '<p>No evidence returned.</p>'}"
+        f"<h4>Returned evidence text</h4>{_evidence_table(items) if items else '<p>No evidence returned.</p>'}"
         "</section>"
     )
 
@@ -767,7 +805,7 @@ def _render_html(
     display_items = _kg_tool_evidence_items(evidence, trace) if bool(opts.get("show_only_kg_tool_evidence")) else list(evidence.items)
     target_relpath, target_function, target_start_line = _target_source_anchor(evidence)
     model_sections = "".join(_call_section(call, i) for i, call in enumerate(trace.model_calls, start=1))
-    tool_sections = "".join(_tool_section(step) for step in trace.kg_tool_steps)
+    tool_sections = "".join(_tool_section(step, root=root) for step in trace.kg_tool_steps)
     validation_link = _link_if_exists(validation_artifact_dir or prediction.target_validation_artifact_dir, "target validation artifacts", root)
     graph_link = _link_if_exists(graph_dir, "KG artifacts directory", root)
     dashboard_link = _link_if_exists((graph_manifest or {}).get("dashboard_path"), "CodeKG dashboard", root)
@@ -825,6 +863,10 @@ def _render_html(
     .note {{ background: #eff6ff; border-left: 4px solid #60a5fa; padding: 10px; }}
     section {{ border-top: 2px solid #e5e7eb; margin-top: 24px; padding-top: 16px; }}
     code {{ background:#f3f4f6; padding: 1px 4px; border-radius: 4px; }}
+    .kgQueryCard {{ background:#fbfdff; border:1px solid #bfdbfe; border-radius:12px; padding:14px; }}
+    .queryLinks {{ margin:10px 0 12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .queryLinks .btn {{ display:inline-block; text-decoration:none; background:#2563eb; color:white; padding:7px 10px; border-radius:8px; font-weight:700; font-size:12px; }}
+    .queryLinks .btn:nth-child(2) {{ background:#475569; }}
   </style>
 </head>
 <body>
@@ -847,6 +889,7 @@ def _render_html(
   {model_sections}
 
   <h2>E. KG query/tool rounds</h2>
+  <p class="note">Each query below has two KG-dashboard actions: <b>highlight</b> keeps the wider graph visible while emphasizing retrieved evidence, and <b>show only</b> filters the CodeKG Explorer to the exact retrieved subgraph. The text tables below are the model-visible evidence rows returned by the same query.</p>
   {tool_sections if tool_sections else '<p>No KG follow-up query steps were executed.</p>'}
 
   <h2>F. Hypothesis ledger and follow-up/verification rounds</h2>

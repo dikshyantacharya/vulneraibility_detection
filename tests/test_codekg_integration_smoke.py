@@ -50,3 +50,6 @@ def test_codekg_graphcache_and_agent_tool_smoke(tmp_path):
     assert result.items
     assert result.diagnostics["retrieved_node_count"] > 0
     assert result.diagnostics["dashboard_path"].endswith("dashboard/index.html")
+    assert result.diagnostics["query_view_path"].endswith(".json")
+    assert Path(result.diagnostics["query_view_path"]).exists()
+    assert result.diagnostics["query_view_node_count"] > 0
