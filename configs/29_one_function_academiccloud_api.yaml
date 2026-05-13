@@ -1,0 +1,155 @@
+experiment:
+  name: one_function_academiccloud_api_live
+  seed: 11
+  output_root: outputs/runs
+dataset:
+  mode: file
+  path: data/raw/sec_vul_eval-train.arrow
+  sample_selection: smallest_vuln_fixed_pair
+  sample_limit: 1
+  project_limit: 1
+  require_project_url: true
+repo:
+  enabled: true
+  cache_dir: cache/repos/bare_mirrors
+  worktree_dir: cache/worktrees
+  partial_clone: true
+  filter_spec: blob:none
+  skip_if_clone_fails: true
+snapshot:
+  use_dataset_commit_id: true
+  validate_target_function: true
+  commit_resolution: secvuleval_patch
+  body_match_threshold: 0.98
+  on_validation_failure: fail
+  save_validation_artifacts: true
+kg:
+  scope: project_snapshot
+  version: project_v5_semantic_api_local_live_cpg_overlay
+  cache_dir: cache/kg
+  build_if_missing: true
+  force_rebuild: false
+  max_files: 500
+  max_file_bytes: 600000
+  include_headers: true
+retrieval:
+  strategy: target_neighborhood
+  top_k_statements: 40
+  top_k_risk: 8
+  top_k_safety: 8
+  top_k_callees: 6
+  top_k_callers: 3
+  max_context_chars: 32000
+  include_cwe_hint: false
+  include_cve_hint: false
+agent:
+  enabled: true
+  mode: iterative
+  max_rounds: 3
+  risk_hypothesis_limit: 6
+  allow_kg_followup_queries: true
+  max_tool_queries_per_round: 5
+  max_tool_results_per_query: 8
+  max_evidence_items_after_tools: 240
+  save_demo_reports: true
+  reasoning_trace: tool_trace
+  response_format: json
+  fail_open_on_parse_error: true
+  max_json_repairs: 2
+  enable_posthoc_commit_audit: true
+  posthoc_audit_max_context_chars: 18000
+  parse_failed_decision_status: parse_failed
+  prompt_profile: api_rich
+  api_source_chars: 60000
+  api_followup_context_chars: 60000
+  api_final_context_chars: 42000
+model:
+  backend: openai_compatible
+  api_base: https://chat-ai.academiccloud.de/v1
+  api_key_env: ACADEMICCLOUD_API_KEY
+  model_name: qwen3.5-397b-a17b
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 2500
+  timeout_seconds: 180
+  request_json_object: false
+  estimate_tokens_if_missing: true
+  cost:
+    input_per_1k_usd: 0.003
+    output_per_1k_usd: 0.015
+  model_fallbacks:
+  - qwen3.5-397b-a17b
+  - openai-gpt-oss-120b
+  - devstral-2-123b-instruct-2512
+  - llama-3.3-70b-instruct
+  - meta-llama-3.1-8b-instruct
+  - deepseek-r1-distill-llama-70b
+  api_preflight: false
+  api_disable_thinking: true
+  api_force_no_think: false
+  api_extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+api_quota:
+  enabled: true
+  requests_per_minute: 10
+  requests_per_hour: 200
+  requests_per_day: 400
+  requests_per_month: 3000
+  max_concurrent_requests: 4
+  retry_max_attempts: 4
+  retry_initial_delay_seconds: 4
+  retry_empty_response_max_attempts: 1
+  retry_max_delay_seconds: 120
+  provider_headers_enabled: true
+  provider_header_probe: false
+  provider_probe_method: GET
+  provider_probe_timeout_seconds: 10
+  provider_header_update_from_responses: true
+execution:
+  classification_max_workers: 1
+  api_classification_max_workers: 4
+  local_classification_max_workers: 1
+  parallelize_api_samples: true
+live_dashboard:
+  enabled: true
+  serve: true
+  host: 127.0.0.1
+  port: 8765
+  open_browser: false
+  keep_alive_after_run: true
+prompting:
+  include_orchestration_metadata_in_model_prompt: false
+  include_cwe_hints_in_model_prompt: false
+  include_cve_hints_in_model_prompt: false
+scaling_analysis:
+  enabled: true
+  projection_sample_counts:
+  - 1
+  - 2
+  - 4
+  - 10
+  - 50
+  - 100
+  - 1000
+  - 25000
+  projection_project_counts:
+  - 1
+  - 2
+  - 5
+  - 50
+  - 100
+  - 900
+evaluation:
+  binary: true
+  statement_level: true
+  reasoning_diagnostics: true
+  make_visualizations: true
+  save_tables: true
+logging:
+  level: INFO
+  rich: true
+  log_every_n_samples: 1
+  profile_memory: true
+  profile_time: true
+  show_eta: true

@@ -1,0 +1,86 @@
+diff --git a/src/vckg/run.py b/src/vckg/run.py
+index 0000000..1111111 100644
+--- a/src/vckg/run.py
++++ b/src/vckg/run.py
+@@ -1,6 +1,8 @@
+ # PSEUDOPATCH: adapt names to your local runner.
+ # The important change is semantic, not the exact line numbers.
+
++from vckg.selection.function_curriculum import select_function_curriculum_pairs
++
+ def run(config):
+     dataset_samples = load_dataset(config.dataset.path)
+
+@@ -20,35 +22,63 @@ def run(config):
+-    candidate_samples = select_candidate_samples(dataset_samples, config)
+-    log.info("Sample selection", selected=len(candidate_samples))
++    selection_cfg = getattr(config, "sample_selection", {}) or {}
++
++    if selection_cfg.get("mode") in {
++        "function_curriculum",
++        "smallest_project_functions",
++        "project_complexity_curriculum",
++    }:
++        # This is the new deterministic curriculum path.
++        selected_samples = select_function_curriculum_pairs(
++            dataset_samples,
++            target_functions=int(selection_cfg.get("target_functions", 5)),
++            inventory_path=selection_cfg.get("inventory_path"),
++            require_complete_pairs=bool(selection_cfg.get("require_complete_pairs", True)),
++            one_function_per_project=bool(selection_cfg.get("one_function_per_project", False)),
++            logger=log,
++        )
++    else:
++        # Existing selection modes remain untouched.
++        selected_samples = select_candidate_samples(dataset_samples, config)
++
++    log.info(
++        "Sample selection finalized",
++        extra={
++            "selected_samples": len(selected_samples),
++            "selected_target_functions": len(selected_samples) // 2,
++        },
++    )
+
+-    # OLD BUG:
+-    # validated_pair_selection may reduce candidate_samples from 160 to 10,
+-    # but later code still uses candidate_samples or dataset_samples.
+-    resolved = resolve_commits(candidate_samples, config)
++    # FIX:
++    # From here onward, the pipeline must use selected_samples only.
++    resolved = resolve_commits(selected_samples, config)
+
+     kg_groups = group_by_project_and_resolved_commit(resolved)
+     build_or_load_kgs(kg_groups, config)
+
+-    runnable = select_runnable_samples(candidate_samples, kg_groups, config)
++    runnable = select_runnable_samples(resolved, kg_groups, config)
++
++    expected = len(selected_samples)
++    if len(runnable) != expected:
++        raise RuntimeError(
++            f"Runnable sample propagation failed: expected {expected}, got {len(runnable)}. "
++            "A selector produced a reduced subset, but a later stage reintroduced candidates."
++        )
++
+     log.info(
+         "Runnable sample selection",
+         extra={
+-            "selected": len(candidate_samples),
++            "selected": len(selected_samples),
+             "runnable": len(runnable),
+-            "skipped": len(candidate_samples) - len(runnable),
++            "skipped": len(selected_samples) - len(runnable),
+         },
+     )
+
+-    classify(candidate_samples, config)
++    log.info(
++        "Classification start",
++        extra={
++            "samples": len(runnable),
++            "model_backend": config.model.backend,
++            "agent_mode": config.agent.mode,
++        },
++    )
++    classify(runnable, config)

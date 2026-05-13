@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vuln-commit-kg"
+version = "0.9.0"
+description = "Commit-aware project-level KG + agentic LLM framework for vulnerability detection"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Vuln Commit KG"}]
+dependencies = [
+  "pydantic>=2.5",
+  "PyYAML>=6.0",
+  "pandas>=2.0",
+  "networkx>=3.0",
+  "matplotlib>=3.8",
+  "psutil>=5.9",
+  "rich>=13.0",
+  "requests>=2.31",
+  "huggingface-hub>=0.20",
+]
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14.0", "datasets>=2.16"]
+hf = ["torch>=2.1", "transformers>=4.38", "accelerate>=0.26"]
+gguf = ["llama-cpp-python>=0.2.80"]
+llama-server = []
+api = ["requests>=2.31"]
+tokens = ["tiktoken>=0.6"]
+dev = ["pytest>=7.4", "ruff>=0.2"]
+all = [
+  "pyarrow>=14.0", "datasets>=2.16", "torch>=2.1", "transformers>=4.38",
+  "accelerate>=0.26", "llama-cpp-python>=0.2.80", "tiktoken>=0.6", "pytest>=7.4"
+]
+
+[project.scripts]
+vckg = "vuln_commit_kg.cli:main"
+codekg = "codekg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

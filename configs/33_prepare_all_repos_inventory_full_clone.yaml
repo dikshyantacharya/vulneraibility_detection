@@ -1,0 +1,71 @@
+experiment:
+  name: prepare_all_repo_inventory_full_clone
+  seed: 11
+  output_root: outputs/runs
+
+dataset:
+  mode: file
+  path: data/raw/sec_vul_eval-train.arrow
+  sample_limit: null
+  sample_selection: standard
+  require_project_url: true
+  build_pair_candidate_cache: true
+
+repo:
+  enabled: true
+  cache_dir: cache/repos/bare_mirrors
+  worktree_dir: cache/worktrees
+  clone_mode: bare_mirror
+  # Full mirror clone. This is expensive for Linux but done once and reused.
+  partial_clone: false
+  filter_spec: blob:none
+  replace_partial_mirror_with_full_clone: true
+  fetch_if_exists: false
+  skip_if_clone_fails: true
+  clone_progress: true
+  passthrough_git_output: true
+  timeout_seconds: 7200
+  prune_stale_worktrees: true
+  force_recreate_registered_worktree: true
+
+repo_inventory:
+  enabled: true
+  cache_dir: cache/repo_inventory
+  force_refresh: false
+  reuse_existing_stats: true
+  clone_missing: true
+  skip_clone_failures: true
+  include_file_types: [.c, .cc, .cpp, .cxx, .h, .hpp, .hh]
+  compute_git_tree_stats: true
+  compute_commit_count: true
+  compute_function_count_approx: false
+  build_pair_candidate_cache: true
+  pair_candidate_orderings:
+    - smallest_source_first
+
+snapshot:
+  validate_target_function: false
+
+kg:
+  scope: disabled
+
+model:
+  backend: mock
+
+api_quota:
+  enabled: false
+  provider_headers_enabled: false
+  provider_header_probe: off
+
+live_dashboard:
+  enabled: true
+  serve: true
+  keep_alive_after_run: true
+
+logging:
+  level: INFO
+  rich: true
+  log_every_n_samples: 1
+  profile_memory: true
+  profile_time: true
+  show_eta: true

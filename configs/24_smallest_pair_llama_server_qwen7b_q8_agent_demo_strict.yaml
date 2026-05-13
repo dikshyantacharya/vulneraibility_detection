@@ -1,0 +1,152 @@
+agent:
+  allow_kg_followup_queries: true
+  demo_report_dirname: agent_demos
+  enabled: true
+  fail_open_on_parse_error: true
+  max_evidence_items_after_tools: 40
+  max_rounds: 3
+  max_tool_queries_per_round: 4
+  max_tool_results_per_query: 4
+  mode: iterative
+  reasoning_trace: tool_trace
+  response_format: json
+  prompt_profile: local_budgeted
+  risk_hypothesis_limit: 4
+  save_demo_reports: true
+  save_full_prompts: true
+  save_raw_model_outputs: true
+  max_json_repairs: 1
+dataset:
+  allow_missing_repo_fields: false
+  explicit_pair_indices: []
+  mode: file
+  non_vulnerable_count: null
+  pair_require_same_file: true
+  pair_require_same_function: true
+  path: data/raw/sec_vul_eval-train.arrow
+  project_exclude:
+  - linux
+  - Chrome
+  - tensorflow
+  - Android
+  project_include: []
+  project_selection: first
+  project_sort_metric: num_samples
+  require_project_url: true
+  sample_limit: null
+  sample_selection: smallest_vuln_fixed_pair
+  shuffle: false
+  vulnerable_count: null
+evaluation:
+  binary: true
+  make_visualizations: true
+  reasoning_diagnostics: true
+  save_tables: true
+  statement_level: true
+  statement_match_threshold: 0.84
+experiment:
+  name: smallest_pair_llama_server_qwen7b_q8_agent_demo_strict
+  output_root: outputs/runs
+  seed: 11
+kg:
+  build_if_missing: true
+  cache_dir: cache/kg
+  force_rebuild: false
+  graph_save_log_every: 5000
+  include_file_types:
+  - .c
+  - .cc
+  - .cpp
+  - .cxx
+  - .h
+  - .hpp
+  - .hh
+  include_headers: true
+  log_file_start: true
+  max_file_bytes: 600000
+  max_files: 500
+  max_functions: null
+  progress_log_every_files: 5
+  progress_log_every_seconds: 2.0
+  save_graphml: false
+  scope: project_snapshot
+  slow_file_log_seconds: 2.0
+  version: project_v4_agentic_bundle_budgeted_cpg_overlay
+logging:
+  level: INFO
+  log_every_n_samples: 1
+  profile_memory: true
+  profile_time: true
+  rich: true
+  show_eta: true
+model:
+  auto_download: true
+  backend: llama_server
+  cost:
+    currency: USD
+    input_per_1k_usd: 0.0
+    output_per_1k_usd: 0.0
+  estimate_tokens_if_missing: false
+  gguf_filename: Qwen2.5-Coder-7B-Instruct-Q8_0.gguf
+  llama_server_auto_download: true
+  llama_server_binary: auto
+  llama_server_download_repo: ggml-org/llama.cpp
+  llama_server_install_dir: tools/llama.cpp
+  llama_server_package: windows-cuda12
+  llama_server_release: latest
+  local_path: models/Qwen2.5-Coder-7B-Instruct-Q8_0.gguf
+  max_tokens: 700
+  model_name: Qwen2.5-Coder-7B-Instruct-Q8_0-GGUF
+  n_ctx: 8192
+  n_gpu_layers: -1
+  repo_id: bartowski/Qwen2.5-Coder-7B-Instruct-GGUF
+  request_json_object: false
+  server_extra_args: []
+  server_host: 127.0.0.1
+  server_log_path: outputs/llama_server_qwen7b_q8.log
+  server_port: 8080
+  server_start: false
+  server_startup_timeout_seconds: 180
+  server_url: http://127.0.0.1:8080/v1
+  temperature: 0.0
+  timeout_seconds: 900
+  tokenizer_backend: llama_cpp
+  top_p: 1.0
+repo:
+  cache_dir: cache/repos/bare_mirrors
+  clean_failed_worktree: true
+  clone_mode: bare_mirror
+  clone_progress: true
+  enabled: true
+  fetch_if_exists: false
+  filter_spec: blob:none
+  partial_clone: true
+  passthrough_git_output: true
+  skip_if_clone_fails: true
+  timeout_seconds: 1800
+  worktree_dir: cache/worktrees
+retrieval:
+  include_cve_hint: false
+  include_cwe_hint: true
+  max_context_chars: 8000
+  strategy: target_neighborhood
+  top_k_callees: 4
+  top_k_callers: 2
+  top_k_risk: 5
+  top_k_safety: 5
+  top_k_statements: 20
+snapshot:
+  body_match_threshold: 0.98
+  commit_resolution: secvuleval_patch
+  on_validation_failure: fail
+  parent_depth: 1
+  require_filepath_exists: true
+  require_function_found: false
+  save_validation_artifacts: true
+  use_dataset_commit_id: true
+  validate_target_function: true
+  validation_artifact_dirname: target_validation_artifacts
+prompting:
+  include_orchestration_metadata_in_model_prompt: false
+  include_cwe_hints_in_model_prompt: false
+  include_cve_hints_in_model_prompt: false

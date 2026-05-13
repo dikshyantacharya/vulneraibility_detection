@@ -1,0 +1,44 @@
+experiment:
+  name: scan_projects
+  seed: 11
+  output_root: outputs/runs
+dataset:
+  mode: file
+  path: data/raw/sec_vul_eval-train.arrow
+  sample_limit: null
+  project_limit: null
+  samples_per_project: null
+  project_include: []
+  project_exclude:
+  - linux
+  - Chrome
+  - tensorflow
+  - Android
+  project_selection: smallest_dataset
+  project_sort_metric: num_samples
+  min_project_samples: null
+  max_project_samples: null
+  require_vulnerable_project: false
+  require_safe_project: false
+  vulnerable_count: null
+  non_vulnerable_count: null
+  shuffle: false
+  require_project_url: true
+  allow_missing_repo_fields: false
+repo:
+  enabled: false
+kg:
+  scope: disabled
+  log_file_start: true
+  slow_file_log_seconds: 2.0
+  include_headers: true
+  version: project_v4_agentic_bundle_budgeted_cpg_overlay
+model:
+  backend: mock
+logging:
+  level: INFO
+  rich: true
+  log_every_n_samples: 1
+  profile_memory: true
+  profile_time: true
+  show_eta: true

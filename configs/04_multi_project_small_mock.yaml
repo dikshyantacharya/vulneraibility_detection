@@ -1,0 +1,125 @@
+experiment:
+  name: multi_project_small_mock
+  seed: 11
+  output_root: outputs/runs
+dataset:
+  mode: file
+  path: data/raw/sec_vul_eval-train.arrow
+  sample_limit: 20
+  project_limit: 5
+  samples_per_project: 4
+  project_include:
+  - shapelib
+  - didiwiki
+  - ytnef
+  - jhead
+  - darkhttpd
+  project_exclude:
+  - linux
+  - Chrome
+  - tensorflow
+  - Android
+  project_selection: explicit
+  project_sort_metric: num_samples
+  min_project_samples: null
+  max_project_samples: 20
+  require_vulnerable_project: true
+  require_safe_project: false
+  vulnerable_count: null
+  non_vulnerable_count: null
+  shuffle: false
+  require_project_url: true
+  allow_missing_repo_fields: false
+repo:
+  enabled: true
+  cache_dir: cache/repos/bare_mirrors
+  worktree_dir: cache/worktrees
+  clone_mode: bare_mirror
+  fetch_if_exists: false
+  timeout_seconds: 1800
+  clean_failed_worktree: true
+  skip_if_clone_fails: true
+  partial_clone: true
+  filter_spec: blob:none
+  clone_progress: true
+  passthrough_git_output: true
+snapshot:
+  use_dataset_commit_id: true
+  validate_target_function: true
+  commit_resolution: secvuleval_patch
+  parent_depth: 1
+  require_filepath_exists: true
+  require_function_found: false
+  body_match_threshold: 0.82
+  on_validation_failure: warn_and_continue
+kg:
+  scope: project_snapshot
+  version: project_v4_agentic_bundle_budgeted_cpg_overlay
+  cache_dir: cache/kg
+  build_if_missing: true
+  force_rebuild: false
+  include_file_types:
+  - .c
+  - .cc
+  - .cpp
+  - .cxx
+  - .h
+  - .hpp
+  - .hh
+  max_files: 600
+  max_file_bytes: 600000
+  max_functions: null
+  save_graphml: false
+  progress_log_every_files: 10
+  progress_log_every_seconds: 5.0
+  graph_save_log_every: 5000
+  log_file_start: true
+  slow_file_log_seconds: 2.0
+  include_headers: true
+retrieval:
+  strategy: target_neighborhood
+  top_k_statements: 80
+  top_k_risk: 12
+  top_k_safety: 10
+  top_k_callees: 8
+  top_k_callers: 5
+  max_context_chars: 8000
+  include_cwe_hint: true
+  include_cve_hint: false
+agent:
+  enabled: true
+  mode: iterative
+  max_rounds: 3
+  risk_hypothesis_limit: 5
+  allow_kg_followup_queries: true
+  reasoning_trace: evidence_summary
+  response_format: json
+  fail_open_on_parse_error: true
+  max_json_repairs: 1
+  max_evidence_items_after_tools: 40
+  max_tool_results_per_query: 4
+model:
+  backend: mock
+  model_name: mock-risk-api
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 700
+  estimate_tokens_if_missing: true
+  cost:
+    input_per_1k_usd: 0.0
+    output_per_1k_usd: 0.0
+    currency: USD
+evaluation:
+  binary: true
+  statement_level: true
+  reasoning_diagnostics: true
+  statement_match_threshold: 0.84
+  make_visualizations: true
+  save_tables: true
+logging:
+  level: INFO
+  rich: true
+  log_every_n_samples: 1
+  profile_memory: true
+  profile_time: true
+  show_eta: true

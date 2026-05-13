@@ -1,0 +1,62 @@
+experiment:
+  name: smoke_mock_no_repo
+  seed: 11
+  output_root: outputs/runs
+  notes: No clone, no real model. Verifies pipeline artifacts.
+dataset:
+  mode: smoke
+  path: data/raw/sec_vul_eval-train.arrow
+  sample_limit: 1
+  require_project_url: false
+  allow_missing_repo_fields: true
+repo:
+  enabled: false
+  cache_dir: cache/repos/bare_mirrors
+  worktree_dir: cache/worktrees
+  fetch_if_exists: false
+  skip_if_clone_fails: true
+snapshot:
+  validate_target_function: false
+kg:
+  scope: function_only_baseline
+  version: project_v4_agentic_bundle_budgeted_cpg_overlay
+  cache_dir: cache/kg
+  log_file_start: true
+  slow_file_log_seconds: 2.0
+  include_headers: true
+retrieval:
+  strategy: target_neighborhood
+  top_k_statements: 30
+  top_k_risk: 8
+  top_k_safety: 6
+  top_k_callees: 3
+  top_k_callers: 2
+  max_context_chars: 8000
+agent:
+  enabled: true
+  mode: iterative
+  risk_hypothesis_limit: 5
+  reasoning_trace: evidence_summary
+  fail_open_on_parse_error: true
+  max_json_repairs: 1
+  max_evidence_items_after_tools: 40
+  max_tool_results_per_query: 4
+model:
+  backend: mock
+  model_name: mock-risk-api
+  temperature: 0.0
+  max_tokens: 500
+  cost:
+    input_per_1k_usd: 0.0
+    output_per_1k_usd: 0.0
+    currency: USD
+evaluation:
+  binary: true
+  statement_level: true
+  reasoning_diagnostics: true
+  make_visualizations: true
+  save_tables: true
+logging:
+  level: INFO
+  rich: true
+  log_every_n_samples: 1
