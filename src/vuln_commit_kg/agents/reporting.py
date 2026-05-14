@@ -722,7 +722,7 @@ def _evidence_table(
             f"<td><pre>{html.escape((item.text or '')[:1400])}</pre></td>"
             "</tr>"
         )
-    return "<table><thead><tr><th>ID</th><th>Kind</th><th>Location<br><span style='font-weight:400'>absolute + function-relative when target-local</span></th><th>Function</th><th>Score</th><th>Scope</th><th>Match</th><th>Trust</th><th>Why selected</th><th>Text</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    return "<div class='tableWrap'><table><thead><tr><th>ID</th><th>Kind</th><th>Location<br><span style='font-weight:400'>absolute + function-relative when target-local</span></th><th>Function</th><th>Score</th><th>Scope</th><th>Match</th><th>Trust</th><th>Why selected</th><th>Text</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
 
 
 def _call_section(call: dict[str, Any], index: int) -> str:
@@ -740,45 +740,51 @@ def _call_section(call: dict[str, Any], index: int) -> str:
             f"<details><summary>Repair attempt {html.escape(str(repair.get('attempt')))} raw response</summary>{_pre(repair.get('response', ''), None)}</details>"
             f"<details><summary>Repair attempt {html.escape(str(repair.get('attempt')))} parse result</summary>{_pre({'parsed': repair.get('parsed'), 'parse_error': repair.get('parse_error'), 'usage': repair.get('usage')})}</details>"
         )
+    elapsed = round(float(call.get("elapsed_seconds") or 0.0), 2)
+    json_status = str(call.get("json_status") or "")
+    name = str(call.get("name") or "model_call")
     return (
-        f"<section><h3>{index}. {html.escape(str(call.get('name')))}</h3>"
+        f"<section class='auditCard modelCall' data-audit-card data-kind='model' data-title='{html.escape(name)}'>"
+        f"<div class='sectionHead'><div><div class='eyebrow'>LLM call {index}</div><h3>{html.escape(name)}</h3></div>"
+        f"<div class='chipRow'><span class='chip'>{html.escape(json_status or 'json')}</span>"
+        f"<span class='chip'>repairs {len(call.get('repair_attempts', []) or [])}</span><span class='chip'>{elapsed}s</span></div></div>"
         f"{warning_html}"
-        f"<p><b>JSON status:</b> {html.escape(str(call.get('json_status')))} | "
-        f"<b>Repair attempts:</b> {len(call.get('repair_attempts', []) or [])} | "
-        f"<b>Elapsed:</b> {html.escape(str(round(float(call.get('elapsed_seconds') or 0.0), 2)))}s</p>"
-        f"<p><b>Prompt chars:</b> {len(str(prompt_text))} | <b>Response chars:</b> {len(str(response_text))} | "
-        f"<b>Prompt tokens:</b> {html.escape(str(usage.get('prompt_tokens', '')))} | "
-        f"<b>Completion tokens:</b> {html.escape(str(usage.get('completion_tokens', '')))} | "
-        f"<b>Total tokens:</b> {html.escape(str(usage.get('total_tokens', '')))}</p>"
+        f"<div class='metricStrip'><span>Prompt chars <b>{len(str(prompt_text))}</b></span><span>Response chars <b>{len(str(response_text))}</b></span>"
+        f"<span>Prompt tokens <b>{html.escape(str(usage.get('prompt_tokens', '')))}</b></span><span>Completion <b>{html.escape(str(usage.get('completion_tokens', '')))}</b></span><span>Total <b>{html.escape(str(usage.get('total_tokens', '')))}</b></span></div>"
         f"<details><summary>Exact prompt visible to the model</summary>{_pre(prompt_text, None)}</details>"
         f"<details open><summary>Raw LLM response</summary>{_pre(response_text, None)}</details>"
         f"<details open><summary>JSON parse/validation result</summary>{_pre({'json_status': call.get('json_status'), 'parsed': call.get('parsed'), 'parse_error': call.get('parse_error')})}</details>"
-        f"{''.join(repairs) if repairs else '<p>No JSON repair was needed for this call.</p>'}"
+        f"{''.join(repairs) if repairs else '<p class=\"quiet\">No JSON repair was needed for this call.</p>'}"
         f"<details><summary>Usage and timing</summary>{_pre({'usage': usage, 'elapsed_seconds': call.get('elapsed_seconds')})}</details>"
         "</section>"
     )
+
 
 def _tool_section(step: dict[str, Any], *, root: Path | None = None) -> str:
     items = [EvidenceItem.model_validate(x) for x in step.get("items", [])]
     source = str(step.get("source") or "model_generated")
     if source == "fallback_generated":
-        source_text = "Source: fallback_generated — model output could not be parsed/repaired or no schema-valid query was available."
+        source_text = "fallback-generated because the model output could not be parsed/repaired"
     elif source == "model_generated_after_json_repair":
-        source_text = "Source: model_generated_after_json_repair."
+        source_text = "model-generated after JSON repair"
     else:
-        source_text = "Source: model_generated."
+        source_text = "model-generated"
     query_links = _kg_dashboard_query_links(step, root)
     reason = step.get('reason') or (step.get('query_object') or {}).get('reason') if isinstance(step.get('query_object'), dict) else step.get('reason')
+    qid = html.escape(str(step.get('query_index')))
+    round_id = html.escape(str(step.get('round_index')))
+    query_type = html.escape(str(step.get('query_type')))
+    status = html.escape(str(step.get('status')))
     return (
-        f"<section class='kgQueryCard'><h3>Q{html.escape(str(step.get('query_index')))} · KG query round {html.escape(str(step.get('round_index')))}</h3>"
-        f"<p><b>{html.escape(source_text)}</b></p>"
-        f"<p><b>Why the LLM asked this:</b> {html.escape(str(reason or 'No explicit reason was recorded.'))}</p>"
-        f"<p><b>Query type:</b> {html.escape(str(step.get('query_type')))} | <b>Status:</b> {html.escape(str(step.get('status')))} | <b>Returned evidence rows:</b> {len(items)}</p>"
+        f"<section class='auditCard kgQueryCard' data-audit-card data-kind='kg' data-title='Q{qid} {query_type}'>"
+        f"<div class='sectionHead'><div><div class='eyebrow'>KG query round {round_id}</div><h3>Q{qid} · {query_type}</h3></div>"
+        f"<div class='chipRow'><span class='chip status'>{status}</span><span class='chip'>{len(items)} evidence rows</span><span class='chip'>{html.escape(source_text)}</span></div></div>"
+        f"<div class='reasonBox'><b>Why this query was asked</b><br>{html.escape(str(reason or 'No explicit reason was recorded.'))}</div>"
         f"{query_links}"
         f"<details open><summary>Structured query object</summary>{_pre(step.get('query_object') or {'query_type': step.get('query_type'), 'query': step.get('query'), 'reason': step.get('reason')})}</details>"
         f"<details><summary>Actual KG tool parameters</summary>{_pre(step.get('tool_parameters') or {'round_index': step.get('round_index'), 'query_index': step.get('query_index'), 'query_type': step.get('query_type'), 'query': step.get('query'), 'max_items': len(items), 'source': source})}</details>"
         f"<details><summary>KG tool diagnostics</summary>{_pre(step.get('diagnostics') or {})}</details>"
-        f"<h4>Returned evidence text</h4>{_evidence_table(items) if items else '<p>No evidence returned.</p>'}"
+        f"<h4>Returned source-grounded evidence</h4>{_evidence_table(items) if items else '<p>No evidence returned.</p>'}"
         "</section>"
     )
 
@@ -852,28 +858,55 @@ def _render_html(
   <meta charset="utf-8" />
   <title>{html.escape(title)}</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 24px; line-height: 1.45; color: #111827; }}
-    h1, h2, h3 {{ color: #1f2937; }}
-    pre {{ white-space: pre-wrap; word-break: break-word; background: #f6f8fa; border: 1px solid #d0d7de; padding: 10px; border-radius: 8px; max-height: 560px; overflow:auto; }}
-    table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-    th, td {{ border: 1px solid #d0d7de; padding: 6px; vertical-align: top; }}
-    th {{ background: #f3f4f6; }}
-    .ok {{ color: #047857; font-weight: 700; }}
-    .bad {{ color: #b91c1c; font-weight: 700; }}
-    .note {{ background: #eff6ff; border-left: 4px solid #60a5fa; padding: 10px; }}
-    section {{ border-top: 2px solid #e5e7eb; margin-top: 24px; padding-top: 16px; }}
-    code {{ background:#f3f4f6; padding: 1px 4px; border-radius: 4px; }}
-    .kgQueryCard {{ background:#fbfdff; border:1px solid #bfdbfe; border-radius:12px; padding:14px; }}
-    .queryLinks {{ margin:10px 0 12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
-    .queryLinks .btn {{ display:inline-block; text-decoration:none; background:#2563eb; color:white; padding:7px 10px; border-radius:8px; font-weight:700; font-size:12px; }}
-    .queryLinks .btn:nth-child(2) {{ background:#475569; }}
+    :root {{ --bg:#f6f8fb; --panel:#ffffff; --soft:#f8fafc; --line:#dbe3ef; --line2:#e7edf5; --text:#0f172a; --muted:#64748b; --blue:#2563eb; --green:#047857; --red:#b91c1c; --amber:#92400e; --shadow:0 12px 28px rgba(15,23,42,.08); }}
+    * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
+    body {{ font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin:0; line-height:1.55; color:var(--text); background:linear-gradient(180deg,#eef4ff 0,#f8fafc 280px,#f6f8fb 100%); }}
+    a {{ color:var(--blue); text-decoration:none; font-weight:700; }} a:hover {{ text-decoration:underline; }}
+    .reportTop {{ position:sticky; top:0; z-index:30; background:rgba(255,255,255,.93); backdrop-filter:blur(14px); border-bottom:1px solid var(--line); box-shadow:0 1px 0 rgba(15,23,42,.04); }}
+    .reportTopInner {{ max-width:1720px; margin:0 auto; padding:14px 22px; display:flex; align-items:center; justify-content:space-between; gap:18px; }}
+    .brand {{ display:flex; gap:12px; align-items:center; }} .brandIcon {{ width:40px; height:40px; border-radius:14px; background:linear-gradient(135deg,#2563eb,#7c3aed); box-shadow:0 10px 22px rgba(37,99,235,.25); }}
+    h1 {{ margin:0; font-size:21px; line-height:1.15; }} .subtitle {{ color:var(--muted); font-size:12px; margin-top:3px; }}
+    .reportLayout {{ max-width:1720px; margin:0 auto; padding:18px 22px 34px; display:grid; grid-template-columns:270px minmax(0,1fr); gap:18px; align-items:start; }}
+    .sideNav {{ position:sticky; top:86px; background:rgba(255,255,255,.96); border:1px solid var(--line); border-radius:20px; padding:14px; box-shadow:var(--shadow); max-height:calc(100vh - 106px); overflow:auto; }}
+    .sideNav h2 {{ margin:0 0 9px; font-size:13px; color:#334155; text-transform:uppercase; letter-spacing:.08em; }}
+    .sideNav a {{ display:block; padding:7px 9px; border-radius:10px; color:#334155; font-size:12px; font-weight:750; }} .sideNav a:hover {{ background:#eff6ff; text-decoration:none; color:#1d4ed8; }}
+    .content {{ min-width:0; }}
+    .hero {{ background:rgba(255,255,255,.96); border:1px solid var(--line); border-radius:24px; padding:18px; box-shadow:var(--shadow); margin-bottom:16px; }}
+    .heroGrid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(185px,1fr)); gap:10px; margin-top:12px; }}
+    .summaryCard {{ background:var(--soft); border:1px solid var(--line2); border-radius:16px; padding:12px; }} .summaryCard .label {{ color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; font-weight:800; }} .summaryCard .value {{ margin-top:4px; font-size:15px; font-weight:850; overflow-wrap:anywhere; }}
+    section, .auditCard {{ background:rgba(255,255,255,.96); border:1px solid var(--line); border-radius:22px; padding:18px; margin:16px 0; box-shadow:var(--shadow); }}
+    h2 {{ margin:28px 0 10px; font-size:19px; }} h3 {{ margin:.2rem 0 .45rem; color:#1e293b; font-size:17px; }} h4 {{ margin:14px 0 8px; }}
+    .sectionHead {{ display:flex; justify-content:space-between; align-items:flex-start; gap:14px; border-bottom:1px solid var(--line2); padding-bottom:12px; margin-bottom:12px; }}
+    .eyebrow {{ font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:850; }}
+    .chipRow {{ display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end; }} .chip {{ display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; background:#eef2ff; color:#3730a3; font-size:12px; font-weight:800; }} .chip.status {{ background:#dcfce7; color:#166534; }}
+    .note {{ background:#eff6ff; border:1px solid #bfdbfe; border-left:5px solid #3b82f6; border-radius:14px; padding:12px 14px; color:#1e3a8a; }}
+    .ok {{ color:var(--green); font-weight:800; }} .bad {{ color:var(--red); font-weight:800; }} .quiet {{ color:var(--muted); }} code {{ background:#eef2f7; padding:2px 5px; border-radius:6px; }}
+    pre {{ white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#dbeafe; border:1px solid #1e293b; padding:14px; border-radius:14px; max-height:560px; overflow:auto; font-size:12px; line-height:1.48; }}
+    details {{ border:1px solid var(--line2); border-radius:14px; padding:10px 12px; background:#fbfdff; margin:10px 0; }} details[open] {{ background:#fff; }} summary {{ cursor:pointer; font-weight:800; color:#334155; }}
+    .tableWrap {{ overflow:auto; border:1px solid var(--line); border-radius:16px; background:white; margin-top:10px; }} table {{ border-collapse:separate; border-spacing:0; width:100%; font-size:13px; }} th, td {{ border-bottom:1px solid var(--line2); padding:10px; vertical-align:top; text-align:left; }} th {{ background:#f8fafc; color:#475569; font-size:11px; text-transform:uppercase; letter-spacing:.05em; position:sticky; top:0; }} tbody tr:hover {{ background:#f8fbff; }} td pre {{ max-height:280px; }}
+    .kgQueryCard {{ border-color:#bfdbfe; background:linear-gradient(180deg,#ffffff 0,#f8fbff 100%); }} .modelCall {{ border-color:#e0e7ff; }}
+    .queryLinks {{ margin:12px 0; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }} .queryLinks .btn {{ display:inline-flex; text-decoration:none; background:#2563eb; color:white; padding:8px 12px; border-radius:999px; font-weight:850; font-size:12px; }} .queryLinks .btn:nth-child(2) {{ background:#334155; }}
+    .reasonBox {{ background:#f8fafc; border:1px solid var(--line2); border-radius:14px; padding:11px; color:#334155; }} .metricStrip {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }} .metricStrip span {{ background:#f8fafc; border:1px solid var(--line2); border-radius:999px; padding:5px 9px; font-size:12px; color:#475569; }}
+    .reportActions {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }} .reportActions a, .reportActions button {{ border:1px solid #cbd5e1; border-radius:999px; background:white; color:#334155; padding:8px 11px; font-size:12px; font-weight:800; cursor:pointer; }}
+    .searchBox {{ width:100%; border:1px solid #cbd5e1; border-radius:12px; padding:9px 11px; margin:8px 0 10px; }}
+    @media (max-width: 1050px) {{ .reportLayout {{ grid-template-columns:1fr; }} .sideNav {{ position:relative; top:auto; max-height:none; }} .reportTopInner {{ align-items:flex-start; flex-direction:column; }} }}
   </style>
 </head>
 <body>
-  <h1>{html.escape(title)}</h1>
+  <header class="reportTop"><div class="reportTopInner"><div class="brand"><div class="brandIcon"></div><div><h1>{html.escape(title)}</h1><div class="subtitle">source-only model trace · CodeKG query evidence · report-only checks separated</div></div></div><div class="reportActions"><button onclick="window.print()">Print / PDF</button><button onclick="location.reload()">Refresh</button></div></div></header>
+  <div class="reportLayout"><aside class="sideNav"><h2>Audit navigation</h2><input id="auditSearch" class="searchBox" placeholder="Filter visible sections" oninput="filterAuditCards()"><nav id="toc"></nav></aside><main class="content"><div class="hero">
   <p class="note">This report shows the model-visible inference trace: source-only hypotheses, prompts, raw outputs, JSON validation/repair, KG queries, returned KG evidence, public hypothesis updates, and final prediction. It does not include hidden/private chain-of-thought.</p>
   {f'<p class="note"><b>Live status:</b> {html.escape(str(opts.get("stage") or "running"))}. This page checks <code>live_status.json</code> and reloads only when this sample report is rewritten.</p>' if bool(opts.get("in_progress")) else ""}
 
+
+  <div class="heroGrid">
+    <div class="summaryCard"><div class="label">Sample</div><div class="value">{html.escape(str(sample.sample_id))}</div></div>
+    <div class="summaryCard"><div class="label">Project</div><div class="value">{html.escape(str(sample.project))}</div></div>
+    <div class="summaryCard"><div class="label">Function</div><div class="value">{html.escape(str(sample.func_name))}</div></div>
+    <div class="summaryCard"><div class="label">Prediction</div><div class="value">{'vulnerable' if prediction.is_vulnerable else 'non-vulnerable'} · {html.escape(str(prediction.confidence))}</div></div>
+    <div class="summaryCard"><div class="label">KG backend</div><div class="value">{html.escape(str((graph_manifest or {}).get('backend_used') or (graph_manifest or {}).get('backend') or graph_status or 'unknown'))}</div></div>
+    <div class="summaryCard"><div class="label">KG queries</div><div class="value">{len(trace.kg_tool_steps or [])}</div></div>
+  </div></div>
   <h2>A. Dataset and target setup</h2>
   {_pre(flow['A_dataset_and_target_setup'])}
   <p>{validation_link if validation_link else 'No validation artifact link available.'}</p>
@@ -938,6 +971,13 @@ def _render_html(
 
   <h2>{"KG evidence returned by hypothesis-driven queries" if bool(opts.get("show_only_kg_tool_evidence")) else "Accumulated evidence after KG tool rounds"} ({len(display_items)} shown / {len(evidence.items)} total)</h2>
   {_evidence_table(display_items, target_relpath=target_relpath, target_function=target_function, target_start_line=target_start_line)}
+</main></div>
+<script>
+function slugify(s){{return String(s||'section').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,80)||'section'}}
+function buildToc(){{const toc=document.getElementById('toc'); if(!toc)return; const heads=[...document.querySelectorAll('main.content h2, main.content section h3')]; const seen={{}}; toc.innerHTML=heads.map(h=>{{let id=h.id||slugify(h.innerText); seen[id]=(seen[id]||0)+1; if(seen[id]>1)id=id+'-'+seen[id]; h.id=id; const pad=h.tagName==='H3'?' style="padding-left:18px;font-weight:650"':''; return `<a${{pad}} href="#${{id}}">${{h.innerText.replace(/\n/g,' ').slice(0,74)}}</a>`}}).join('')}}
+function filterAuditCards(){{const q=(document.getElementById('auditSearch')?.value||'').toLowerCase(); document.querySelectorAll('[data-audit-card]').forEach(el=>{{el.style.display=(!q||el.innerText.toLowerCase().includes(q))?'':'none'}});}}
+window.addEventListener('DOMContentLoaded', buildToc);
+</script>
 {live_refresh_script}</body>
 </html>"""
 
@@ -994,11 +1034,7 @@ def write_agent_demo_index(run_dir: Path) -> Path:
     index.write_text(
         """<!doctype html><html><head><meta charset='utf-8'><title>Agent demos</title>
         <style>
-        body{font-family:system-ui;margin:24px;line-height:1.45;color:#111827}
-        table{border-collapse:collapse;width:100%;font-size:13px} th,td{border:1px solid #d0d7de;padding:6px;text-align:left;vertical-align:top} th{background:#f3f4f6}
-        button{margin:4px;padding:6px 10px;border:1px solid #d0d7de;border-radius:8px;background:#fff;cursor:pointer} button.active{background:#111827;color:white}
-        .badge{font-weight:700;border-radius:6px;padding:2px 6px}.TP{background:#dcfce7;color:#166534}.TN{background:#e0f2fe;color:#075985}.FP{background:#fee2e2;color:#991b1b}.FN{background:#fef3c7;color:#92400e}.UNKNOWN,.INVALID{background:#fef3c7;color:#92400e}
-        input{padding:7px;width:280px;border:1px solid #d0d7de;border-radius:8px}
+        :root{--bg:#f6f8fb;--panel:#fff;--line:#dbe3ef;--text:#0f172a;--muted:#64748b;--blue:#2563eb;--shadow:0 12px 28px rgba(15,23,42,.08)}*{box-sizing:border-box}body{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;margin:0;line-height:1.45;color:var(--text);background:linear-gradient(180deg,#eef4ff 0,#f8fafc 260px,#f6f8fb 100%);padding:28px}h1{margin:0 0 6px;font-size:26px}.shell{max-width:1500px;margin:0 auto}.hero{background:rgba(255,255,255,.96);border:1px solid var(--line);border-radius:24px;padding:20px;box-shadow:var(--shadow);margin-bottom:16px}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:#f8fafc;border:1px solid #e7edf5;border-radius:16px;padding:10px;margin-top:12px}table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px;background:white;border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:var(--shadow)}th,td{border-bottom:1px solid #e7edf5;padding:10px;text-align:left;vertical-align:top}th{background:#f8fafc;color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:.05em}tr:hover{background:#f8fbff}button{padding:8px 12px;border:1px solid #cbd5e1;border-radius:999px;background:#fff;cursor:pointer;font-weight:800}button.active{background:#2563eb;color:white;border-color:#2563eb}.badge{font-weight:800;border-radius:999px;padding:3px 8px}.TP{background:#dcfce7;color:#166534}.TN{background:#e0f2fe;color:#075985}.FP{background:#fee2e2;color:#991b1b}.FN{background:#fef3c7;color:#92400e}.UNKNOWN,.INVALID{background:#fef3c7;color:#92400e}input{padding:9px 11px;min-width:320px;border:1px solid #cbd5e1;border-radius:12px}.small{color:var(--muted);font-size:13px}a{color:var(--blue);font-weight:800;text-decoration:none}a:hover{text-decoration:underline}
         </style>
         <script>
         function filterRows(kind){
@@ -1012,19 +1048,19 @@ def write_agent_demo_index(run_dir: Path) -> Path:
         }
         function applySearch(){ const active=document.querySelector('button.active'); filterRows(active?active.dataset.kind:'ALL'); }
         </script>
-        </head><body>
+        </head><body><div class="shell"><div class="hero">
         <h1>Agent demo reports</h1>
         <p>Filter by prediction outcome. Each report contains source-only hypotheses, model-visible prompts, raw outputs, JSON validation/repair, KG query/tool results, public hypothesis updates, evidence, final prediction, and prompt-privacy checks.</p>
         """
         + "<p><b>Counts:</b> "
         + " | ".join(f"{html.escape(k)}={v}" for k, v in summary_counts.items())
         + "</p>"
-        + "<div>"
+        + "<div class='toolbar'>"
         + "".join(f"<button data-kind='{k}' onclick=\"filterRows('{k}')\">{k}</button>" for k in ["ALL", "TP", "FP", "TN", "FN", "UNKNOWN"])
         + " <input id='search' oninput='applySearch()' placeholder='search project/function/sample...' /></div>"
         + "<table><thead><tr><th>Outcome</th><th>Sample</th><th>Project</th><th>Filepath</th><th>Function</th><th>Ground truth</th><th>Prediction</th><th>Confidence</th><th>Report</th></tr></thead><tbody>"
         + "".join(row_html)
-        + "</tbody></table><script>filterRows('ALL')</script></body></html>",
+        + "</tbody></table><script>filterRows('ALL')</script></div></div></body></html>",
         encoding="utf-8",
     )
     return index
