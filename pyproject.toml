@@ -37,6 +37,7 @@ all = [
 [project.scripts]
 vckg = "vuln_commit_kg.cli:main"
 codekg = "codekg.cli:main"
+student-system-creator = "student_system_creator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

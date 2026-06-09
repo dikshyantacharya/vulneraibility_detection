@@ -156,17 +156,77 @@ def _parse_dot_attrs(text: str) -> dict:
     return out
 
 
+def _dot_statement_stream(path: Path):
+    """Yield logical DOT statements without loading the whole export in memory.
+
+    Joern can emit very large DOT files.  The older importer used one giant
+    regex over the whole file, which is slow on Windows and can look like a
+    hang for medium/large projects.  This streaming parser is intentionally
+    conservative: it handles the common one-line and lightly wrapped node/edge
+    statements emitted by joern-export and stops once the caller's node/edge
+    limits are reached.
+    """
+    buf: list[str] = []
+    bracket_balance = 0
+    in_statement = False
+    with path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("digraph") or stripped in {"{", "}"}:
+                continue
+            buf.append(stripped)
+            bracket_balance += stripped.count("[") - stripped.count("]")
+            in_statement = in_statement or "[" in stripped or "->" in stripped
+            if in_statement and bracket_balance <= 0 and (stripped.endswith(";") or stripped.endswith("]")):
+                stmt = " ".join(buf).strip()
+                buf = []
+                bracket_balance = 0
+                in_statement = False
+                if stmt:
+                    yield stmt
+            # Defensive bound: avoid pathological malformed exports building huge buffers.
+            if len(buf) > 200:
+                stmt = " ".join(buf).strip()
+                buf = []
+                bracket_balance = 0
+                in_statement = False
+                if stmt:
+                    yield stmt
+    if buf:
+        stmt = " ".join(buf).strip()
+        if stmt:
+            yield stmt
+
+
 def _ingest_dot(graph: GraphStore, path: Path, source_dir: Path, max_nodes: int, max_edges: int) -> Tuple[int, int, int]:
-    text = path.read_text(encoding="utf-8", errors="ignore")
     local_nodes: Dict[str, dict] = {}
-    for m in re.finditer(r"^\s*\"?([^\"\s\[;]+)\"?\s*\[(.*?)\]\s*;?\s*$", text, flags=re.M | re.S):
+    pending_edges: list[tuple[str, str, dict]] = []
+
+    # Parse a bounded number of nodes and edges in one streaming pass.  Do not
+    # use re.S across the full file: Joern DOT exports can be large enough that
+    # global backtracking dominates runtime.
+    node_re = re.compile(r'^\s*"?([^"\s\[;]+)"?\s*\[(.*)\]\s*;?\s*$')
+    edge_re = re.compile(r'^\s*"?([^"\s\[]+)"?\s*->\s*"?([^"\s\[]+)"?\s*(?:\[(.*)\])?\s*;?\s*$')
+
+    for stmt in _dot_statement_stream(path):
+        if "->" in stmt:
+            if len(pending_edges) >= max_edges:
+                continue
+            m = edge_re.match(stmt)
+            if not m:
+                continue
+            pending_edges.append((m.group(1), m.group(2), _parse_dot_attrs(m.group(3) or "")))
+            continue
+        if len(local_nodes) >= max_nodes:
+            continue
+        m = node_re.match(stmt)
+        if not m:
+            continue
         raw_id = m.group(1)
-        attrs = _parse_dot_attrs(m.group(2))
         if raw_id in {"node", "edge", "graph"} or "->" in raw_id:
             continue
-        local_nodes[raw_id] = attrs
-        if len(local_nodes) >= max_nodes:
-            break
+        local_nodes[raw_id] = _parse_dot_attrs(m.group(2))
+
     node_map: Dict[str, str] = {}
     repr_name = path.parent.name if path.parent.name != "export" else path.stem
     added_nodes = added_edges = overlays = 0
@@ -192,14 +252,13 @@ def _ingest_dot(graph: GraphStore, path: Path, source_dir: Path, max_nodes: int,
         ))
         overlays += _register_overlay(graph, jid, attrs, source_dir)
         added_nodes += 1
-    edge_pattern = re.compile(r"^\s*\"?([^\"\s\[]+)\"?\s*->\s*\"?([^\"\s\[]+)\"?\s*(?:\[(.*?)\])?\s*;?\s*$", flags=re.M | re.S)
-    for m in edge_pattern.finditer(text):
+
+    for src_raw, dst_raw, attrs in pending_edges:
         if added_edges >= max_edges:
             break
-        sid, tid = node_map.get(m.group(1)), node_map.get(m.group(2))
+        sid, tid = node_map.get(src_raw), node_map.get(dst_raw)
         if not sid or not tid:
             continue
-        attrs = _parse_dot_attrs(m.group(3) or "")
         label = _first(attrs, "label", "LABEL")
         etype = _edge_type(label, repr_name)
         if graph.add_edge(Edge(sid, tid, etype, attrs={"joern_repr": repr_name, "joern_edge_label": label, "source_backend": "joern", **attrs})):

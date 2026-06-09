@@ -69,6 +69,100 @@ def _ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+def _norm_repo_relpath(path: str | None) -> str:
+    return (path or "").replace("\\", "/").strip().lstrip("/")
+
+
+def _path_parts(path: str | None) -> list[str]:
+    return [part for part in _norm_repo_relpath(path).split("/") if part and part not in {".", ".."}]
+
+
+def _candidate_target_paths(snapshot_path: Path, sample: SecVulEvalSample, *, scan_limit: int = 200) -> list[Path]:
+    """Return plausible target-file paths for dataset rows whose filepath may
+    include a repository-name prefix or stale benchmark prefix.
+
+    SecVulEval-style rows often contain paths such as
+    ``project_name/src/file.c`` while the checked-out worktree contains
+    ``src/file.c``.  Some rows also have stale prefixes after repository
+    renames.  Validation should therefore try exact/suffix candidates before
+    giving up with file_missing.
+    """
+    parts = _path_parts(sample.filepath)
+    seen: set[str] = set()
+    out: list[Path] = []
+
+    def add(rel: str | Path) -> None:
+        rel_s = _norm_repo_relpath(str(rel))
+        if not rel_s or rel_s in seen:
+            return
+        seen.add(rel_s)
+        out.append(snapshot_path / rel_s)
+
+    if parts:
+        add("/".join(parts))
+        project = (sample.project or "").strip().lower()
+        # Common case: dataset path starts with the project/repository name.
+        if len(parts) > 1 and project and parts[0].lower() == project:
+            add("/".join(parts[1:]))
+        # General suffix attempts.  This is cheap and catches repository-root
+        # prefix drift without scanning the tree.
+        for i in range(1, min(len(parts), 5)):
+            if len(parts[i:]) >= 1:
+                add("/".join(parts[i:]))
+
+    # If any direct/suffix candidate exists, do not scan the tree.
+    existing = [path for path in out if path.exists() and path.is_file()]
+    if existing:
+        return existing + [path for path in out if path not in existing]
+
+    # Last-resort filename scan.  Keep bounded because some challenge repos are
+    # large.  Prefer candidate files whose suffix overlaps most with the dataset
+    # path and that contain the target function name.
+    filename = parts[-1] if parts else ""
+    if not filename:
+        return out
+
+    suffixes = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+    if Path(filename).suffix.lower() not in suffixes:
+        return out
+
+    matches: list[tuple[int, int, Path]] = []
+    scanned = 0
+    try:
+        for cand in snapshot_path.rglob(filename):
+            if scanned >= scan_limit:
+                break
+            scanned += 1
+            if not cand.is_file():
+                continue
+            rel_parts = cand.relative_to(snapshot_path).as_posix().split("/")
+            # Ignore Git internals and common vendored binary/build trees.
+            lowered = "/".join(rel_parts).lower()
+            if "/.git/" in lowered or lowered.startswith(".git/"):
+                continue
+            tail_overlap = 0
+            for a, b in zip(reversed(parts), reversed(rel_parts)):
+                if a.lower() != b.lower():
+                    break
+                tail_overlap += 1
+            contains_fn = 0
+            if sample.func_name:
+                try:
+                    head = cand.read_text(encoding="utf-8", errors="ignore")[:250000]
+                    contains_fn = 1 if re.search(r"\b" + re.escape(sample.func_name) + r"\b", head) else 0
+                except Exception:
+                    contains_fn = 0
+            matches.append((contains_fn, tail_overlap, cand))
+    except Exception:
+        pass
+    matches.sort(key=lambda item: (item[0], item[1], -len(str(item[2]))), reverse=True)
+    for _, _, cand in matches[:25]:
+        if str(cand) not in seen:
+            seen.add(str(cand))
+            out.append(cand)
+    return out
+
+
 def normalize_newlines(text: str | None) -> str:
     return (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
@@ -174,12 +268,14 @@ class TargetValidator:
             return TargetValidation(sample.sample_id, "no_snapshot", False, False, 0.0, error="snapshot unavailable")
         if not sample.filepath:
             return TargetValidation(sample.sample_id, "missing_filepath", False, False, 0.0)
-        target_file = snapshot_path / sample.filepath
+        target_candidates = _candidate_target_paths(snapshot_path, sample)
+        target_file = next((p for p in target_candidates if p.exists() and p.is_file()), snapshot_path / sample.filepath)
         if not target_file.exists():
             return TargetValidation(sample.sample_id, "file_missing", False, False, 0.0, str(target_file))
         try:
+            resolved_relpath = target_file.relative_to(snapshot_path).as_posix()
             text = target_file.read_text(encoding="utf-8", errors="ignore")
-            funcs = extract_functions_from_text(text, relpath=sample.filepath)
+            funcs = extract_functions_from_text(text, relpath=resolved_relpath)
             candidates = [fn for fn in funcs if sample.func_name and fn.name == sample.func_name]
             function_found = bool(candidates)
             if not function_found and sample.func_name:

@@ -114,7 +114,7 @@ class GraphCache:
             force_rebuild=self.cfg.force_rebuild,
             build_if_missing=self.cfg.build_if_missing,
         )
-        if not self.cfg.force_rebuild and (out_dir / "nodes.jsonl").exists() and (out_dir / "edges.jsonl").exists():
+        if (not self.cfg.force_rebuild and (out_dir / "nodes.jsonl").exists() and (out_dir / "edges.jsonl").exists() and (out_dir / "graph.json").exists() and (out_dir / "manifest.json").exists()):
             if (out_dir / "graph.json").exists():
                 graph = load_codekg_as_project_graph(out_dir)
             else:

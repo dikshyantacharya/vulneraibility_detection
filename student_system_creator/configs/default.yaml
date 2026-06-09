@@ -1,0 +1,83 @@
+input:
+  dataset_path: data/raw/sec_vul_eval-train.arrow
+  dataset_mode: file
+  base_vckg_config: configs/45_curriculum_1_function_agentic_proof_qwen397b.yaml
+  repo_inventory_dir: cache/repo_inventory
+  require_repo_inventory_usable: false
+  use_pair_candidate_cache: true
+  pair_candidate_cache_path: cache/repo_inventory/pair_candidates_smallest_first.jsonl
+  clone_if_missing: false
+  worktree_dir: null
+  git_timeout_seconds: 180
+
+selection:
+  seed: 42
+  # Windows-hostile/very large repositories are skipped by default so the
+  # challenge build reaches KG creation instead of spending time on impossible
+  # worktrees. Remove patterns if you build inside Linux/WSL.
+  skip_projects: []
+  skip_project_patterns:
+    - chrome
+    - chromium
+    - android
+    - linux
+  max_projects: null
+  max_functions_per_project: 2
+  max_functions_per_label_per_project: 1
+  prefer_validated_pair_cache: true
+  # Requested target: 300 projects × {1 vulnerable, 1 non-vulnerable} = 600 test functions.
+  test_projects: 300
+  test_functions: 600
+  strict_test_size: false
+  include_projects_with_single_label_in_train: true
+  # Use cache/repo_inventory project-size/statistics caches to process smaller projects first.
+  order_by_project_size: true
+  unknown_size_last: true
+  body_match_threshold: 0.98
+  min_function_chars: 20
+  max_function_chars: null
+
+kg:
+  cache_dir: cache/kg
+  backend: auto
+  joern_home: tools/joern-cli
+  require_joern: false
+  joern_language: C
+  joern_timeout_seconds: 900
+  force_rebuild: false
+  build_if_missing: true
+  # copy = self-contained RAID private KG store; reference = registry points to existing cache/kg.
+  copy_kg_artifacts: true
+  kg_store_mode: copy
+
+api:
+  host: 127.0.0.1
+  port: 8000
+  api_key: dev-key
+  require_api_key: false
+  max_rounds: 5
+  max_queries_per_round: 2
+  max_queries_per_sample: 8
+  max_nodes_per_query: 500
+  timeout_per_sample_seconds: 120
+  allowed_query_kinds:
+    - security_context
+    - evidence_slice
+    - function_context
+    - call_neighborhood
+    - variable_flow
+    - semantic_facts
+    - file_context
+    - shortest_path
+
+output:
+  root: outputs/student_challenge
+  challenge_name: vckg_codekg_student_challenge
+  include_public_metadata: false
+  overwrite: false
+  make_raid_bundle: true
+  make_student_release_zip: true
+  make_organizer_private_zip: false
+  # Write a usable partial public/private challenge every N successfully materialized KGs.
+  # If you stop a long run with Ctrl+C, the already-created rows remain usable.
+  write_partial_every: 10

@@ -927,3 +927,56 @@ kg:
   cache_mode: run_local
   kg_out_dir: codekg
 ```
+
+## Student challenge system creator
+
+This project now includes a bounded student challenge generator in `student_system_creator/` and the package `student_system_creator`.
+
+Create a challenge from the existing dataset/repo/KG caches:
+
+```bash
+student-system-creator build --config student_system_creator/configs/default.yaml
+```
+
+Serve private CodeKG graphs through the challenge API:
+
+```bash
+student-system-creator serve --registry outputs/student_challenge/vckg_codekg_student_challenge/private/kg_registry_private.json --host 127.0.0.1 --port 8000
+```
+
+Evaluate a student `solution.py` through the controlled recursive agent loop:
+
+```bash
+student-system-creator evaluate \
+  --solution outputs/student_challenge/vckg_codekg_student_challenge/public/student_kit/solution.py \
+  --train outputs/student_challenge/vckg_codekg_student_challenge/public/train.csv \
+  --input outputs/student_challenge/vckg_codekg_student_challenge/public/test.csv \
+  --labels outputs/student_challenge/vckg_codekg_student_challenge/private/test_labels.csv \
+  --api-base http://127.0.0.1:8000 \
+  --out outputs/student_eval/demo
+```
+
+The student submission contract is intentionally fixed: `solution.py` must define `build_agent(config)`, and the returned agent must implement `step(sample, observation, budget)`. The evaluator controls recursion and KG-query budgets; the student controls query strategy and final reasoning.
+
+
+## Student System Creator command not found on Windows
+
+After copying the student system creator files into an existing checkout, reinstall the editable package so the console entry point is created in `.venv\Scripts`:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+student-system-creator build --config student_system_creator/configs/default.yaml
+```
+
+You can also run it without reinstalling through the included launcher:
+
+```powershell
+.\student-system-creator.ps1 build --config student_system_creator/configs/default.yaml
+```
+
+or directly with Python:
+
+```powershell
+$env:PYTHONPATH="src"
+python -m student_system_creator build --config student_system_creator/configs/default.yaml
+```
