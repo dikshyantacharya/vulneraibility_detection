@@ -38,10 +38,12 @@ export default function AgentTracePage() {
   const nav = useNavigate();
   const trace = useAsync(() => research.trace(runId!, sampleId!), [runId, sampleId]);
   const [calls, setCalls] = useState<any[]>([]);
+  const [kgUrl, setKgUrl] = useState<string | null>(null);
   const report = useAsync(() => research.report(runId!, sampleId!), [runId, sampleId]);
 
   useEffect(() => {
     research.llmCalls(runId!, sampleId!).then(setCalls).catch(() => setCalls([]));
+    research.kgDashboard(runId!, sampleId!).then((d) => setKgUrl(d.iframe_url)).catch(() => setKgUrl(null));
   }, [runId, sampleId]);
 
   const t = trace.data || {};
@@ -69,8 +71,9 @@ export default function AgentTracePage() {
         <span className="mono">{runId}</span>.
       </p>
       <div className="btn-row" style={{ marginBottom: 12 }}>
-        <button className="btn" onClick={() => nav(`/research/kg/${runId}/${sampleId}`)}>KG Query Flow</button>
-        <a className="btn" href={research.dashboardUrl(runId!, sampleId!)} target="_blank" rel="noreferrer">Open static dashboard</a>
+        <button className="btn primary" onClick={() => nav(`/research/kg/${runId}/${sampleId}`)}>Open CodeKG Dashboard</button>
+        {kgUrl && <a className="btn" href={kgUrl} target="_blank" rel="noreferrer">CodeKG dashboard ↗</a>}
+        <a className="btn" href={research.dashboardUrl(runId!, sampleId!)} target="_blank" rel="noreferrer">Legacy audit page</a>
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>

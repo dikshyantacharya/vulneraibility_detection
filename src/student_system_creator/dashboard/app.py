@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
+import time
 import requests
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -51,21 +53,57 @@ which proxies API + WebSocket calls to this backend.</p></div></body></html>"""
 
 
 class WSManager:
-    """Tracks connected websockets and forwards DashboardEvents to them."""
+    """Tracks connected websockets and forwards DashboardEvents to them.
+
+    Two kinds of sockets:
+      * "event" sockets (/ws/dashboard/events, /ws/dashboard/jobs/{id}) receive
+        the raw DashboardEvent stream, optionally filtered by job id.
+      * "dashboard" sockets (/ws/dashboard) receive translated control-plane
+        messages (job_created / job_updated / job_event / disk_updated /
+        health_updated) so the SPA never has to poll REST endpoints.
+    """
 
     def __init__(self) -> None:
-        self._conns: list[tuple[WebSocket, str | None]] = []
+        self._conns: list[tuple[WebSocket, str | None]] = []   # event sockets
+        self._dash_conns: list[WebSocket] = []                 # dashboard sockets
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._known_jobs: set[str] = set()
+        self._last_disk_ts: float = 0.0
+        self.disk_min_interval: float = 60.0
+        # Injected callbacks (set by create_app) — keep WSManager decoupled.
+        self.job_lookup: Callable[[str], Any] | None = None
+        self.disk_provider: Callable[[], dict[str, Any]] | None = None
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 
+    # ---- event sockets ------------------------------------------------
     async def connect(self, ws: WebSocket, job_id: str | None) -> None:
         await ws.accept()
         self._conns.append((ws, job_id))
 
     def disconnect(self, ws: WebSocket) -> None:
         self._conns = [(w, j) for (w, j) in self._conns if w is not ws]
+
+    # ---- dashboard sockets -------------------------------------------
+    async def connect_dashboard(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self._dash_conns.append(ws)
+
+    def disconnect_dashboard(self, ws: WebSocket) -> None:
+        self._dash_conns = [w for w in self._dash_conns if w is not ws]
+
+    def seed_known_jobs(self, job_ids: list[str]) -> None:
+        # Existing jobs must not trigger job_created on a fresh dashboard socket.
+        self._known_jobs.update(job_ids)
+
+    def _send(self, ws: WebSocket, payload: dict[str, Any]) -> None:
+        if self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(payload), self._loop)
+        except Exception:
+            pass
 
     def broadcast(self, event: DashboardEvent) -> None:
         # Called from the JobManager's background thread -> hop to the loop.
@@ -75,10 +113,46 @@ class WSManager:
         for ws, job_filter in list(self._conns):
             if job_filter and job_filter != event.job_id:
                 continue
-            try:
-                asyncio.run_coroutine_threadsafe(ws.send_json(payload), self._loop)
-            except Exception:
-                pass
+            self._send(ws, payload)
+        if self._dash_conns:
+            self._broadcast_dashboard(event)
+
+    def _broadcast_dashboard(self, event: DashboardEvent) -> None:
+        job_id = event.job_id
+        job = self.job_lookup(job_id) if (self.job_lookup and job_id) else None
+        job_dict = job.to_dict() if job else None
+        messages: list[dict[str, Any]] = []
+        if job_id and job_id not in self._known_jobs:
+            self._known_jobs.add(job_id)
+            if job_dict:
+                messages.append({"type": "job_created", "job": job_dict})
+        messages.append({"type": "job_event", "job_id": job_id, "event": event.to_dict()})
+        if job_dict:
+            messages.append({
+                "type": "job_updated",
+                "job_id": job_id,
+                "status": job_dict.get("status"),
+                "job": job_dict,
+                "progress": event.data if event.type == "progress" else None,
+            })
+        for ws in list(self._dash_conns):
+            for m in messages:
+                self._send(ws, m)
+        # Disk is expensive: only recompute when a job finishes, throttled to
+        # disk_min_interval. Never on a fixed timer.
+        if event.type == "status" and "finished" in (event.message or "").lower():
+            self.push_disk(force=False)
+
+    def push_disk(self, force: bool = False) -> None:
+        if not self.disk_provider or not self._dash_conns:
+            return
+        now = time.time()
+        if not force and (now - self._last_disk_ts) < self.disk_min_interval:
+            return
+        self._last_disk_ts = now
+        disk = self.disk_provider()
+        for ws in list(self._dash_conns):
+            self._send(ws, {"type": "disk_updated", "disk": disk})
 
 
 def _dir_size(path: Path, cap_files: int = 20000) -> int:
@@ -125,7 +199,33 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         env_loader=llm_env_loader
     )
 
+    def _polling_fallback_enabled() -> bool:
+        import os
+
+        if str(os.environ.get("VCKG_DASHBOARD_POLLING_FALLBACK", "")).strip() in ("1", "true", "yes", "on"):
+            return True
+        return bool(settings.extra.get("polling_fallback"))
+
+    def _health_payload() -> dict[str, Any]:
+        return {"ok": True, "service": "vckg-dashboard", "version": "0.1.0"}
+
+    def _disk_payload() -> dict[str, Any]:
+        root = Path(settings.project_root).resolve()
+        usage = shutil.disk_usage(str(root))
+        challenge = settings.resolve("challenge_root")
+        out = {
+            "drive_total_bytes": usage.total,
+            "drive_used_bytes": usage.used,
+            "drive_free_bytes": usage.free,
+            "drive_percent_used": round(usage.used / usage.total * 100, 1) if usage.total else 0,
+        }
+        if challenge.exists():
+            out["challenge_size_bytes"] = _dir_size(challenge)
+        return out
+
     ws_manager = WSManager()
+    ws_manager.job_lookup = jobs.get_job
+    ws_manager.disk_provider = _disk_payload
     jobs.add_global_listener(ws_manager.broadcast)
 
     _inv_cache: dict[str, ChallengeInventory] = {}
@@ -143,7 +243,7 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
     # ---- health / status / config / settings ------------------------
     @app.get("/api/dashboard/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "service": "vckg-dashboard", "version": "0.1.0"}
+        return _health_payload()
 
     @app.get("/api/dashboard/status")
     def status(mode: str = Query("admin")) -> dict[str, Any]:
@@ -526,19 +626,11 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
 
     # ---- disk -------------------------------------------------------
     @app.get("/api/dashboard/disk")
-    def disk() -> dict[str, Any]:
-        root = Path(settings.project_root).resolve()
-        usage = shutil.disk_usage(str(root))
-        challenge = settings.resolve("challenge_root")
-        out = {
-            "drive_total_bytes": usage.total,
-            "drive_used_bytes": usage.used,
-            "drive_free_bytes": usage.free,
-            "drive_percent_used": round(usage.used / usage.total * 100, 1) if usage.total else 0,
-        }
-        if challenge.exists():
-            out["challenge_size_bytes"] = _dir_size(challenge)
-        return out
+    def disk(push: bool = Query(False)) -> dict[str, Any]:
+        # Manual/explicit refresh also pushes to dashboard sockets (force).
+        if push:
+            ws_manager.push_disk(force=True)
+        return _disk_payload()
 
     @app.get("/api/dashboard/challenges")
     def challenges() -> list[dict[str, Any]]:
@@ -628,7 +720,48 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
             raise HTTPException(404, "dashboard file not found")
         return FileResponse(str(f))
 
+    # ---- old CodeKG static dashboard (the high-quality explorer) -----
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/kg-dashboard")
+    def research_kg_dashboard(run_id: str, sample_id: str) -> dict[str, Any]:
+        """Discover the old static CodeKG dashboard/index.html for a sample and
+        return a tokenised, sandboxed URL the SPA can embed in an iframe."""
+        return research.kg_dashboard(run_id, sample_id)
+
+    @app.get("/api/research/kg-dashboard/{token}/{path:path}")
+    def research_kg_dashboard_file(token: str, path: str = "index.html"):
+        """Serve the static dashboard (index.html + relative assets like
+        graph_data.json/JS/CSS) from a directory restricted to safe roots."""
+        f = research.kg_dashboard_file(token, path or "index.html")
+        if f is None:
+            raise HTTPException(404, "kg dashboard file not found")
+        return FileResponse(str(f))
+
     # ---- websockets -------------------------------------------------
+    @app.websocket("/ws/dashboard")
+    async def ws_dashboard(ws: WebSocket) -> None:
+        """Primary control-plane socket. Sends a one-time snapshot then pushes
+        incremental updates so the SPA never polls health/jobs/disk."""
+        await ws_manager.connect_dashboard(ws)
+        job_list = jobs.list_jobs()
+        ws_manager.seed_known_jobs([j["job_id"] for j in job_list])
+        snapshot = {
+            "type": "dashboard_snapshot",
+            "health": _health_payload(),
+            "disk": _disk_payload(),
+            "jobs": job_list,
+            "polling_fallback": _polling_fallback_enabled(),
+        }
+        try:
+            await ws.send_json(snapshot)
+            while True:
+                msg = await ws.receive_text()
+                if msg == "ping":
+                    await ws.send_json({"type": "pong"})
+        except WebSocketDisconnect:
+            ws_manager.disconnect_dashboard(ws)
+        except Exception:
+            ws_manager.disconnect_dashboard(ws)
+
     @app.websocket("/ws/dashboard/events")
     async def ws_events(ws: WebSocket) -> None:
         await ws_manager.connect(ws, None)
@@ -678,8 +811,60 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
     return app
 
 
+_QUIET_ACCESS_PATHS = (
+    "/api/dashboard/health",
+    "/api/dashboard/jobs",
+    "/api/dashboard/disk",
+    "/ws/dashboard",
+)
+
+
+def _access_log_should_emit(msg: str) -> bool:
+    """Return False to suppress a routine access-log line for a noisy path.
+
+    Matches the EXACT request path (so /api/dashboard/jobs/<id>/cancel is never
+    confused with the /api/dashboard/jobs list), and only suppresses successful
+    responses — any 4xx/5xx still logs so real errors are never hidden.
+    """
+    req = re.search(r'"[A-Z]+\s+(\S+)\s+HTTP/[\d.]+"', msg)
+    if not req:
+        return True
+    path = req.group(1).split("?")[0]
+    if path not in _QUIET_ACCESS_PATHS:
+        return True
+    status = re.search(r'"\s+(\d{3})', msg)
+    if status and status.group(1)[0] in ("4", "5"):
+        return True
+    return False
+
+
+def _install_quiet_access_log_filter() -> None:
+    """Drop routine uvicorn access-log lines for high-frequency no-op routes."""
+    import logging
+
+    class _QuietAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                return _access_log_should_emit(record.getMessage())
+            except Exception:
+                return True
+
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
+
+
+def _quiet_access_logs_enabled(settings: DashboardSettings) -> bool:
+    import os
+
+    if str(os.environ.get("VCKG_DASHBOARD_QUIET_ACCESS_LOGS", "")).strip() in ("1", "true", "yes", "on"):
+        return True
+    return bool(getattr(settings, "quiet_access_logs", False))
+
+
 def run(settings: DashboardSettings, settings_path: str | Path | None = None, reload: bool = False) -> None:
     import uvicorn
+
+    if _quiet_access_logs_enabled(settings):
+        _install_quiet_access_log_filter()
 
     if reload:
         # reload needs an import string; expose a module-level factory.

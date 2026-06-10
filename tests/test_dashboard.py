@@ -533,6 +533,106 @@ def test_http_400_body_captured_and_no_secret_logged(monkeypatch, caplog):
     assert "Authorization" not in log_text
 
 
+# --------------------------------------------------------------------------
+# WebSocket-first dashboard architecture (no REST polling by default)
+# --------------------------------------------------------------------------
+
+
+def test_ws_dashboard_sends_snapshot(client: TestClient):
+    with client.websocket_connect("/ws/dashboard") as ws:
+        snap = ws.receive_json()
+    assert snap["type"] == "dashboard_snapshot"
+    assert snap["health"]["ok"] is True
+    assert "drive_free_bytes" in snap["disk"]
+    assert isinstance(snap["jobs"], list)
+    assert "polling_fallback" in snap
+
+
+def test_wsmanager_translates_job_events():
+    """A raw DashboardEvent fans out to dashboard sockets as job_created (first
+    time) + job_event + job_updated. Unit-tested to avoid cross-thread timing."""
+    from student_system_creator.dashboard.app import WSManager
+    from student_system_creator.dashboard.events import DashboardEvent
+
+    mgr = WSManager()
+    sent: list = []
+    mgr._dash_conns = [object()]
+    mgr._send = lambda ws, payload: sent.append(payload)  # type: ignore
+
+    class _Job:
+        def to_dict(self):
+            return {"job_id": "j1", "status": "running", "type": "research_agentic_audit"}
+
+    mgr.job_lookup = lambda jid: _Job() if jid == "j1" else None
+
+    mgr._broadcast_dashboard(DashboardEvent(type="status", job_id="j1", message="started"))
+    types = [m["type"] for m in sent]
+    assert types == ["job_created", "job_event", "job_updated"]
+    assert sent[0]["job"]["job_id"] == "j1"
+    assert sent[2]["status"] == "running"
+
+    # A second event for the same job does NOT re-create it.
+    sent.clear()
+    mgr._broadcast_dashboard(DashboardEvent(type="progress", job_id="j1", data={"processed": 1}))
+    types2 = [m["type"] for m in sent]
+    assert "job_created" not in types2
+    assert "job_event" in types2 and "job_updated" in types2
+    assert sent[-1]["progress"] == {"processed": 1}
+
+
+def test_wsmanager_disk_updates_are_throttled():
+    from student_system_creator.dashboard.app import WSManager
+
+    mgr = WSManager()
+    sent: list = []
+
+    class _FakeWS:
+        pass
+
+    # Stub the loop hop so _send just records payloads.
+    mgr._dash_conns = [_FakeWS()]
+    mgr._send = lambda ws, payload: sent.append(payload)  # type: ignore
+    mgr.disk_provider = lambda: {"drive_free_bytes": 1}
+    mgr.disk_min_interval = 60.0
+
+    mgr.push_disk(force=False)   # first push allowed
+    mgr.push_disk(force=False)   # throttled (within 60s)
+    assert len(sent) == 1
+    mgr.push_disk(force=True)    # explicit/manual refresh always pushes
+    assert len(sent) == 2
+    assert all(p["type"] == "disk_updated" for p in sent)
+
+
+def test_quiet_access_log_predicate():
+    from student_system_creator.dashboard.app import _access_log_should_emit
+
+    # Suppress routine 200s on noisy paths
+    assert _access_log_should_emit('127.0.0.1 - "GET /api/dashboard/health HTTP/1.1" 200') is False
+    assert _access_log_should_emit('127.0.0.1 - "GET /api/dashboard/jobs HTTP/1.1" 200') is False
+    assert _access_log_should_emit('127.0.0.1 - "GET /api/dashboard/disk HTTP/1.1" 200') is False
+    # Never hide errors
+    assert _access_log_should_emit('127.0.0.1 - "GET /api/dashboard/jobs HTTP/1.1" 500') is True
+    # Always log unrelated paths
+    assert _access_log_should_emit('127.0.0.1 - "POST /api/dashboard/jobs/x/cancel HTTP/1.1" 200') is True
+    assert _access_log_should_emit('127.0.0.1 - "GET /api/research/runs HTTP/1.1" 200') is True
+
+
+def test_frontend_topbar_has_no_polling_interval():
+    # Guard against reintroducing continuous REST polling in the TopBar.
+    root = Path(__file__).resolve().parents[1]
+    topbar = (root / "frontend" / "src" / "components" / "TopBar.tsx").read_text(encoding="utf-8")
+    assert "setInterval" not in topbar
+    assert "useDashboard" in topbar
+
+
+def test_frontend_kgqueryflow_defaults_to_codekg_tab():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "frontend" / "src" / "pages" / "KGQueryFlowPage.tsx").read_text(encoding="utf-8")
+    assert 'useState<Tab>("codekg")' in page
+    # The recommended CodeKG dashboard tab must be declared first.
+    assert page.index('id: "codekg"') < page.index('id: "react"')
+
+
 def test_log_parser_progress_fields():
     parsed = parse_line("student_challenge.progress | processed=277/1178 | ready=237 | eta=37m42s | rate=23.9/min")
     assert parsed["data"]["processed"] == 277

@@ -63,6 +63,24 @@ export interface ResearchSample {
   model_backend?: string;
 }
 
+export interface KGDashboardCandidate {
+  dashboard_index: string;
+  graph_dir: string;
+  token: string;
+  iframe_url: string;
+}
+
+export interface KGDashboardInfo {
+  exists: boolean;
+  graph_dir: string | null;
+  dashboard_index: string | null;
+  iframe_url: string | null;
+  open_url: string | null;
+  candidates: KGDashboardCandidate[];
+  searched: string[];
+  reason?: string;
+}
+
 export const research = {
   health: () => http<{ ok: boolean; configs: number; runs: number }>("/health"),
   configs: () => http<{ name: string; path: string }[]>("/configs"),
@@ -76,6 +94,10 @@ export const research = {
   llmCalls: (run: string, s: string) => http<any[]>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/llm-calls`),
   kgQueries: (run: string, s: string) => http<any[]>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/kg-queries`),
   report: (run: string, s: string) => http<any>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/audit-report`),
+  // Old per-sample audit page (agent_demos/sample_x/index.html) — legacy.
   dashboardUrl: (run: string, s: string) =>
     `${BASE}/dash/${encodeURIComponent(run)}/${encodeURIComponent(s)}/index.html`,
+  // The high-quality static CodeKG explorer discovered from cache/kg.
+  kgDashboard: (run: string, s: string) =>
+    http<KGDashboardInfo>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/kg-dashboard`),
 };

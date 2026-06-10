@@ -1,15 +1,18 @@
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
-import { fmtBytes, useApp, useAsync } from "../state";
+import { fmtBytes, useApp, useAsync, useDashboard } from "../state";
 import MetricCard from "../components/MetricCard";
 
 export default function OverviewPage() {
   const { mode } = useApp();
   const nav = useNavigate();
+  // status + leakage are one-time snapshots (no interval). Disk + active-job
+  // counts come from the central WebSocket store, not a REST poll.
   const status = useAsync(() => api.status(mode), [mode]);
-  const disk = useAsync(() => api.disk(), []);
   const leakage = useAsync(() => api.leakage(), []);
+  const { disk, jobs } = useDashboard();
   const s = status.data;
+  const activeJobs = jobs.filter((j) => j.status === "running").length;
 
   return (
     <div>
@@ -34,9 +37,9 @@ export default function OverviewPage() {
         <MetricCard label="KG graphs" value={s?.kgs ?? "—"} sub="built & registered" />
         <MetricCard
           label="Active jobs"
-          value={s?.active_jobs ?? 0}
-          sub={`${s?.total_jobs ?? 0} total`}
-          accent={s?.active_jobs ? "blue" : undefined}
+          value={activeJobs}
+          sub={`${jobs.length} total`}
+          accent={activeJobs ? "blue" : undefined}
         />
       </div>
 
@@ -63,9 +66,9 @@ export default function OverviewPage() {
         />
         <MetricCard
           label="Disk free"
-          value={fmtBytes(disk.data?.drive_free_bytes)}
-          sub={`${disk.data?.drive_percent_used ?? "—"}% used`}
-          accent={disk.data && disk.data.drive_percent_used > 90 ? "red" : undefined}
+          value={fmtBytes(disk?.drive_free_bytes)}
+          sub={`${disk?.drive_percent_used ?? "—"}% used`}
+          accent={disk && disk.drive_percent_used > 90 ? "red" : undefined}
         />
         <MetricCard
           label="Public-id leakage"

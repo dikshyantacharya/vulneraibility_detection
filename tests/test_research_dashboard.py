@@ -125,6 +125,99 @@ def test_static_dashboard_traversal_guarded(client: TestClient):
     assert r.status_code in (404, 400)
 
 
+# --------------------------------------------------------------------------
+# Old CodeKG static dashboard discovery + secure serving
+# --------------------------------------------------------------------------
+
+def _make_codekg_dashboard(tmp_path: Path, repo_key: str = "rockhopper__249d7d9b9217",
+                           commit: str = "a971948ca5191e1c84335c646be5d5d554ca9a80") -> Path:
+    gdir = tmp_path / "cache" / "kg" / repo_key / commit / "project_v6" / "85b3bd63b04c"
+    dash = gdir / "dashboard"
+    dash.mkdir(parents=True)
+    (dash / "index.html").write_text("<html><body>CodeKG Explorer OLD</body></html>", encoding="utf-8")
+    (dash / "graph_data.json").write_text(json.dumps({"graph": {"nodes": [], "edges": []}}), encoding="utf-8")
+    return gdir
+
+
+def _set_final_prediction_graph_dir(tmp_path: Path, gdir: Path) -> None:
+    sd = tmp_path / "outputs" / "runs" / "20260101_000000__demo" / "agent_demos" / "sample_900_do_thing"
+    fp = json.loads((sd / "final_prediction.json").read_text())
+    fp["graph_dir"] = str(gdir)
+    (sd / "final_prediction.json").write_text(json.dumps(fp), encoding="utf-8")
+
+
+def test_kg_dashboard_found_from_graph_dir(client: TestClient, tmp_path: Path):
+    gdir = _make_codekg_dashboard(tmp_path)
+    _set_final_prediction_graph_dir(tmp_path, gdir)
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    assert info["exists"] is True
+    assert info["iframe_url"]
+    assert "dashboard" in info["dashboard_index"].replace("\\", "/")
+
+
+def test_kg_dashboard_found_from_log(client: TestClient, tmp_path: Path):
+    gdir = _make_codekg_dashboard(tmp_path, repo_key="logproj__deadbeef")
+    run_dir = tmp_path / "outputs" / "runs" / "20260101_000000__demo"
+    (run_dir / "run.log").write_text(
+        f"2026-01-01 INFO Dashboard written: {gdir / 'dashboard' / 'index.html'}\n",
+        encoding="utf-8",
+    )
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    assert info["exists"] is True
+    assert any("logproj__deadbeef" in c["dashboard_index"].replace("\\", "/") for c in info["candidates"])
+
+
+def test_kg_dashboard_static_serves_index(client: TestClient, tmp_path: Path):
+    gdir = _make_codekg_dashboard(tmp_path)
+    _set_final_prediction_graph_dir(tmp_path, gdir)
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    r = client.get(info["iframe_url"])
+    assert r.status_code == 200
+    assert "CodeKG Explorer OLD" in r.text
+
+
+def test_kg_dashboard_static_serves_graph_data(client: TestClient, tmp_path: Path):
+    gdir = _make_codekg_dashboard(tmp_path)
+    _set_final_prediction_graph_dir(tmp_path, gdir)
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    asset = info["iframe_url"].replace("index.html", "graph_data.json")
+    r = client.get(asset)
+    assert r.status_code == 200
+    assert "graph" in r.text
+
+
+def test_kg_dashboard_static_blocks_traversal(client: TestClient, tmp_path: Path):
+    gdir = _make_codekg_dashboard(tmp_path)
+    _set_final_prediction_graph_dir(tmp_path, gdir)
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    token = info["candidates"][0]["token"]
+    # path traversal out of the dashboard dir must not serve metrics.json
+    r = client.get(f"/api/research/kg-dashboard/{token}/../../../../../../metrics.json")
+    assert r.status_code in (400, 404)
+
+
+def test_kg_dashboard_token_outside_safe_root_blocked(client: TestClient, tmp_path: Path):
+    import base64
+    # A crafted token pointing at an arbitrary file outside safe roots is rejected.
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top secret", encoding="utf-8")
+    token = base64.urlsafe_b64encode(str(secret.parent).encode()).decode().rstrip("=")
+    r = client.get(f"/api/research/kg-dashboard/{token}/secret.txt")
+    assert r.status_code in (400, 404)
+
+
+def test_kg_dashboard_missing_reports_searched_paths(client: TestClient):
+    rid = client.get("/api/research/runs").json()[0]["run_id"]
+    info = client.get(f"/api/research/runs/{rid}/samples/900/kg-dashboard").json()
+    assert info["exists"] is False
+    assert "searched" in info and isinstance(info["searched"], list)
+
+
 def test_research_job_selection_enforced(tmp_path: Path):
     _make_research_tree(tmp_path)
     import yaml

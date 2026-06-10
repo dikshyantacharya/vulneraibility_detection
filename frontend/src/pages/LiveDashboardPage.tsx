@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
-import { subscribeEvents, subscribeJob } from "../api/websocket";
-import { fmtDuration, useAsync } from "../state";
+import { subscribeJob } from "../api/websocket";
+import { fmtDuration, useDashboard } from "../state";
 import type { DashboardEvent, Job } from "../api/types";
 import JobStatusBadge from "../components/JobStatusBadge";
 import LogViewer, { LogLine } from "../components/LogViewer";
@@ -26,18 +26,18 @@ interface Progress {
 export default function LiveDashboardPage() {
   const { jobId } = useParams();
   const nav = useNavigate();
-  const jobsRes = useAsync(() => api.jobs(), []);
+  const { jobs: allJobs } = useDashboard();
   const [events, setEvents] = useState<DashboardEvent[]>([]);
   const [progress, setProgress] = useState<Progress>({});
   const [job, setJob] = useState<Job | null>(null);
   const seen = useRef(0);
 
-  // pick active or selected job
+  // pick active or selected job (job list comes from the central WS store)
   const activeJob = useMemo(() => {
     if (jobId) return jobId;
-    const running = (jobsRes.data || []).find((j) => j.status === "running");
+    const running = allJobs.find((j) => j.status === "running");
     return running?.job_id;
-  }, [jobId, jobsRes.data]);
+  }, [jobId, allJobs]);
 
   useEffect(() => {
     if (!activeJob) return;
@@ -87,12 +87,12 @@ export default function LiveDashboardPage() {
         <div className="card">
           <p className="muted">No running job. Recent jobs:</p>
           <div className="btn-row">
-            {(jobsRes.data || []).slice(0, 8).map((j) => (
+            {allJobs.slice(0, 8).map((j) => (
               <button key={j.job_id} className="btn" onClick={() => nav(`/live/${j.job_id}`)}>
                 {j.type} · {j.status}
               </button>
             ))}
-            {(jobsRes.data || []).length === 0 && <span className="muted">none yet — start one from Build.</span>}
+            {allJobs.length === 0 && <span className="muted">none yet — start one from Build.</span>}
           </div>
         </div>
       )}

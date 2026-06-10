@@ -40,8 +40,11 @@ export default function KGExplorerPage() {
 
   return (
     <div>
-      <h1 className="page-title">KG Explorer</h1>
-      <p className="page-sub">Interactive in-browser KG view (replaces the static index.html dump).</p>
+      <h1 className="page-title">KG Explorer <span className="badge amber">experimental</span></h1>
+      <p className="page-sub">
+        Lightweight in-browser KG view. For full source-grounded analysis use the high-quality static
+        CodeKG dashboard from a run's KG Query Flow page.
+      </p>
 
       <div className="toolbar">
         <select value={current || ""} onChange={(e) => setCurrent(e.target.value)} style={{ maxWidth: 360 }}>

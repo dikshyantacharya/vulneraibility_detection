@@ -31,6 +31,9 @@ class DashboardSettings:
     slow_query_seconds: float = 10.0
     theme: str = "light"
     external_env_path: str = "C:/Users/DikshyantAcharya/Personal/env"
+    # Suppress routine uvicorn access logs for high-frequency/no-op routes
+    # (health/jobs/disk/ws) while still logging errors + job lifecycle.
+    quiet_access_logs: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod

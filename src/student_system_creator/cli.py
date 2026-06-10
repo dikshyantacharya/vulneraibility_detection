@@ -22,6 +22,8 @@ def _run_dashboard(args) -> int:
         settings.challenge_root = args.challenge
     settings.host = args.host
     settings.port = args.port
+    if getattr(args, "quiet_access_logs", False):
+        settings.quiet_access_logs = True
     Path(args.settings).parent.mkdir(parents=True, exist_ok=True)
     settings.save(args.settings)
     reload = bool(getattr(args, "reload", False)) or args.cmd == "dashboard-dev"
@@ -97,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     p_dash.add_argument("--host", default="127.0.0.1")
     p_dash.add_argument("--port", type=int, default=8080)
     p_dash.add_argument("--reload", action="store_true", help="Auto-reload backend on code change (dev)")
+    p_dash.add_argument("--quiet-access-logs", action="store_true",
+                        help="Suppress routine access logs for health/jobs/disk/ws (errors still log)")
 
     p_dash_dev = sub.add_parser("dashboard-dev", help="Start the dashboard backend with auto-reload for frontend dev (Vite proxies to it)")
     p_dash_dev.add_argument("--config", default="student_system_creator/configs/default.yaml")
