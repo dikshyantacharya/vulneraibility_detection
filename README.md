@@ -2,6 +2,27 @@
 
 This package now vendors the standalone `codekg` project and uses it as the default knowledge-graph backend for vulnerability-audit runs. The existing dataset loading, repository/snapshot resolution, LLM reasoning, agent loop, and audit-report workflow are preserved. The old `ProjectGraphBuilder` remains only as an explicit compatibility escape hatch via `kg.use_codekg: false`.
 
+## Control Dashboard (React)
+
+A browser-based control plane for the student-challenge / KG workflow now ships
+alongside the CLI. It launches the existing commands as durable, streamed jobs and
+adds live progress, a KG explorer, an agent-query audit, validation/evaluation
+reports, and admin/student preview modes. All existing CLI commands are unchanged.
+
+```powershell
+pip install -e ".[dashboard]"          # FastAPI + uvicorn
+cd frontend; npm install; npm run build; cd ..
+student-system-creator dashboard --config student_system_creator/configs/default.yaml --port 8080
+# open http://127.0.0.1:8080
+```
+
+Dev mode (hot-reload): run `student-system-creator dashboard-dev` and, in another
+terminal, `cd frontend && npm run dev`. Full docs:
+[docs/DASHBOARD.md](docs/DASHBOARD.md),
+[docs/DASHBOARD_API.md](docs/DASHBOARD_API.md),
+[docs/FRONTEND_DEVELOPMENT.md](docs/FRONTEND_DEVELOPMENT.md),
+[docs/ADMIN_WORKFLOW.md](docs/ADMIN_WORKFLOW.md).
+
 ## What changed
 
 The vulnerability pipeline now builds CodeKG artifacts under each run directory, normally:

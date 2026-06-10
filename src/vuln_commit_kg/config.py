@@ -20,6 +20,9 @@ class DatasetConfig(BaseModel):
     sample_limit: int | None = 1
     sample_selection: Literal["standard", "smallest_vuln_fixed_pair", "smallest_vuln_fixed_pairs_by_project", "explicit_pair"] = "standard"
     explicit_pair_indices: list[int] = Field(default_factory=list)
+    # Dashboard-driven explicit selection (additive; empty = no constraint).
+    only_sample_ids: list[str] = Field(default_factory=list)
+    only_function_names: list[str] = Field(default_factory=list)
     pair_require_same_function: bool = True
     pair_require_same_file: bool = True
 
@@ -29,6 +32,10 @@ class DatasetConfig(BaseModel):
     # matches exactly or above snapshot.body_match_threshold.  This prevents
     # function-name-only / 0-similarity cases from reaching KG/LLM stages.
     validation_aware_pair_selection: bool = False
+    # When true, only selected sample IDs run exactly as specified (no pair expansion).
+    # When false (default), pair expansion runs if validation_aware_pair_selection or
+    # sample_selection mode is pair-based. Only enforced if only_sample_ids is non-empty.
+    exact_sample_ids_only: bool = False
     validated_pair_limit: int | None = None
     candidate_pair_limit: int | None = None
     candidate_pair_oversample_factor: int = 6

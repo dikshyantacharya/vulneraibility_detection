@@ -86,7 +86,11 @@ def select_samples(samples: list[SecVulEvalSample], cfg: Any, seed: int = 0) -> 
         rows = [s for s in rows if s.project.lower() not in exclude and str(s.project_url or "").lower() not in exclude]
     if getattr(cfg, "require_project_url", False) and not getattr(cfg, "allow_missing_repo_fields", False):
         rows = [s for s in rows if s.project_url]
-    if getattr(cfg, "sample_selection", "standard") in {"smallest_vuln_fixed_pair", "smallest_vuln_fixed_pairs_by_project", "explicit_pair"}:
+
+    # If exact_sample_ids_only is true and only_sample_ids is specified, skip pair selection.
+    exact_ids_requested = getattr(cfg, "exact_sample_ids_only", False) and getattr(cfg, "only_sample_ids", None)
+
+    if not exact_ids_requested and getattr(cfg, "sample_selection", "standard") in {"smallest_vuln_fixed_pair", "smallest_vuln_fixed_pairs_by_project", "explicit_pair"}:
         if getattr(cfg, "sample_selection", "") == "explicit_pair" and getattr(cfg, "explicit_pair_indices", None):
             wanted = {int(x) for x in cfg.explicit_pair_indices}
             rows = [s for s in rows if s.idx in wanted]
@@ -114,6 +118,13 @@ def select_samples(samples: list[SecVulEvalSample], cfg: Any, seed: int = 0) -> 
     if getattr(cfg, "project_limit", None) and getattr(cfg, "sample_selection", "standard") == "standard":
         keep = {p.project for p in sorted(summarize_projects(rows), key=lambda p:(p.num_samples,p.project))[:int(cfg.project_limit)]}
         rows = [s for s in rows if s.project in keep]
+    # Dashboard-driven explicit selection (additive; empty lists are no-ops).
+    only_ids = {str(x) for x in getattr(cfg, "only_sample_ids", []) or []}
+    if only_ids:
+        rows = [s for s in rows if str(s.sample_id) in only_ids or str(s.idx) in only_ids]
+    only_funcs = {str(x).lower() for x in getattr(cfg, "only_function_names", []) or []}
+    if only_funcs:
+        rows = [s for s in rows if str(getattr(s, "func_name", "")).lower() in only_funcs]
     if getattr(cfg, "sample_limit", None) is not None:
         rows = rows[:int(cfg.sample_limit)]
     return rows

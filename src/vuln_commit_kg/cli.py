@@ -17,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--limit", type=int, default=None, help="Override dataset.sample_limit.")
         p.add_argument("--output-root", default=None, help="Override experiment.output_root.")
         p.add_argument("--model-backend", default=None, choices=["mock", "openai_compatible", "gguf", "hf", "llama_server"], help="Override model.backend.")
+        p.add_argument("--sample-ids", default=None, help="Comma-separated sample ids to restrict the run to (dashboard selection).")
+        p.add_argument("--function-names", default=None, help="Comma-separated function names to restrict the run to.")
+        p.add_argument("--selection-file", default=None, help="JSON file with dataset selection overrides {only_sample_ids, only_function_names, project_include, sample_limit}.")
         if name == "estimate-cost":
             p.add_argument("--completion-tokens-per-call", type=int, default=None, help="Assumed completion budget per model call for pre-flight API cost estimates.")
 
@@ -108,6 +111,19 @@ def _load_and_override(args) -> tuple:
         cfg.experiment.output_root = args.output_root
     if getattr(args, "model_backend", None) is not None:
         cfg.model.backend = args.model_backend
+    # Dashboard-driven explicit selection (additive; safe no-ops when unset).
+    if getattr(args, "selection_file", None):
+        import json as _json
+        sel = _json.loads(Path(args.selection_file).read_text(encoding="utf-8"))
+        for key in ("only_sample_ids", "only_function_names", "project_include", "project_exclude"):
+            if sel.get(key) is not None:
+                setattr(cfg.dataset, key, list(sel[key]))
+        if sel.get("sample_limit") is not None:
+            cfg.dataset.sample_limit = int(sel["sample_limit"])
+    if getattr(args, "sample_ids", None):
+        cfg.dataset.only_sample_ids = [x.strip() for x in args.sample_ids.split(",") if x.strip()]
+    if getattr(args, "function_names", None):
+        cfg.dataset.only_function_names = [x.strip() for x in args.function_names.split(",") if x.strip()]
     return cfg, Path(args.config)
 
 

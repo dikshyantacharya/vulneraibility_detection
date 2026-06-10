@@ -28,6 +28,7 @@ gguf = ["llama-cpp-python>=0.2.80"]
 llama-server = []
 api = ["requests>=2.31"]
 tokens = ["tiktoken>=0.6"]
+dashboard = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 dev = ["pytest>=7.4", "ruff>=0.2"]
 all = [
   "pyarrow>=14.0", "datasets>=2.16", "torch>=2.1", "transformers>=4.38",

@@ -9,6 +9,27 @@ from .server.api_server import main as serve_main
 from .validate_challenge import main as validate_main
 
 
+def _run_dashboard(args) -> int:
+    from pathlib import Path
+
+    from .dashboard.app import run
+    from .dashboard.settings import DashboardSettings
+
+    settings = DashboardSettings.load(args.settings)
+    settings.project_root = "."
+    settings.config_path = args.config
+    if args.challenge:
+        settings.challenge_root = args.challenge
+    settings.host = args.host
+    settings.port = args.port
+    Path(args.settings).parent.mkdir(parents=True, exist_ok=True)
+    settings.save(args.settings)
+    reload = bool(getattr(args, "reload", False)) or args.cmd == "dashboard-dev"
+    print(f"Starting VCKG dashboard at http://{settings.host}:{settings.port} (mode default={settings.default_mode})", flush=True)
+    run(settings, settings_path=args.settings, reload=reload)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="student-system-creator")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -69,7 +90,24 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--query-timeout-seconds", type=int, default=30)
     p_eval.add_argument("--quiet", action="store_true")
 
+    p_dash = sub.add_parser("dashboard", help="Start the React control dashboard (REST + WebSocket + UI)")
+    p_dash.add_argument("--config", default="student_system_creator/configs/default.yaml")
+    p_dash.add_argument("--challenge", default=None, help="Default challenge folder to inspect")
+    p_dash.add_argument("--settings", default="outputs/dashboard/settings.json", help="Dashboard settings JSON (created if missing)")
+    p_dash.add_argument("--host", default="127.0.0.1")
+    p_dash.add_argument("--port", type=int, default=8080)
+    p_dash.add_argument("--reload", action="store_true", help="Auto-reload backend on code change (dev)")
+
+    p_dash_dev = sub.add_parser("dashboard-dev", help="Start the dashboard backend with auto-reload for frontend dev (Vite proxies to it)")
+    p_dash_dev.add_argument("--config", default="student_system_creator/configs/default.yaml")
+    p_dash_dev.add_argument("--challenge", default=None)
+    p_dash_dev.add_argument("--settings", default="outputs/dashboard/settings.json")
+    p_dash_dev.add_argument("--host", default="127.0.0.1")
+    p_dash_dev.add_argument("--port", type=int, default=8080)
+
     args, rest = parser.parse_known_args(argv)
+    if args.cmd in ("dashboard", "dashboard-dev"):
+        return _run_dashboard(args)
     if args.cmd == "build":
         build_args = ["--config", args.config, "--progress-every", str(args.progress_every)]
         if args.limit is not None:
