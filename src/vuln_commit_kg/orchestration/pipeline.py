@@ -2170,9 +2170,23 @@ class CommitKGPipeline:
     def _load_selected_samples(self) -> list[SecVulEvalSample]:
         self._dashboard_load_repo_inventory()
         all_samples = load_samples(self.cfg.dataset.path, self.cfg.dataset.mode, self.logger)
-        if self.cfg.dataset.validation_aware_pair_selection:
+        # Exact sample selection (dashboard "selected_samples" / exact_sample_ids_only)
+        # overrides validation-aware pair selection. Pair candidate loading expands
+        # the selection to vulnerable/fixed pairs and ignores only_sample_ids, so we
+        # must skip it entirely when the caller asked for exact ids only.
+        exact_ids_requested = bool(
+            getattr(self.cfg.dataset, "exact_sample_ids_only", False)
+            and getattr(self.cfg.dataset, "only_sample_ids", None)
+        )
+        if self.cfg.dataset.validation_aware_pair_selection and not exact_ids_requested:
             samples = self._load_validation_aware_pair_candidates(all_samples)
         else:
+            if exact_ids_requested and self.cfg.dataset.validation_aware_pair_selection:
+                self.logger.info(
+                    "sample_selection.exact_override | exact_sample_ids_only=true | "
+                    "validation_aware_pair_selection disabled for this run | only_sample_ids=%s",
+                    list(self.cfg.dataset.only_sample_ids),
+                )
             samples = select_samples(all_samples, self.cfg.dataset, self.cfg.experiment.seed)
         if not samples:
             raise RuntimeError("No samples selected. Check dataset config/project filters.")

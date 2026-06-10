@@ -417,6 +417,13 @@ class ModelConfig(BaseModel):
     # top-level request-body fields, for providers such as vLLM/AcademicCloud
     # that expose vendor-specific controls. Keep empty for strict OpenAI APIs.
     api_extra_body: dict[str, Any] = Field(default_factory=dict)
+    # Strict compatibility mode for gateways that reject vendor extensions (e.g.
+    # AcademicCloud's chat-completions gateway returns HTTP 400 on unknown body
+    # fields such as chat_template_kwargs/response_format). When true, the
+    # OpenAI-compatible adapter sends ONLY the universally supported keys
+    # (model, messages, temperature, top_p, max_tokens, and stop if set) and
+    # ignores api_extra_body / response_format / chat_template_kwargs.
+    api_minimal_payload: bool = False
     # Qwen3/AcademicCloud thinking control. The AcademicCloud Qwen 3.5 endpoint
     # returns hidden reasoning in message.reasoning unless the request body
     # includes chat_template_kwargs.enable_thinking=false. When enabled, the

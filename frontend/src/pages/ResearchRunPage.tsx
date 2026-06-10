@@ -190,6 +190,10 @@ export default function ResearchRunPage() {
           mode: sample_ids.length ? "selected_samples" : "all",
           sample_ids,
           exact_sample_ids_only: sample_ids.length > 0,
+          // Exact selection must not expand to vulnerable/fixed pairs (e.g. 18452
+          // would otherwise also run its fixed pair 18453). The server disables
+          // every pair-selection mechanism when this is false.
+          include_pairs: false,
           limit: limit ? Number(limit) : undefined,
         },
         llm: {

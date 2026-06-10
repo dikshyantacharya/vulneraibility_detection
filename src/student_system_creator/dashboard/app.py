@@ -285,22 +285,33 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         except Exception as e:
             return {"ok": False, "message": f"Chat test failed: {str(e)}"}
 
+    def _effective_model_config(profile_id: str, model: str) -> Any:
+        """Build the exact ModelConfig the audit pipeline would use for this
+        profile/model, so the preflight payload matches the real request body
+        (including AcademicCloud's minimal-payload compatibility mode)."""
+        from vuln_commit_kg.config import ModelConfig
+        from student_system_creator.dashboard.jobs import _apply_llm_override
+
+        cfg_dict: dict[str, Any] = {}
+        _apply_llm_override(cfg_dict, profile_id, model)
+        return ModelConfig.model_validate(cfg_dict.get("model", {}))
+
     def _test_openai_compatible_chat(prof: Any, model: str, prompt: str, creds: dict[str, str]) -> dict[str, Any]:
-        """Test chat with OpenAI-compatible provider."""
+        """Test chat with OpenAI-compatible provider using the SAME payload
+        construction as the real pipeline (build_chat_payload), so payload
+        incompatibility is caught before an audit starts."""
+        from vuln_commit_kg.models.openai_compatible import build_chat_payload
+
         headers = {"Content-Type": "application/json"}
         if creds.get("api_key"):
             headers["Authorization"] = f"Bearer {creds['api_key']}"
 
+        mcfg = _effective_model_config(prof.profile_id, model)
         url = prof.base_url.rstrip("/") + "/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_tokens": 100,
-        }
+        payload = build_chat_payload(mcfg, prompt)
 
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code == 200:
                 data = r.json()
                 response_text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -308,16 +319,21 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
                     "ok": True,
                     "profile_id": prof.profile_id,
                     "model": model,
+                    "payload_keys": sorted(payload.keys()),
+                    "minimal_payload": bool(getattr(mcfg, "api_minimal_payload", False)),
                     "response": response_text[:200],
                     "message": "Chat test successful",
                 }
             else:
+                # Surface the actual provider error body, not just "Bad Request".
                 return {
                     "ok": False,
                     "profile_id": prof.profile_id,
                     "model": model,
                     "status_code": r.status_code,
-                    "message": f"HTTP {r.status_code}: {r.text[:200]}",
+                    "payload_keys": sorted(payload.keys()),
+                    "provider_message": (r.text or "")[:500],
+                    "message": f"HTTP {r.status_code}: {(r.text or '')[:300]}",
                 }
         except requests.exceptions.Timeout:
             return {

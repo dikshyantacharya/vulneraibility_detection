@@ -7,6 +7,7 @@ on a real (large) built challenge.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -225,14 +226,49 @@ def _write_base_config(root: Path) -> Path:
     return p
 
 
-def _run_research_argv(tmp_path: Path, kg: dict, llm: dict | None = None):
-    base_cfg = _write_base_config(tmp_path)
+def _write_pair_config(root: Path) -> Path:
+    """A config 46-like base with validation-aware pair selection + AcademicCloud
+    model extras, used to test that exact selection / model override neutralise it."""
+    cfg = {
+        "experiment": {"name": "curriculum_..._academiccloud_qwen397b_live"},
+        "dataset": {
+            "sample_selection": "smallest_vuln_fixed_pairs_by_project",
+            "validation_aware_pair_selection": True,
+            "validated_pair_limit": 1,
+            "candidate_pair_limit": 20,
+            "use_cached_pair_candidates": True,
+            "validation_candidate_stream_until_valid_pairs": True,
+        },
+        "kg": {"backend": "auto"},
+        "model": {
+            "backend": "openai_compatible",
+            "api_base": "https://chat-ai.academiccloud.de/v1",
+            "model_name": "qwen3.5-397b-a17b",
+            "max_tokens": 4096,
+            "api_disable_thinking": True,
+            "api_extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "model_fallbacks": ["qwen3.5-397b-a17b", "llama-3.3-70b-instruct"],
+        },
+    }
+    p = root / "config46_like.yaml"
+    p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    return p
+
+
+def _run_research_argv(
+    tmp_path: Path,
+    kg: dict,
+    llm: dict | None = None,
+    selection: dict | None = None,
+    base_cfg: Path | None = None,
+):
+    base_cfg = base_cfg or _write_base_config(tmp_path)
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     ctx = JobContext(tmp_path, "default_config", "default_challenge")
     params = {
         "config_path": str(base_cfg),
-        "selection": {"sample_ids": ["18452"]},
+        "selection": selection or {"sample_ids": ["18452"]},
         "kg": kg,
     }
     if llm:
@@ -322,6 +358,179 @@ def test_kg_backends_endpoint(client: TestClient):
     jp = next(o for o in data["options"] if o["id"] == "joern_plus")
     assert jp["effective_backend"] == "joern"
     assert "joern_plus" not in data["allowed_backend_values"]
+
+
+# --------------------------------------------------------------------------
+# Issue 1: exact sample selection overrides validation-aware pair selection
+# --------------------------------------------------------------------------
+
+
+def test_exact_selection_selects_only_requested_sample(tmp_path: Path):
+    base_cfg = _write_pair_config(tmp_path)
+    job_dir, _ = _run_research_argv(
+        tmp_path,
+        kg={"preset": "joern_plus"},
+        selection={"sample_ids": ["18452"], "exact_sample_ids_only": True, "include_pairs": False},
+        base_cfg=base_cfg,
+    )
+    cfg = yaml.safe_load((job_dir / "effective_config.yaml").read_text(encoding="utf-8"))
+    ds = cfg["dataset"]
+    assert ds["only_sample_ids"] == ["18452"]
+    assert ds["exact_sample_ids_only"] is True
+
+
+def test_exact_selection_disables_pair_mechanisms(tmp_path: Path):
+    base_cfg = _write_pair_config(tmp_path)
+    job_dir, _ = _run_research_argv(
+        tmp_path,
+        kg={"preset": "joern_plus"},
+        selection={"sample_ids": ["18452"], "exact_sample_ids_only": True},
+        base_cfg=base_cfg,
+    )
+    ds = yaml.safe_load((job_dir / "effective_config.yaml").read_text(encoding="utf-8"))["dataset"]
+    assert ds["validation_aware_pair_selection"] is False
+    assert ds["sample_selection"] == "standard"
+    assert ds["validated_pair_limit"] is None
+    assert ds["candidate_pair_limit"] is None
+    assert ds["use_cached_pair_candidates"] is False
+    assert ds["validation_candidate_stream_until_valid_pairs"] is False
+
+
+def test_include_pairs_keeps_pair_selection(tmp_path: Path):
+    base_cfg = _write_pair_config(tmp_path)
+    job_dir, _ = _run_research_argv(
+        tmp_path,
+        kg={"preset": "joern_plus"},
+        selection={"sample_ids": ["18452"], "exact_sample_ids_only": True, "include_pairs": True},
+        base_cfg=base_cfg,
+    )
+    ds = yaml.safe_load((job_dir / "effective_config.yaml").read_text(encoding="utf-8"))["dataset"]
+    # Opt-in: pair selection is preserved from the base config.
+    assert ds["validation_aware_pair_selection"] is True
+
+
+def test_pipeline_exact_override_skips_pair_loading(monkeypatch):
+    """The pipeline routes exact selection through select_samples, not pair loading."""
+    from types import SimpleNamespace
+    from vuln_commit_kg.orchestration import pipeline as pl
+
+    captured = {"pair_called": False, "select_called": False}
+    monkeypatch.setattr(pl, "load_samples", lambda *a, **k: [object()])
+    monkeypatch.setattr(
+        pl, "select_samples",
+        lambda all_samples, ds, seed: captured.__setitem__("select_called", True) or all_samples,
+    )
+
+    ds = SimpleNamespace(
+        path="x", mode="file",
+        validation_aware_pair_selection=True,
+        exact_sample_ids_only=True, only_sample_ids=["18452"],
+    )
+    pipe = SimpleNamespace(
+        cfg=SimpleNamespace(dataset=ds, experiment=SimpleNamespace(seed=0)),
+        logger=logging.getLogger("test"),
+        _dashboard_load_repo_inventory=lambda: None,
+        _load_validation_aware_pair_candidates=lambda all_samples: captured.__setitem__("pair_called", True) or all_samples,
+    )
+    result = pl.CommitKGPipeline._load_selected_samples(pipe)
+    assert result  # non-empty
+    assert captured["select_called"] is True
+    assert captured["pair_called"] is False
+
+
+# --------------------------------------------------------------------------
+# Issue 2: AcademicCloud model override + payload + 400 capture
+# --------------------------------------------------------------------------
+
+
+def test_selected_model_overrides_config_and_no_qwen397b_leak(tmp_path: Path):
+    base_cfg = _write_pair_config(tmp_path)
+    job_dir, _ = _run_research_argv(
+        tmp_path,
+        kg={"preset": "joern_plus"},
+        llm={"profile_id": "academiccloud", "model": "qwen3-coder-30b-a3b-instruct",
+             "temperature": 0.0, "max_tokens": 2048},
+        base_cfg=base_cfg,
+    )
+    cfg = yaml.safe_load((job_dir / "effective_config.yaml").read_text(encoding="utf-8"))
+    mc = cfg["model"]
+    assert mc["model_name"] == "qwen3-coder-30b-a3b-instruct"
+    assert mc["model_fallbacks"] == ["qwen3-coder-30b-a3b-instruct"]
+    assert mc["api_minimal_payload"] is True
+    assert mc["api_extra_body"] == {}
+    assert mc["api_disable_thinking"] is False
+    assert mc["max_tokens"] == 2048
+    assert "qwen397b" not in cfg["experiment"]["name"]
+    # llm_profile_used.json records the effective model
+    used = json.loads((job_dir / "llm_profile_used.json").read_text(encoding="utf-8"))
+    assert used["effective_model_name"] == "qwen3-coder-30b-a3b-instruct"
+    assert used["api_minimal_payload"] is True
+
+
+def test_academiccloud_payload_minimal_keys_only():
+    from vuln_commit_kg.config import ModelConfig
+    from vuln_commit_kg.models.openai_compatible import build_chat_payload
+    from student_system_creator.dashboard.jobs import _apply_llm_override
+
+    cfg_dict: dict = {}
+    _apply_llm_override(cfg_dict, "academiccloud", "qwen3-coder-30b-a3b-instruct")
+    mcfg = ModelConfig.model_validate(cfg_dict["model"])
+    payload = build_chat_payload(mcfg, "hi", system="sys")
+    assert set(payload.keys()) <= {"model", "messages", "temperature", "top_p", "max_tokens", "stop"}
+    assert "chat_template_kwargs" not in payload
+    assert "response_format" not in payload
+    assert payload["model"] == "qwen3-coder-30b-a3b-instruct"
+
+
+def test_non_minimal_payload_includes_extras():
+    from vuln_commit_kg.config import ModelConfig
+    from vuln_commit_kg.models.openai_compatible import build_chat_payload
+
+    mcfg = ModelConfig.model_validate({
+        "backend": "openai_compatible",
+        "model_name": "m",
+        "request_json_object": True,
+        "api_disable_thinking": True,
+        "api_extra_body": {"foo": "bar"},
+    })
+    payload = build_chat_payload(mcfg, "hi")
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["foo"] == "bar"
+    assert payload["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_http_400_body_captured_and_no_secret_logged(monkeypatch, caplog):
+    from vuln_commit_kg.config import ModelConfig
+    from vuln_commit_kg.models import openai_compatible as oc
+
+    monkeypatch.setenv("ACADEMIC_CLOUD_API_KEY", "sk-super-secret-xyz")
+
+    class _Resp:
+        status_code = 400
+        ok = False
+        headers = {"content-type": "application/json"}
+        text = '{"error":{"message":"model qwen3.5-397b-a17b does not exist"}}'
+
+    monkeypatch.setattr(oc.requests, "post", lambda *a, **k: _Resp())
+
+    mcfg = ModelConfig.model_validate({
+        "backend": "openai_compatible",
+        "api_base": "https://chat-ai.academiccloud.de/v1",
+        "api_key_env": "ACADEMIC_CLOUD_API_KEY",
+        "model_name": "qwen3.5-397b-a17b",
+        "api_minimal_payload": True,
+    })
+    model = oc.OpenAICompatibleModel(mcfg)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(oc.requests.HTTPError) as exc:
+            model.generate("hello")
+    msg = str(exc.value)
+    assert "does not exist" in msg  # provider message surfaced
+    assert "400" in msg
+    # No secret anywhere in the raised message or logs
+    log_text = msg + " " + " ".join(r.getMessage() for r in caplog.records)
+    assert "sk-super-secret-xyz" not in log_text
+    assert "Authorization" not in log_text
 
 
 def test_log_parser_progress_fields():

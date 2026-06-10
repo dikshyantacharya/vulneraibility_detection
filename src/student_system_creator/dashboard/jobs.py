@@ -19,6 +19,7 @@ Durable layout (survives server restart + browser refresh):
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -64,6 +65,28 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+# Dataset fields that drive validation-aware vulnerable/fixed pair selection in
+# the pipeline (names taken verbatim from vuln_commit_kg.config.DatasetConfig and
+# configs/46_*.yaml). Exact sample selection must neutralise all of them.
+_PAIR_SELECTION_DISABLE: dict[str, Any] = {
+    "sample_selection": "standard",
+    "validation_aware_pair_selection": False,
+    "validated_pair_limit": None,
+    "candidate_pair_limit": None,
+    "use_cached_pair_candidates": False,
+    "build_pair_candidate_cache": False,
+    "validation_candidate_stream_until_valid_pairs": False,
+    "validation_candidate_clone_mirrors": False,
+    "explicit_pair_indices": [],
+}
+
+
+def _disable_pair_selection(ds: dict[str, Any]) -> None:
+    """Force exact, non-pair selection on a dataset config block in-place."""
+    for key, value in _PAIR_SELECTION_DISABLE.items():
+        ds[key] = value
 
 
 def _validate_effective_config(path: Path) -> None:
@@ -209,6 +232,15 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
     if sel.get("limit") is not None:
         ds["sample_limit"] = int(sel["limit"])
 
+    # Exact sample selection must override every validation-aware pair-selection
+    # mechanism inherited from the base config (e.g. config 46). Otherwise the
+    # pipeline oversamples vulnerable/fixed pairs and the run would also classify
+    # the fixed counterpart (e.g. 18453) of the requested vulnerable sample (18452).
+    # `include_pairs: true` opts back into pair expansion explicitly.
+    exact_requested = bool(ds.get("exact_sample_ids_only")) and not sel.get("include_pairs")
+    if exact_requested:
+        _disable_pair_selection(ds)
+
     kg = params.get("kg") or {}
     kgc = base.setdefault("kg", {})
     # The UI sends a high-level KG *preset* (e.g. "joern_plus") which is NOT a
@@ -234,13 +266,24 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
         profile_id = llm_spec.get("profile_id")
         selected_model = llm_spec.get("model")
         if profile_id and selected_model:
-            _apply_llm_override(base, profile_id, selected_model)
-            # Persist which profile/model was used
+            _apply_llm_override(
+                base,
+                profile_id,
+                selected_model,
+                temperature=llm_spec.get("temperature"),
+                max_tokens=llm_spec.get("max_tokens"),
+            )
+            mc = base.get("model", {})
+            # Persist which profile/model was used, plus the effective config
+            # values so it is unambiguous what really ran (no qwen397b leak).
             llm_used = {
                 "profile_id": profile_id,
                 "model": selected_model,
-                "temperature": llm_spec.get("temperature"),
-                "max_tokens": llm_spec.get("max_tokens"),
+                "effective_model_name": mc.get("model_name"),
+                "api_base": mc.get("api_base"),
+                "api_minimal_payload": mc.get("api_minimal_payload", False),
+                "temperature": mc.get("temperature"),
+                "max_tokens": mc.get("max_tokens"),
             }
             (job_dir / "llm_profile_used.json").write_text(
                 json.dumps(llm_used, indent=2), encoding="utf-8"
@@ -261,7 +304,20 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
             json.dumps(kg_used, indent=2), encoding="utf-8"
         )
 
-    base.setdefault("experiment", {})["output_root"] = str((job_dir / "runs").as_posix())
+    # Never write raw credentials into the effective config. Only api_key_env
+    # references are allowed; strip any inline secret-bearing keys inherited from
+    # the base config (these are also not valid AppConfig fields).
+    model_block = base.get("model")
+    if isinstance(model_block, dict):
+        for secret_key in ("api_key", "api_secret", "authorization", "token"):
+            model_block.pop(secret_key, None)
+
+    exp_block = base.setdefault("experiment", {})
+    exp_block["output_root"] = str((job_dir / "runs").as_posix())
+    # experiment.name is required by AppConfig; ensure one exists even if the
+    # base config omitted it and no LLM override supplied a name.
+    if not exp_block.get("name"):
+        exp_block["name"] = f"dashboard_audit_{job_dir.name}"
 
     effective = job_dir / "effective_config.yaml"
     effective.write_text(yaml.safe_dump(base, sort_keys=False), encoding="utf-8")
@@ -280,11 +336,36 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
     return argv
 
 
-def _apply_llm_override(config: dict[str, Any], profile_id: str, model: str) -> None:
+def _strip_vendor_thinking_extras(model_cfg: dict[str, Any]) -> None:
+    """Remove provider-specific generation extras inherited from the base config.
+
+    Gateways like AcademicCloud reject unknown chat-completions body fields
+    (e.g. chat_template_kwargs) with HTTP 400. For such providers we force a
+    minimal OpenAI-compatible payload and drop the extras unless the user has
+    explicitly re-enabled them.
+    """
+    model_cfg["api_minimal_payload"] = True
+    model_cfg["api_extra_body"] = {}
+    model_cfg["api_disable_thinking"] = False
+    model_cfg["api_force_no_think"] = False
+    model_cfg["request_json_object"] = False
+
+
+def _apply_llm_override(
+    config: dict[str, Any],
+    profile_id: str,
+    model: str,
+    *,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> None:
     """Apply LLM provider/model override to config.
 
-    Modifies config in-place to use the selected provider/model.
-    Uses api_key_env for credentials (never writes secrets to config).
+    Modifies config in-place to use the selected provider/model. Uses
+    api_key_env for credentials (never writes secrets to config). The selected
+    UI model fully overrides the base config model (no qwen397b leak): the
+    fallback list is clamped to the selected model and the experiment name is
+    rewritten so the run directory does not imply an unselected model.
     """
     model_cfg = config.setdefault("model", {})
 
@@ -293,6 +374,8 @@ def _apply_llm_override(config: dict[str, Any], profile_id: str, model: str) -> 
         model_cfg["api_base"] = "https://chat-ai.academiccloud.de/v1"
         model_cfg["model_name"] = model
         model_cfg["api_key_env"] = "ACADEMIC_CLOUD_API_KEY"
+        # AcademicCloud's gateway returns 400 on vendor extensions -> minimal.
+        _strip_vendor_thinking_extras(model_cfg)
 
     elif profile_id == "tu_berlin_ollama":
         # Use OpenAI-compatible endpoint (smallest robust solution)
@@ -307,6 +390,25 @@ def _apply_llm_override(config: dict[str, Any], profile_id: str, model: str) -> 
         model_cfg["api_base"] = "https://api.openai.com/v1"
         model_cfg["model_name"] = model
         model_cfg["api_key_env"] = "OPENAI_API_KEY"
+    else:
+        # Unknown profile: still honour the selected model, leave endpoint as-is.
+        model_cfg["model_name"] = model
+
+    if temperature is not None:
+        model_cfg["temperature"] = float(temperature)
+    if max_tokens is not None:
+        model_cfg["max_tokens"] = int(max_tokens)
+
+    # The selected model must win over any base-config model_fallbacks (config
+    # 46 lists qwen3.5-397b-a17b first); clamp fallbacks to the selected model
+    # so a transient error cannot silently switch to an unselected model.
+    model_cfg["model_fallbacks"] = [model]
+
+    # Avoid leaking an unselected model name through the run directory, which is
+    # derived from experiment.name.
+    exp = config.setdefault("experiment", {})
+    safe_model = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_").lower()
+    exp["name"] = f"dashboard_audit_{profile_id}_{safe_model}"
 
 
 JOB_BUILDERS: dict[str, JobBuilder] = {
