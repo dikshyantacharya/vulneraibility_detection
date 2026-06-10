@@ -100,4 +100,115 @@ export const research = {
   // The high-quality static CodeKG explorer discovered from cache/kg.
   kgDashboard: (run: string, s: string) =>
     http<KGDashboardInfo>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/kg-dashboard`),
+  runSummary: (run: string, mode = "admin") =>
+    http<RunSummary>(`/runs/${encodeURIComponent(run)}/summary?mode=${mode}`),
+  runMetrics: (run: string, mode = "admin") =>
+    http<LiveMetrics>(`/runs/${encodeURIComponent(run)}/metrics-live?mode=${mode}`),
+  sampleNormalized: (run: string, s: string, mode = "admin") =>
+    http<NormalizedSample>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/trace-normalized?mode=${mode}`),
+  sampleStages: (run: string, s: string) =>
+    http<Stage[]>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/stages`),
 };
+
+export interface RunLLM {
+  provider_id?: string;
+  provider_name?: string;
+  base_url?: string;
+  model?: string;
+  model_backend?: string;
+  temperature?: number;
+  max_tokens?: number;
+  minimal_payload?: boolean;
+}
+export interface RunKG {
+  preset?: string;
+  display_name?: string;
+  effective_backend?: string;
+  graph_dir?: string;
+  dashboard_url?: string;
+  dashboard_exists?: boolean;
+  reuse_cache?: boolean;
+  force_rebuild?: boolean;
+}
+export interface RunSummary {
+  run_id: string;
+  config_name?: string;
+  status?: string;
+  started_at?: string;
+  finished_at?: string;
+  llm: RunLLM;
+  kg: RunKG;
+  selection: { exact_sample_ids_only?: boolean; include_pairs?: boolean; sample_ids?: string[] };
+  usage?: any;
+  samples_requested: number;
+  samples_completed: number;
+  samples_failed: number;
+  metrics?: Record<string, number> | null;
+  metrics_available: boolean;
+  metrics_reason?: string;
+}
+export interface LiveMetrics {
+  available: boolean;
+  reason?: string;
+  processed?: number;
+  single_sample?: boolean;
+  tp?: number; tn?: number; fp?: number; fn?: number;
+  accuracy?: number; precision?: number; recall?: number; f1?: number;
+  vulnerable_recall?: number; safe_recall?: number;
+  per_sample?: any[];
+}
+export interface Stage {
+  index: number;
+  stage: string;
+  status?: string;
+  source?: string;
+  prompt?: string | null;
+  system?: string | null;
+  response?: string | null;
+  parsed_json?: any;
+  prompt_chars?: number | null;
+  response_chars?: number | null;
+  tokens?: { prompt?: number; completion?: number; total?: number } | null;
+  elapsed_seconds?: number | null;
+  json_status?: string | null;
+  json_expected?: boolean;
+  json_valid?: boolean | null;
+  repaired_next?: boolean;
+  error?: string | null;
+  is_repair?: boolean;
+  is_planning?: boolean;
+  is_final?: boolean;
+}
+export interface NormalizedSample {
+  run_id: string;
+  sample_id: string;
+  project?: string;
+  function?: string;
+  filepath?: string;
+  status?: string;
+  failed?: boolean;
+  failed_stage?: string | null;
+  last_completed_stage?: string | null;
+  error_type?: string | null;
+  error_message?: string | null;
+  provider_error?: string | null;
+  true_label?: string | null;
+  prediction?: string | null;
+  prediction_available?: boolean;
+  confidence?: number | null;
+  confidence_available?: boolean;
+  correct?: boolean | null;
+  decision_status?: string;
+  verdict_text?: string | null;
+  primary_vulnerability_type?: string;
+  parse_error?: string;
+  resolved_commit?: string;
+  kg_loaded?: boolean;
+  initial_retrieval?: boolean;
+  kg_queries_count?: number;
+  llm: RunLLM;
+  kg: RunKG & { nodes?: number | null; edges?: number | null; target_found?: boolean | null };
+  usage?: any;
+  stages: Stage[];
+  kg_queries: any[];
+}

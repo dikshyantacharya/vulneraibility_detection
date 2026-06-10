@@ -607,6 +607,27 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         return {"job_id": job_id, "lines": lines[-tail:], "total": len(lines)}
 
+    _JOB_VIEWABLE_FILES = {
+        "llm_profile_used.json", "kg_builder_used.json", "selection.json",
+        "effective_config.yaml", "job.json", "result.json",
+    }
+
+    @app.get("/api/dashboard/jobs/{job_id}/file")
+    def job_file(job_id: str, name: str = Query(...)) -> dict[str, Any]:
+        """Read-only view of a small allow-listed artifact inside a job folder."""
+        if name not in _JOB_VIEWABLE_FILES:
+            raise HTTPException(400, "file not viewable")
+        job = jobs.get_job(job_id)
+        job_dir = (Path(job.dir) if job else jobs.root / job_id).resolve()
+        target = (job_dir / name).resolve()
+        try:
+            target.relative_to(job_dir)
+        except ValueError:
+            raise HTTPException(400, "invalid path")
+        if not target.is_file():
+            raise HTTPException(404, "file not found")
+        return {"job_id": job_id, "name": name, "content": target.read_text(encoding="utf-8", errors="replace")}
+
     # ---- reports ----------------------------------------------------
     @app.get("/api/dashboard/reports/validation")
     def validation_report() -> dict[str, Any]:
@@ -635,6 +656,15 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
     @app.get("/api/dashboard/challenges")
     def challenges() -> list[dict[str, Any]]:
         return discover_challenges(settings.resolve("outputs_root"))
+
+    @app.get("/api/dashboard/inventory-summary")
+    def inventory_summary(mode: str = Query("admin")) -> dict[str, Any]:
+        """End-to-end readiness: dataset → cloned repos → KG → research → challenge.
+        Computed on demand (manual Refresh) — never on a continuous timer."""
+        dataset_path = settings.extra.get("dataset_path") or "data/raw/sec_vul_eval-train.arrow"
+        return research.inventory_summary(
+            str(settings.resolve("challenge_root")), dataset_path, mode  # type: ignore[arg-type]
+        )
 
     @app.get("/api/dashboard/leakage")
     def leakage() -> dict[str, Any]:
@@ -680,9 +710,40 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
             raise HTTPException(404, "unknown run")
         return d
 
+    @app.get("/api/research/runs/{run_id}/summary")
+    def research_run_summary(run_id: str, mode: str = Query("admin")) -> dict[str, Any]:
+        d = research.run_summary(run_id, mode)  # type: ignore[arg-type]
+        if d is None:
+            raise HTTPException(404, "unknown run")
+        return d
+
+    @app.get("/api/research/runs/{run_id}/metrics-live")
+    def research_run_metrics(run_id: str, mode: str = Query("admin")) -> dict[str, Any]:
+        return research.run_live_metrics(run_id, mode)  # type: ignore[arg-type]
+
     @app.get("/api/research/runs/{run_id}/samples")
     def research_run_samples(run_id: str) -> list[dict[str, Any]]:
         return research.list_samples(run_id)
+
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/normalized")
+    def research_sample_normalized(run_id: str, sample_id: str, mode: str = Query("admin")) -> dict[str, Any]:
+        d = research.sample_normalized(run_id, sample_id, mode)  # type: ignore[arg-type]
+        if d is None:
+            raise HTTPException(404, "unknown sample")
+        return d
+
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/trace-normalized")
+    def research_trace_normalized(run_id: str, sample_id: str, mode: str = Query("admin")) -> dict[str, Any]:
+        """Robust trace object that survives failed/partial runs (recovers the
+        stage timeline + failure reason from run logs when artifacts are empty)."""
+        d = research.trace_normalized(run_id, sample_id, mode)  # type: ignore[arg-type]
+        if d is None:
+            raise HTTPException(404, "unknown sample")
+        return d
+
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/stages")
+    def research_sample_stages(run_id: str, sample_id: str) -> list[dict[str, Any]]:
+        return research.sample_stages(run_id, sample_id)
 
     @app.get("/api/research/runs/{run_id}/samples/{sample_id}")
     def research_sample(run_id: str, sample_id: str) -> dict[str, Any]:

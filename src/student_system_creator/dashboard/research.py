@@ -24,7 +24,22 @@ from typing import Any
 import yaml
 
 # Config keys that may hold secrets and must never be returned to the UI.
-_SECRET_HINTS = ("api_key", "apikey", "token", "secret", "password")
+# NOTE: a bare "token" hint wrongly redacts token *counts* (prompt_tokens,
+# completion_tokens, total_tokens) which are NOT secrets. We match credential
+# tokens specifically and exempt count-style keys.
+_SECRET_HINTS = ("api_key", "apikey", "secret", "password", "authorization",
+                 "access_token", "api_token", "bearer", "auth_token")
+# Token-count keys that must NEVER be redacted (they are integers, not secrets).
+_TOKEN_COUNT_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                     "num_tokens", "tokens", "max_tokens", "token_count",
+                     "avg_total_tokens_per_prediction")
+
+
+def _is_secret_key(key: str) -> bool:
+    k = str(key).lower()
+    if k in _TOKEN_COUNT_KEYS or k.endswith("_tokens") or k.endswith("token_count"):
+        return False
+    return any(h in k for h in _SECRET_HINTS)
 
 
 def _read_json(path: Path) -> Any:
@@ -53,7 +68,7 @@ def _mask_secrets(obj: Any) -> Any:
     if isinstance(obj, dict):
         masked = {}
         for k, v in obj.items():
-            if any(h in str(k).lower() for h in _SECRET_HINTS):
+            if _is_secret_key(k):
                 masked[k] = "***redacted***"
             else:
                 masked[k] = _mask_secrets(v)
@@ -61,6 +76,38 @@ def _mask_secrets(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_mask_secrets(v) for v in obj]
     return obj
+
+
+# Decision-status values that mean "no real final prediction yet" — these are
+# placeholders written at agent_loop_start that survive a failed/interrupted run.
+_INCOMPLETE_STATUSES = {"running", "in_progress", "in progress", "pending",
+                        "agent_loop_start", "started", ""}
+
+
+def _prediction_is_available(fp: dict[str, Any] | None) -> bool:
+    """True only if final_prediction holds a real decision (not a placeholder).
+
+    A failed run leaves is_vulnerable=false / confidence=0.0 / decision_status=
+    "running"; that must NOT be read as a real "safe" prediction.
+    """
+    if not fp:
+        return False
+    status = str(fp.get("decision_status") or "").strip().lower()
+    if status in _INCOMPLETE_STATUSES or "running" in status or "progress" in status:
+        return False
+    if fp.get("parse_error"):
+        # parse failures are completed-but-invalid; still not a usable prediction
+        return False
+    return fp.get("is_vulnerable") is not None
+
+
+# Log line patterns for recovering a partial stage timeline + KG summary when a
+# run failed before persisting per-sample model_calls / agent_trace.
+_RE_GEN_START = re.compile(r"model\.generate_start \| sample=(?P<sid>\S+) \| stage=(?P<stage>\S+)(?: \| attempt=(?P<attempt>\S+))?(?: \| prompt_chars=(?P<pc>\d+))?")
+_RE_GEN_DONE = re.compile(r"model\.generate_done \| sample=(?P<sid>\S+) \| stage=(?P<stage>\S+)(?: \| attempt=(?P<attempt>\S+))?(?: \| elapsed=(?P<el>[\d.]+)s)?(?: \| response_chars=(?P<rc>\d+))?(?: \| completion_tokens=(?P<ct>\d+))?")
+_RE_GEN_ERROR = re.compile(r"model\.generate_error \| sample=(?P<sid>\S+) \| stage=(?P<stage>\S+)(?: \| attempt=(?P<attempt>\S+))?(?: \| elapsed=(?P<el>[\d.]+)s)?(?: \| (?P<msg>.*))?")
+_RE_KG_TOOLS = re.compile(r"agent\.kg_tools \| sample=(?P<sid>\S+) \| round=(?P<round>\S+) \| queries=(?P<q>\d+) \| returned_items=(?P<ri>\d+) \| evidence_items=(?P<ei>\d+)")
+_RE_SAMPLE_FAILED = re.compile(r"Sample failed: (?P<sid>\S+)")
 
 
 class ResearchInventory:
@@ -176,12 +223,16 @@ class ResearchInventory:
         out = []
         for sd in self._sample_dirs(d):
             fp = _read_json(sd / "final_prediction.json") or {}
+            avail = _prediction_is_available(fp)
             out.append({
                 "sample_id": fp.get("sample_id") or sd.name.split("_")[1] if "_" in sd.name else sd.name,
                 "dir": sd.name,
                 "function_name": "_".join(sd.name.split("_")[2:]) or None,
-                "prediction": "vulnerable" if fp.get("is_vulnerable") else ("safe" if fp.get("is_vulnerable") is False else None),
-                "confidence": fp.get("confidence"),
+                # Only surface a prediction when one really exists — a failed run's
+                # placeholder (is_vulnerable=false) is NOT "safe".
+                "prediction": (None if not avail else ("vulnerable" if fp.get("is_vulnerable") else "safe")),
+                "prediction_available": avail,
+                "confidence": fp.get("confidence") if avail else None,
                 "decision_status": fp.get("decision_status"),
                 "resolved_commit": fp.get("resolved_commit_id"),
                 "model_backend": fp.get("model_backend"),
@@ -224,6 +275,22 @@ class ResearchInventory:
         q = trace.get("kg_queries") or trace.get("kg_tool_steps") or []
         if not q:
             q = _read_jsonl(sd / "kg_tool_calls.jsonl")
+        if not q:
+            # Fallback: recover a summary-only entry from the run log's
+            # "agent.kg_tools queries=N returned_items=N evidence_items=N" line.
+            run_dir = self._resolve_run(run_id)
+            if run_dir:
+                _, ls = self._parse_log_stages(run_dir, sample_id)
+                if ls.get("kg_queries"):
+                    return [{
+                        "_summary_only": True,
+                        "query_type": "agent_kg_tools (summary)",
+                        "queries": ls.get("kg_queries"),
+                        "returned_items": ls.get("kg_returned_items"),
+                        "evidence_items": ls.get("kg_evidence_items"),
+                        "reason": "Detailed query payload unavailable; only log summary found.",
+                    }]
+            return []
         return _mask_secrets(q)
 
     def audit_report(self, run_id: str, sample_id: str) -> dict[str, Any] | None:
@@ -449,6 +516,618 @@ class ResearchInventory:
         if not self._under_safe_root(candidate):
             return None
         return candidate if candidate.is_file() else None
+
+    # ---- provider / job-artifact resolution -------------------------
+    #
+    # Runs started from the dashboard live at <job>/runs/<run_id> and the job
+    # directory holds llm_profile_used.json / kg_builder_used.json /
+    # selection.json / effective_config.yaml. We surface the REAL provider and
+    # model (e.g. "AcademicCloud · qwen3-coder-30b-a3b-instruct") instead of the
+    # generic model_backend ("openai_compatible").
+
+    _PROVIDER_DISPLAY = {
+        "academiccloud": "AcademicCloud",
+        "tu_berlin_ollama": "TU Berlin / MLSEC Ollama",
+        "openai": "OpenAI",
+    }
+
+    def _job_dir_for(self, run_dir: Path) -> Path | None:
+        if run_dir.parent.name == "runs":
+            jd = run_dir.parent.parent
+            if (jd / "job.json").exists() or (jd / "llm_profile_used.json").exists():
+                return jd
+        return None
+
+    def run_meta(self, run_id: str) -> dict[str, Any]:
+        """Provider/model/KG/selection/status metadata for a run (no secrets)."""
+        run_dir = self._resolve_run(run_id)
+        if not run_dir:
+            return {}
+        job_dir = self._job_dir_for(run_dir)
+        llm = _read_json(job_dir / "llm_profile_used.json") if job_dir else None
+        kg = _read_json(job_dir / "kg_builder_used.json") if job_dir else None
+        sel = _read_json(job_dir / "selection.json") if job_dir else None
+        job = _read_json(job_dir / "job.json") if job_dir else None
+        cfg = _read_json(run_dir / "resolved_config.yaml")  # may be None (yaml)
+        if cfg is None and (run_dir / "resolved_config.yaml").exists():
+            try:
+                cfg = yaml.safe_load((run_dir / "resolved_config.yaml").read_text(encoding="utf-8"))
+            except Exception:
+                cfg = None
+        model_cfg = (cfg or {}).get("model") or {}
+        ds_cfg = (cfg or {}).get("dataset") or {}
+
+        provider_id = (llm or {}).get("profile_id")
+        provider_name = self._PROVIDER_DISPLAY.get(provider_id, provider_id) if provider_id else None
+        model = (llm or {}).get("effective_model_name") or (llm or {}).get("model") or model_cfg.get("model_name")
+        base_url = (llm or {}).get("api_base") or model_cfg.get("api_base")
+        params = (job or {}).get("params") or {}
+        sel_params = params.get("selection") or {}
+        return {
+            "run_id": run_id,
+            "config_name": Path(((job or {}).get("params") or {}).get("config_path") or "").name or None,
+            "status": (job or {}).get("status"),
+            "created_at": (job or {}).get("created_at"),
+            "started_at": (job or {}).get("started_at"),
+            "finished_at": (job or {}).get("finished_at"),
+            "llm": {
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "base_url": base_url,
+                "model": model,
+                "model_backend": model_cfg.get("backend"),
+                "temperature": (llm or {}).get("temperature", model_cfg.get("temperature")),
+                "max_tokens": (llm or {}).get("max_tokens", model_cfg.get("max_tokens")),
+                "minimal_payload": (llm or {}).get("api_minimal_payload", model_cfg.get("api_minimal_payload")),
+            },
+            "kg": {
+                "preset": (kg or {}).get("preset"),
+                "display_name": (kg or {}).get("display_name"),
+                "effective_backend": (kg or {}).get("effective_backend") or ((cfg or {}).get("kg") or {}).get("backend"),
+                "reuse_cache": (kg or {}).get("reuse_cache"),
+                "force_rebuild": (kg or {}).get("force_rebuild"),
+            },
+            "selection": {
+                "exact_sample_ids_only": ds_cfg.get("exact_sample_ids_only") or sel_params.get("exact_sample_ids_only"),
+                "include_pairs": sel_params.get("include_pairs"),
+                "sample_ids": (sel or {}).get("sample_ids") or sel_params.get("sample_ids") or [],
+            },
+            "usage": _read_json(run_dir / "usage_summary.json"),
+        }
+
+    def _binary_metrics(self, run_dir: Path) -> dict[str, Any] | None:
+        m = _read_json(run_dir / "metrics.json") or {}
+        b = m.get("binary")
+        return b if isinstance(b, dict) else None
+
+    def run_summary(self, run_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
+        run_dir = self._resolve_run(run_id)
+        if not run_dir:
+            return None
+        meta = self.run_meta(run_id)
+        samples = self.list_samples(run_id)
+        # "completed" = a real, valid prediction exists (not a placeholder).
+        completed = sum(1 for s in samples if s.get("prediction_available"))
+        failed_path = run_dir / "failed_samples.jsonl"
+        failed = len(_read_jsonl(failed_path)) if failed_path.exists() else 0
+        if not failed:
+            failed = sum(1 for s in samples if not s.get("prediction_available"))
+        requested = len(meta.get("selection", {}).get("sample_ids") or []) or len(samples)
+        pending = max(0, requested - completed - failed)
+        out = {
+            **meta,
+            "samples_requested": requested,
+            "samples_completed": completed,
+            "samples_failed": failed,
+            "samples_pending": pending,
+            "mtime": run_dir.stat().st_mtime,
+        }
+        b = self._binary_metrics(run_dir)
+        n_valid = int(b.get("valid_predictions") if (b and b.get("valid_predictions") is not None) else (b.get("n") if b else 0) or 0)
+        if mode != "admin":
+            out["metrics"] = None
+            out["metrics_available"] = False
+            out["metrics_reason"] = "labels not available in this mode"
+        elif not b or n_valid == 0 or completed == 0:
+            out["metrics"] = None
+            out["metrics_available"] = False
+            out["metrics_reason"] = "no completed predictions"
+        else:
+            out["metrics"] = {k: b.get(k) for k in ("n", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1")}
+            out["metrics_available"] = True
+            out["metrics_note"] = "single-sample metric" if n_valid <= 1 else (f"{failed} failed excluded" if failed else None)
+        return out
+
+    def run_live_metrics(self, run_id: str, mode: Mode = "admin") -> dict[str, Any]:
+        """Confusion matrix + per-sample correctness. Admin-only (uses labels)."""
+        run_dir = self._resolve_run(run_id)
+        if not run_dir:
+            return {"available": False, "reason": "unknown run"}
+        if mode != "admin":
+            return {"available": False, "reason": "labels not available in student/public mode"}
+        b = self._binary_metrics(run_dir)
+        if not b:
+            return {"available": False, "reason": "Metrics unavailable: labels not available for this run"}
+        # Only count valid completed predictions — never fabricate FN/FP from a
+        # failed sample that has no real prediction.
+        n_valid = int(b.get("valid_predictions") if b.get("valid_predictions") is not None else (b.get("n") or 0))
+        samples = self.list_samples(run_id)
+        completed = sum(1 for s in samples if s.get("prediction_available"))
+        failed = len(_read_jsonl(run_dir / "failed_samples.jsonl")) if (run_dir / "failed_samples.jsonl").exists() else 0
+        if not failed:
+            failed = sum(1 for s in samples if not s.get("prediction_available"))
+        if n_valid == 0 or completed == 0:
+            return {"available": False,
+                    "reason": "Metrics unavailable: no completed predictions",
+                    "completed_predictions": completed, "failed_samples": failed,
+                    "pending_samples": max(0, len(samples) - completed - failed)}
+        rows = b.get("rows") or []
+        per = []
+        # Enrich rows with project/function from per-sample correctness if present.
+        m = _read_json(run_dir / "metrics.json") or {}
+        corr = {str(r.get("sample_id")): r for r in (m.get("prediction_correctness") or {}).get("per_sample_correctness", [])}
+        for r in rows:
+            sid = str(r.get("sample_id"))
+            c = corr.get(sid, {})
+            per.append({
+                "sample_id": sid,
+                "project": c.get("project"),
+                "function": c.get("function"),
+                "true_label": "vulnerable" if r.get("true") else "safe",
+                "prediction": "vulnerable" if r.get("pred") else "safe",
+                "correct": bool(r.get("outcome") in ("TP", "TN")),
+                "outcome": r.get("outcome"),
+                "confidence": r.get("confidence"),
+                "decision_status": r.get("decision_status"),
+            })
+        n = int(b.get("n") or len(rows))
+        return {
+            "available": True,
+            "processed": n,
+            "completed_predictions": completed,
+            "failed_samples": failed,
+            "pending_samples": max(0, len(samples) - completed - failed),
+            "computed_on": "completed predictions only",
+            "single_sample": n <= 1,
+            "tp": b.get("tp", 0), "tn": b.get("tn", 0), "fp": b.get("fp", 0), "fn": b.get("fn", 0),
+            "accuracy": b.get("accuracy"), "precision": b.get("precision"),
+            "recall": b.get("recall"), "f1": b.get("f1"),
+            "specificity": b.get("specificity"),
+            "vulnerable_recall": b.get("recall"),
+            "safe_recall": b.get("specificity"),
+            "per_sample": per,
+        }
+
+    # ---- partial-run recovery from run logs -------------------------
+    def _run_log_text(self, run_dir: Path) -> str:
+        parts = []
+        for name in ("run.log",):
+            p = run_dir / name
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8", errors="replace"))
+        job_dir = self._job_dir_for(run_dir)
+        if job_dir and (job_dir / "stdout.log").exists():
+            parts.append((job_dir / "stdout.log").read_text(encoding="utf-8", errors="replace"))
+        return "\n".join(parts)
+
+    def _parse_log_stages(self, run_dir: Path, sample_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Recover an ordered stage timeline from textual run logs.
+
+        Returns (stages, summary) where summary has failed/failed_stage/error/
+        kg_tools counts. Used when per-sample model_calls were not persisted
+        because the run failed mid-way.
+        """
+        text = self._run_log_text(run_dir)
+        sid = str(sample_id)
+        stages: list[dict[str, Any]] = []
+        index: dict[str, dict[str, Any]] = {}
+        summary: dict[str, Any] = {"failed": False, "failed_stage": None, "error_message": None,
+                                   "kg_queries": None, "kg_returned_items": None, "kg_evidence_items": None}
+        order = 0
+        for line in text.splitlines():
+            m = _RE_GEN_START.search(line)
+            if m and m.group("sid") == sid:
+                stage = m.group("stage")
+                order += 1
+                st = {"index": order, "stage": stage, "status": "started", "source": "log",
+                      "prompt_chars": int(m.group("pc")) if m.group("pc") else None,
+                      "response_chars": None, "tokens": None, "elapsed_seconds": None,
+                      "prompt": None, "response": None, "parsed_json": None, "error": None}
+                stages.append(st)
+                index[stage] = st
+                continue
+            m = _RE_GEN_DONE.search(line)
+            if m and m.group("sid") == sid:
+                st = index.get(m.group("stage"))
+                if st:
+                    st["status"] = "completed"
+                    if m.group("rc"):
+                        st["response_chars"] = int(m.group("rc"))
+                    if m.group("ct"):
+                        st["tokens"] = {"completion": int(m.group("ct"))}
+                    if m.group("el"):
+                        st["elapsed_seconds"] = float(m.group("el"))
+                continue
+            m = _RE_GEN_ERROR.search(line)
+            if m and m.group("sid") == sid:
+                stage = m.group("stage")
+                st = index.get(stage)
+                msg = (m.group("msg") or "").strip()
+                if st:
+                    st["status"] = "failed"
+                    st["error"] = msg
+                else:
+                    order += 1
+                    st = {"index": order, "stage": stage, "status": "failed", "source": "log",
+                          "error": msg, "prompt": None, "response": None, "parsed_json": None}
+                    stages.append(st)
+                    index[stage] = st
+                summary["failed"] = True
+                summary["failed_stage"] = stage
+                summary["error_message"] = msg or summary.get("error_message")
+                continue
+            m = _RE_KG_TOOLS.search(line)
+            if m and m.group("sid") == sid:
+                summary["kg_queries"] = int(m.group("q"))
+                summary["kg_returned_items"] = int(m.group("ri"))
+                summary["kg_evidence_items"] = int(m.group("ei"))
+                continue
+            m = _RE_SAMPLE_FAILED.search(line)
+            if m and m.group("sid").split(":")[0] == sid:
+                summary["failed"] = True
+                if not summary["failed_stage"] and stages:
+                    # last started/incomplete stage is the failure point
+                    inc = [s for s in stages if s["status"] != "completed"]
+                    summary["failed_stage"] = (inc[-1] if inc else stages[-1])["stage"]
+        return stages, summary
+
+    # ---- per-sample stage timeline + normalized object --------------
+    _JSON_STAGE_HINTS = ("source_only_hypothesis", "kg_query_planning", "hypothesis_verification",
+                         "counter_evidence_review", "final_adjudication", "final_decision",
+                         "schema_consistency_repair")
+
+    @staticmethod
+    def _stage_json_meta(name: str) -> dict[str, Any]:
+        low = str(name).lower()
+        is_repair = "repair" in low
+        json_expected = is_repair or any(h in low for h in ResearchInventory._JSON_STAGE_HINTS)
+        return {
+            "is_repair": is_repair,
+            "is_planning": "planning" in low,
+            "is_final": "final" in low or "adjudication" in low,
+            "json_expected": json_expected,
+        }
+
+    def sample_stages(self, run_id: str, sample_id: str) -> list[dict[str, Any]]:
+        sd = self._sample_dir(run_id, sample_id)
+        run_dir = self._resolve_run(run_id)
+        if not sd or not run_dir:
+            return []
+        trace = _read_json(sd / "agent_trace.json") or {}
+        calls = trace.get("model_calls") or _read_jsonl(sd / "model_calls.jsonl")
+        out: list[dict[str, Any]] = []
+        if calls:
+            for i, c in enumerate(calls, start=1):
+                name = c.get("name") or c.get("stage") or f"stage_{i}"
+                usage = c.get("usage") or c.get("total_stage_usage") or {}
+                json_status = c.get("json_status")
+                parsed = _read_json(sd / f"parsed_response_{i:02d}_{name}.json")
+                meta = self._stage_json_meta(name)
+                err = c.get("error")
+                if err:
+                    status = "failed"
+                elif meta["is_repair"]:
+                    status = "repaired"
+                else:
+                    status = "completed"
+                tok = usage or {}
+                out.append({
+                    "index": i, "stage": name, "status": status, "source": "model_calls",
+                    "prompt": c.get("prompt"), "system": c.get("system"),
+                    "response": c.get("response") or c.get("raw"),
+                    "parsed_json": _mask_secrets(parsed) if parsed is not None else None,
+                    "prompt_chars": c.get("prompt_chars") or len(str(c.get("prompt") or "")),
+                    "response_chars": len(str(c.get("response") or c.get("raw") or "")),
+                    "tokens": {"prompt": tok.get("prompt_tokens"), "completion": tok.get("completion_tokens"),
+                               "total": tok.get("total_tokens")} if tok else None,
+                    "elapsed_seconds": c.get("elapsed_seconds"),
+                    "json_status": json_status,
+                    "json_expected": meta["json_expected"],
+                    "json_valid": (parsed is not None) if meta["json_expected"] else None,
+                    "error": err,
+                    "is_repair": meta["is_repair"], "is_planning": meta["is_planning"], "is_final": meta["is_final"],
+                })
+        else:
+            # Failed/interrupted run: recover the partial timeline from run logs.
+            log_stages, _ = self._parse_log_stages(run_dir, sample_id)
+            for st in log_stages:
+                meta = self._stage_json_meta(st["stage"])
+                st.update({
+                    "json_expected": meta["json_expected"],
+                    "json_valid": None,
+                    "is_repair": meta["is_repair"], "is_planning": meta["is_planning"], "is_final": meta["is_final"],
+                })
+                out.append(st)
+        # Cross-stage "invalid → repaired": if a JSON stage is followed by its
+        # repair stage that succeeded, annotate it.
+        for i, st in enumerate(out):
+            if st.get("json_valid") is False and i + 1 < len(out) and out[i + 1].get("is_repair"):
+                if out[i + 1].get("json_valid") is not False:
+                    st["repaired_next"] = True
+        return _mask_secrets(out)
+
+    def sample_normalized(self, run_id: str, sample_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
+        return self.trace_normalized(run_id, sample_id, mode)
+
+    def trace_normalized(self, run_id: str, sample_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
+        sd = self._sample_dir(run_id, sample_id)
+        run_dir = self._resolve_run(run_id)
+        if not sd or not run_dir:
+            return None
+        meta = self.run_meta(run_id)
+        fp = _read_json(sd / "final_prediction.json") or {}
+        sample = _read_json(sd / "sample.json") or {}
+        trace = _read_json(sd / "agent_trace.json") or {}
+        stages = self.sample_stages(run_id, sample_id)
+        _, log_summary = self._parse_log_stages(run_dir, sample_id)
+        kg_queries = self.kg_queries(run_id, sample_id)
+
+        pred_available = _prediction_is_available(fp)
+        # Status: prefer log failure, then job status, then prediction availability.
+        job_status = meta.get("status")
+        failed = bool(log_summary.get("failed")) or job_status in ("failed", "cancelled")
+        if failed and not pred_available:
+            status = "failed"
+        elif pred_available:
+            status = "completed"
+        elif job_status == "running":
+            status = "running"
+        else:
+            status = "partial"
+
+        failed_stage = log_summary.get("failed_stage")
+        if not failed_stage and failed and stages:
+            inc = [s for s in stages if s.get("status") not in ("completed", "repaired")]
+            failed_stage = (inc[-1] if inc else stages[-1]).get("stage")
+        last_completed = None
+        for s in stages:
+            if s.get("status") in ("completed", "repaired"):
+                last_completed = s.get("stage")
+
+        true_is_vuln = sample.get("is_vulnerable")
+        pred_is_vuln = fp.get("is_vulnerable") if pred_available else None
+        true_label = None if true_is_vuln is None or mode != "admin" else ("vulnerable" if true_is_vuln else "safe")
+        prediction = None if pred_is_vuln is None else ("vulnerable" if pred_is_vuln else "safe")
+        correct = None
+        if mode == "admin" and pred_available and true_is_vuln is not None and pred_is_vuln is not None:
+            correct = bool(true_is_vuln) == bool(pred_is_vuln)
+
+        kg_info = self.kg_dashboard(run_id, sample_id)
+        # KG node/edge counts + target-found from the kg manifest if present.
+        graph_dir = kg_info.get("graph_dir")
+        nodes = edges = None
+        target_found = fp.get("target_validation_status") in ("match_exact", "match") or None
+        if graph_dir:
+            man = _read_json(Path(graph_dir) / "manifest.json") or _read_json(Path(graph_dir) / "dashboard" / "graph_data.json")
+            if isinstance(man, dict):
+                nodes = man.get("num_nodes") or man.get("number_of_nodes") or (man.get("manifest") or {}).get("num_nodes")
+                edges = man.get("num_edges") or man.get("number_of_edges") or (man.get("manifest") or {}).get("num_edges")
+
+        return {
+            "run_id": run_id,
+            "sample_id": str(sample_id),
+            "project": sample.get("project"),
+            "function": sample.get("func_name") or sample.get("function_name"),
+            "filepath": sample.get("filepath"),
+            "status": status,
+            "failed": failed,
+            "failed_stage": failed_stage,
+            "last_completed_stage": last_completed,
+            "error_type": fp.get("error_type"),
+            "error_message": log_summary.get("error_message") or fp.get("parse_error"),
+            "provider_error": log_summary.get("error_message"),
+            "true_label": true_label,
+            "prediction": prediction,
+            "prediction_available": pred_available,
+            "confidence": fp.get("confidence") if pred_available else None,
+            "confidence_available": pred_available and fp.get("confidence") is not None,
+            "correct": correct,
+            "decision_status": fp.get("decision_status"),
+            "verdict_text": fp.get("reasoning_summary") if pred_available else None,
+            "primary_vulnerability_type": fp.get("primary_vulnerability_type"),
+            "parse_error": fp.get("parse_error"),
+            "resolved_commit": fp.get("resolved_commit_id"),
+            "kg_loaded": bool(kg_info.get("exists")),
+            "initial_retrieval": (trace.get("initial_evidence_count") or 0) > 0,
+            "kg_queries_count": len(kg_queries) or (log_summary.get("kg_queries") or 0),
+            "llm": meta.get("llm"),
+            "kg": {
+                **meta.get("kg", {}),
+                "graph_dir": graph_dir,
+                "dashboard_url": kg_info.get("iframe_url"),
+                "dashboard_exists": kg_info.get("exists"),
+                "nodes": nodes,
+                "edges": edges,
+                "target_found": target_found,
+            },
+            "usage": fp.get("usage"),
+            "stages": stages,
+            "kg_queries": kg_queries,
+        }
+
+    def sample_normalized(self, run_id: str, sample_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
+        sd = self._sample_dir(run_id, sample_id)
+        if not sd:
+            return None
+        meta = self.run_meta(run_id)
+        fp = _read_json(sd / "final_prediction.json") or {}
+        sample = _read_json(sd / "sample.json") or {}
+        true_is_vuln = sample.get("is_vulnerable")
+        pred_is_vuln = fp.get("is_vulnerable")
+        true_label = None if true_is_vuln is None or mode != "admin" else ("vulnerable" if true_is_vuln else "safe")
+        prediction = None if pred_is_vuln is None else ("vulnerable" if pred_is_vuln else "safe")
+        correct = None
+        if mode == "admin" and true_is_vuln is not None and pred_is_vuln is not None:
+            correct = bool(true_is_vuln) == bool(pred_is_vuln)
+        kg_info = self.kg_dashboard(run_id, sample_id)
+        return {
+            "run_id": run_id,
+            "sample_id": str(sample_id),
+            "project": sample.get("project"),
+            "function": sample.get("func_name") or sample.get("function_name"),
+            "filepath": sample.get("filepath"),
+            "true_label": true_label,
+            "prediction": prediction,
+            "correct": correct,
+            "decision_status": fp.get("decision_status"),
+            "confidence": fp.get("confidence"),
+            "verdict_text": fp.get("reasoning_summary"),
+            "primary_vulnerability_type": fp.get("primary_vulnerability_type"),
+            "parse_error": fp.get("parse_error"),
+            "resolved_commit": fp.get("resolved_commit_id"),
+            "llm": meta.get("llm"),
+            "kg": {
+                **meta.get("kg", {}),
+                "graph_dir": kg_info.get("graph_dir"),
+                "dashboard_url": kg_info.get("iframe_url"),
+                "dashboard_exists": kg_info.get("exists"),
+            },
+            "usage": fp.get("usage"),
+            "stages": self.sample_stages(run_id, sample_id),
+            "kg_queries": self.kg_queries(run_id, sample_id),
+        }
+
+    # ---- end-to-end inventory summary -------------------------------
+    def inventory_summary(self, challenge_root: str | Path, dataset_path: str | None,
+                          mode: Mode = "admin") -> dict[str, Any]:
+        """Dataset / repo-clone / KG / challenge / research readiness counts.
+
+        Best-effort and never raises: missing caches simply yield zeros.
+        """
+        out: dict[str, Any] = {}
+
+        # --- dataset inventory (cheap pyarrow metadata; falls back to candidates)
+        dataset = {"total_samples": None, "projects": None, "functions": None,
+                   "vulnerable": None, "safe": None, "source": None}
+        try:
+            if dataset_path:
+                p = Path(dataset_path)
+                if not p.is_absolute():
+                    p = self.root / p
+                if p.exists():
+                    dataset.update(self._dataset_counts(p))
+        except Exception:
+            pass
+        if dataset["total_samples"] is None:
+            cands = _read_jsonl(self.candidate_cache)
+            projs = {r.get("project") for r in cands if r.get("project")}
+            dataset.update({"total_samples": len(cands) * 2 if cands else 0,
+                            "projects": len(projs), "source": "pair_candidate_cache"})
+        out["dataset"] = dataset
+
+        # --- repository availability
+        mirrors_dir = self.root / "cache" / "repos" / "bare_mirrors"
+        worktrees_dir = self.root / "cache" / "worktrees"
+        inv_dir = self.root / "cache" / "repo_inventory"
+        mirrors = [d for d in mirrors_dir.glob("*.git")] if mirrors_dir.exists() else []
+        worktrees = [d for d in worktrees_dir.iterdir() if d.is_dir()] if worktrees_dir.exists() else []
+        inv_files = [f for f in inv_dir.glob("*.json")] if inv_dir.exists() else []
+        ds_projects = dataset.get("projects") or 0
+        cloned = len({m.name.split("__")[0] for m in mirrors})
+        out["repos"] = {
+            "dataset_projects": ds_projects,
+            "mirrored_projects": cloned,
+            "missing_projects": max(0, ds_projects - cloned) if ds_projects else None,
+            "clone_coverage_pct": round(cloned / ds_projects * 100, 1) if ds_projects else None,
+            "worktrees": len(worktrees),
+            "repo_inventory_records": len(inv_files),
+        }
+
+        # --- KG / CodeKG readiness
+        kg_dir = self.root / "cache" / "kg"
+        graph_dashboards = list(kg_dir.glob("**/dashboard/index.html")) if kg_dir.exists() else []
+        graph_dirs = list(kg_dir.glob("**/graph.json")) if kg_dir.exists() else []
+        out["functions"] = {
+            "theoretical_analyzable": dataset.get("total_samples"),
+            "kg_built": len(graph_dirs),
+            "codekg_dashboards": len(graph_dashboards),
+        }
+
+        # --- student challenge inventory
+        from .inventory import ChallengeInventory
+
+        inv = ChallengeInventory(challenge_root)
+        ch: dict[str, Any] = {"exists": inv.exists}
+        if inv.exists:
+            splits = inv.split_counts()
+            vr = inv.validation_report() or {}
+            ch.update({
+                "rows": sum(splits.values()),
+                "train_rows": splits.get("train", 0),
+                "test_rows": splits.get("test", 0),
+                "registry_entries": len(inv.kgs(mode="admin")),
+                "validation_ok": vr.get("ok"),
+            })
+            if mode == "admin":
+                ch["label_balance"] = inv.label_balance("admin")
+        out["challenge"] = ch
+
+        # --- research activity
+        runs = self.list_runs()
+        statuses = []
+        for r in runs:
+            jm = self.run_meta(r["run_id"]) if r.get("is_job_run") else {}
+            statuses.append(jm.get("status"))
+        last = runs[0] if runs else None
+        last_meta = self.run_meta(last["run_id"]) if last else {}
+        out["research"] = {
+            "total_runs": len(runs),
+            "running": sum(1 for s in statuses if s == "running"),
+            "failed": sum(1 for s in statuses if s == "failed"),
+            "last_run_id": last["run_id"] if last else None,
+            "last_run_time": last["mtime"] if last else None,
+            "last_provider": (last_meta.get("llm") or {}).get("provider_name"),
+            "last_model": (last_meta.get("llm") or {}).get("model"),
+            "last_kg_backend": (last_meta.get("kg") or {}).get("effective_backend"),
+        }
+        return out
+
+    def _dataset_counts(self, path: Path) -> dict[str, Any]:
+        """Cheap-ish dataset counts via pyarrow (num_rows metadata + columns)."""
+        try:
+            import pyarrow as pa  # noqa
+            import pyarrow.ipc as ipc
+        except Exception:
+            return {}
+        try:
+            with pa.memory_map(str(path), "r") as src:
+                try:
+                    reader = ipc.open_file(src)
+                except Exception:
+                    src.seek(0)
+                    reader = ipc.open_stream(src)
+                tbl = reader.read_all()
+        except Exception:
+            return {}
+        cols = set(tbl.column_names)
+        n = tbl.num_rows
+        out: dict[str, Any] = {"total_samples": n, "source": "dataset_arrow"}
+        def uniq(col):
+            return len(set(tbl.column(col).to_pylist())) if col in cols else None
+        for c in ("project", "project_name", "repo"):
+            if c in cols:
+                out["projects"] = uniq(c); break
+        for c in ("func_name", "function_name"):
+            if c in cols:
+                out["functions"] = uniq(c); break
+        for c in ("is_vulnerable", "label", "target"):
+            if c in cols:
+                vals = tbl.column(c).to_pylist()
+                vuln = sum(1 for v in vals if v in (1, True, "1", "vulnerable"))
+                out["vulnerable"] = vuln
+                out["safe"] = n - vuln
+                break
+        return out
 
     # ---- candidates -------------------------------------------------
     def candidates(self, limit: int = 500) -> list[dict[str, Any]]:

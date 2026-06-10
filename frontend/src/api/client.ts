@@ -76,6 +76,10 @@ export const api = {
   jobLogs: (id: string, tail = 500) =>
     http<{ job_id: string; lines: string[]; total?: number }>(`/jobs/${id}/logs?tail=${tail}`),
 
+  inventorySummary: (mode: Mode) => http<Record<string, any>>(`/inventory-summary?mode=${mode}`),
+  jobFile: (id: string, name: string) =>
+    http<{ job_id: string; name: string; content: string }>(`/jobs/${id}/file?name=${encodeURIComponent(name)}`),
+
   validationReport: () => http<Record<string, any>>("/reports/validation"),
   evaluationReport: () => http<Record<string, any>>("/reports/evaluation"),
   disk: () => http<DiskInfo>("/disk"),

@@ -5,6 +5,9 @@ import { api } from "../api/client";
 import { useAsync } from "../state";
 import DataTable, { Column } from "../components/DataTable";
 
+// Dashboard default model for AcademicCloud (UI preference, not a credential).
+const ACADEMICCLOUD_DEFAULT_MODEL = "mistral-large-3-675b-instruct-2512";
+
 interface LLMModel {
   id: string;
   display_name: string;
@@ -41,6 +44,7 @@ export default function ResearchRunPage() {
   const [dryRun, setDryRun] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [createdJob, setCreatedJob] = useState<string | null>(null);
 
   // LLM state
   const [llmProfiles, setLLMProfiles] = useState<any[]>([]);
@@ -48,7 +52,7 @@ export default function ResearchRunPage() {
   const [llmModels, setLLMModels] = useState<LLMModel[]>([]);
   const [selectedLLMModel, setSelectedLLMModel] = useState("");
   const [llmTemperature, setLLMTemperature] = useState("0.0");
-  const [llmMaxTokens, setLLMMaxTokens] = useState("2048");
+  const [llmMaxTokens, setLLMMaxTokens] = useState("8000");
   const [llmLoading, setLLMLoading] = useState(false);
   const [llmHealth, setLLMHealth] = useState<Record<string, any>>({});
 
@@ -106,9 +110,16 @@ export default function ResearchRunPage() {
       try {
         const result = await api.llmDiscoverModels(selectedLLMProfile);
         if (result.ok) {
-          setLLMModels(result.models || []);
-          if (result.models?.length && !selectedLLMModel) {
-            setSelectedLLMModel(result.models[0].id);
+          const models = result.models || [];
+          setLLMModels(models);
+          if (models.length && !selectedLLMModel) {
+            // AcademicCloud default = mistral-large-3-675b-instruct-2512 if
+            // available; otherwise the first ready model.
+            const preferred =
+              selectedLLMProfile === "academiccloud"
+                ? models.find((mm: LLMModel) => mm.id === ACADEMICCLOUD_DEFAULT_MODEL)
+                : undefined;
+            setSelectedLLMModel((preferred || models[0]).id);
           }
         } else {
           setMsg(`Model discovery failed: ${result.message}`);
@@ -214,7 +225,7 @@ export default function ResearchRunPage() {
         dry_run: dryRun,
       };
       const job = await api.createJob(body);
-      nav(`/research/live/${job.job_id}`);
+      setCreatedJob(job.job_id);
     } catch (e: any) {
       setMsg(e.message);
     } finally {
@@ -398,20 +409,59 @@ export default function ResearchRunPage() {
         </div>
       </div>
 
-      {/* Summary */}
-      <div className="card" style={{ background: "#f9f9f9" }}>
-        <h3 style={{ margin: 0 }}>Run Summary</h3>
-        <dl className="kv" style={{ fontSize: "12px", margin: "12px 0 0 0" }}>
-          <dt>Config</dt><dd className="mono">{config || "—"}</dd>
-          <dt>Samples</dt><dd>{selected.size > 0 ? `${selected.size} selected (exact mode)` : "Config default"}</dd>
-          <dt>LLM</dt><dd>{llmProfile?.display_name || "—"}</dd>
-          <dt>Model</dt><dd className="mono">{llmModel?.display_name || "—"}</dd>
-          <dt>KG preset</dt><dd>{kgPreset?.label || kgBackend}</dd>
-          <dt>Effective kg.backend</dt><dd className="mono">{kgEffectiveBackend || "—"}</dd>
-          <dt>KG cache</dt><dd>{kgReuseCache ? "Reuse" : "Rebuild"}</dd>
-          <dt>Temperature</dt><dd>{llmTemperature}</dd>
-          <dt>Max tokens</dt><dd>{llmMaxTokens}</dd>
-        </dl>
+      {/* Original config vs Effective overrides */}
+      {(() => {
+        const overrideActive =
+          (!!selectedLLMModel && selectedLLMModel !== m?.model_name) ||
+          (!!llmProfile && m?.model_backend !== "openai_compatible") ||
+          (kgEffectiveBackend && kgEffectiveBackend !== m?.kg_backend);
+        return (
+          <div className="grid cols-2">
+            <div className="card">
+              <h3 className="section-title" style={{ marginTop: 0 }}>Original config</h3>
+              <dl className="kv" style={{ fontSize: 12 }}>
+                <dt>Config file</dt><dd className="mono">{config || "—"}</dd>
+                <dt>Dataset path</dt><dd className="mono" style={{ fontSize: 11 }}>{m?.dataset_path || "—"}</dd>
+                <dt>Model backend</dt><dd>{m?.model_backend || "—"}</dd>
+                <dt>Model name</dt><dd className="mono">{m?.model_name || "—"}</dd>
+                <dt>API base</dt><dd className="mono" style={{ fontSize: 11 }}>{m?.api_base || "—"}</dd>
+                <dt>KG backend</dt><dd className="mono">{m?.kg_backend || "—"}</dd>
+                <dt>Pair-selection</dt><dd>{m?.sample_selection || "—"}</dd>
+              </dl>
+            </div>
+            <div className="card" style={{ borderColor: overrideActive ? "#2563eb" : undefined }}>
+              <h3 className="section-title" style={{ marginTop: 0 }}>
+                Effective run overrides {overrideActive && <span className="badge blue">Dashboard override active</span>}
+              </h3>
+              <dl className="kv" style={{ fontSize: 12 }}>
+                <dt>Provider</dt><dd><strong>{llmProfile?.display_name || "—"}</strong></dd>
+                <dt>Server / base URL</dt><dd className="mono" style={{ fontSize: 11 }}>{llmProfile?.base_url || "—"}</dd>
+                <dt>Model</dt><dd className="mono">{selectedLLMModel || "—"}</dd>
+                <dt>KG preset</dt><dd>{kgPreset?.label || kgBackend}</dd>
+                <dt>Effective kg.backend</dt><dd className="mono">{kgEffectiveBackend || "—"}</dd>
+                <dt>Exact sample mode</dt><dd>{selected.size > 0 ? "yes" : "no (config default)"}</dd>
+                <dt>Include pairs</dt><dd>{selected.size > 0 ? "false" : "—"}</dd>
+                <dt>Reuse / rebuild</dt><dd>{kgReuseCache ? "reuse" : "rebuild"}{kgForceRebuild ? " · force" : ""}</dd>
+                <dt>Temperature</dt><dd>{llmTemperature}</dd>
+                <dt>Max tokens</dt><dd>{llmMaxTokens}</dd>
+              </dl>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* This run will use */}
+      <div className="card" style={{ background: "#f0f8ff" }}>
+        <h3 style={{ margin: 0 }}>This run will use</h3>
+        <ul style={{ fontSize: 13, margin: "10px 0 0", lineHeight: 1.7 }}>
+          <li>Provider: <strong>{llmProfile?.display_name || "—"}</strong></li>
+          <li>Server: <span className="mono">{llmProfile?.base_url || "—"}</span></li>
+          <li>Model: <span className="mono">{selectedLLMModel || "—"}</span></li>
+          <li>KG preset: {kgPreset?.label || kgBackend}</li>
+          <li>Effective KG backend: <span className="mono">{kgEffectiveBackend || "—"}</span></li>
+          <li>Samples: {selected.size > 0 ? `${selected.size} exact sample${selected.size > 1 ? "s" : ""}` : "config default"}</li>
+          <li>Pairs: {selected.size > 0 ? "disabled" : "config default"}</li>
+        </ul>
       </div>
 
       {/* Controls */}
@@ -427,6 +477,20 @@ export default function ResearchRunPage() {
         <button className="btn" onClick={() => nav("/llm-providers")}>LLM Settings</button>
         <button className="btn" onClick={() => nav("/kg-builder")}>KG Settings</button>
       </div>
+
+      {/* Post-create quick links */}
+      {createdJob && (
+        <div className="card" style={{ background: "#f0fff4", marginBottom: 24 }}>
+          <h3 style={{ margin: 0 }}>Job started: <span className="mono">{createdJob}</span></h3>
+          <div className="btn-row" style={{ marginTop: 10 }}>
+            <button className="btn primary" onClick={() => nav(`/research/live/${createdJob}`)}>Open live dashboard</button>
+            <a className="btn" href={`/api/dashboard/jobs/${createdJob}/file?name=llm_profile_used.json`} target="_blank" rel="noreferrer">llm_profile_used.json</a>
+            <a className="btn" href={`/api/dashboard/jobs/${createdJob}/file?name=kg_builder_used.json`} target="_blank" rel="noreferrer">kg_builder_used.json</a>
+            <a className="btn" href={`/api/dashboard/jobs/${createdJob}/file?name=selection.json`} target="_blank" rel="noreferrer">selection.json</a>
+            <a className="btn" href={`/api/dashboard/jobs/${createdJob}/file?name=effective_config.yaml`} target="_blank" rel="noreferrer">effective_config.yaml</a>
+          </div>
+        </div>
+      )}
 
       {/* Sample Selection */}
       <div className="section-title">5. Candidate Functions (from validated pair cache)</div>

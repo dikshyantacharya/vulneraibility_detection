@@ -218,6 +218,231 @@ def test_kg_dashboard_missing_reports_searched_paths(client: TestClient):
     assert "searched" in info and isinstance(info["searched"], list)
 
 
+# --------------------------------------------------------------------------
+# Run summary / live metrics / normalized sample / inventory (display layer)
+# --------------------------------------------------------------------------
+
+def _make_job_run(tmp_path: Path) -> tuple[str, str]:
+    """A dashboard-job-style run with llm/kg artifacts + a FN sample (vuln→safe)."""
+    job = tmp_path / "outputs" / "dashboard" / "jobs" / "20260610_144251_f081b8"
+    run = job / "runs" / "20260610_164252__dashboard_audit_academiccloud"
+    sd = run / "agent_demos" / "sample_18452_count_rows"
+    sd.mkdir(parents=True)
+    (job / "llm_profile_used.json").write_text(json.dumps({
+        "profile_id": "academiccloud", "model": "qwen3-coder-30b-a3b-instruct",
+        "effective_model_name": "qwen3-coder-30b-a3b-instruct",
+        "api_base": "https://chat-ai.academiccloud.de/v1",
+        "api_minimal_payload": True, "temperature": 0.0, "max_tokens": 2048,
+    }), encoding="utf-8")
+    (job / "kg_builder_used.json").write_text(json.dumps({
+        "preset": "joern_plus", "display_name": "Joern plus / semantic overlay",
+        "effective_backend": "joern", "reuse_cache": True, "force_rebuild": False,
+    }), encoding="utf-8")
+    (job / "selection.json").write_text(json.dumps({"sample_ids": ["18452"]}), encoding="utf-8")
+    (job / "job.json").write_text(json.dumps({
+        "job_id": "20260610_144251_f081b8", "status": "completed",
+        "params": {"config_path": "configs/46_demo.yaml", "selection": {"sample_ids": ["18452"], "exact_sample_ids_only": True, "include_pairs": False}},
+    }), encoding="utf-8")
+    (run / "usage_summary.json").write_text(json.dumps({"total_tokens": 5000, "cost_total_usd": 0.02}), encoding="utf-8")
+    (run / "metrics.json").write_text(json.dumps({
+        "binary": {"n": 1, "tp": 0, "tn": 0, "fp": 0, "fn": 1, "accuracy": 0.0,
+                   "precision": 0.0, "recall": 0.0, "f1": 0.0, "specificity": 0.0,
+                   "rows": [{"sample_id": "18452", "true": True, "pred": False, "outcome": "FN", "confidence": 0.95, "decision_status": "fixed/non-vulnerable"}]},
+        "prediction_correctness": {"per_sample_correctness": [{"sample_id": "18452", "project": "rockhopper", "function": "count_rows"}]},
+    }), encoding="utf-8")
+    (sd / "sample.json").write_text(json.dumps({
+        "sample_id": "18452", "project": "rockhopper", "func_name": "count_rows",
+        "filepath": "rockhopper/src/ragged_array.c", "is_vulnerable": True,
+    }), encoding="utf-8")
+    (sd / "final_prediction.json").write_text(json.dumps({
+        "sample_id": "18452", "is_vulnerable": False, "confidence": 0.95,
+        "decision_status": "fixed/non-vulnerable", "model_backend": "openai_compatible",
+        "resolved_commit_id": "a971948ca5191e", "reasoning_summary": "All vulns refuted by guards.",
+        "usage": {"total_tokens": 5000},
+    }), encoding="utf-8")
+    (sd / "agent_trace.json").write_text(json.dumps({
+        "sample_id": "18452",
+        "model_calls": [
+            {"name": "01_source_only_hypothesis", "prompt": "P1", "response": "R1", "prompt_chars": 2, "usage": {"total_tokens": 100}, "elapsed_seconds": 1.0, "json_status": "ok"},
+            {"name": "04_hypothesis_verification_json_repair", "prompt": "P2", "response": "bad json", "json_status": "repaired", "usage": {"total_tokens": 50}},
+        ],
+        "kg_queries": [{"query_type": "security_context", "query": {"target_function": "count_rows"}, "reason": "check guards", "items": [{"node": "n1"}]}],
+    }), encoding="utf-8")
+    return run.name, "18452"
+
+
+def test_run_summary_shows_provider_and_model(client: TestClient, tmp_path: Path):
+    run_id, _ = _make_job_run(tmp_path)
+    s = client.get(f"/api/research/runs/{run_id}/summary?mode=admin").json()
+    assert s["llm"]["provider_name"] == "AcademicCloud"
+    assert s["llm"]["model"] == "qwen3-coder-30b-a3b-instruct"
+    assert s["kg"]["effective_backend"] == "joern"
+    assert s["samples_completed"] == 1
+    assert s["metrics"]["fn"] == 1
+
+
+def test_live_metrics_admin_vs_student(client: TestClient, tmp_path: Path):
+    run_id, _ = _make_job_run(tmp_path)
+    admin = client.get(f"/api/research/runs/{run_id}/metrics-live?mode=admin").json()
+    assert admin["available"] is True
+    assert admin["fn"] == 1 and admin["tp"] == 0
+    assert admin["single_sample"] is True
+    assert admin["per_sample"][0]["correct"] is False
+    student = client.get(f"/api/research/runs/{run_id}/metrics-live?mode=student").json()
+    assert student["available"] is False  # labels hidden in student mode
+
+
+def test_normalized_sample_marks_incorrect(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_job_run(tmp_path)
+    n = client.get(f"/api/research/runs/{run_id}/samples/{sid}/normalized?mode=admin").json()
+    assert n["true_label"] == "vulnerable"
+    assert n["prediction"] == "safe"
+    assert n["correct"] is False
+    assert n["confidence"] == 0.95
+    assert n["llm"]["provider_name"] == "AcademicCloud"
+
+
+def test_normalized_sample_hides_label_in_student_mode(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_job_run(tmp_path)
+    n = client.get(f"/api/research/runs/{run_id}/samples/{sid}/normalized?mode=student").json()
+    assert n["true_label"] is None
+    assert n["correct"] is None
+    assert n["prediction"] == "safe"  # prediction itself is not a private label
+
+
+def test_sample_stages_parse_all_stages(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_job_run(tmp_path)
+    stages = client.get(f"/api/research/runs/{run_id}/samples/{sid}/stages").json()
+    assert len(stages) == 2
+    assert stages[0]["stage"] == "01_source_only_hypothesis"
+    assert stages[0]["prompt"] == "P1" and stages[0]["response"] == "R1"
+    assert stages[1]["is_repair"] is True
+
+
+def test_inventory_summary_separates_dataset_and_challenge(client: TestClient, tmp_path: Path):
+    inv = client.get("/api/dashboard/inventory-summary?mode=admin").json()
+    assert "dataset" in inv and "repos" in inv and "functions" in inv
+    assert "challenge" in inv and "research" in inv
+    # challenge inventory is its own object, not mixed into dataset counts
+    assert isinstance(inv["challenge"], dict)
+
+
+def test_job_file_viewer_allowlist_and_traversal(client: TestClient, tmp_path: Path):
+    _make_job_run(tmp_path)
+    jid = "20260610_144251_f081b8"
+    ok = client.get(f"/api/dashboard/jobs/{jid}/file?name=llm_profile_used.json")
+    assert ok.status_code == 200
+    assert "academiccloud" in ok.json()["content"]
+    bad = client.get(f"/api/dashboard/jobs/{jid}/file?name=../../../secret.txt")
+    assert bad.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Failed / partial run recovery (no model_calls; placeholder prediction)
+# --------------------------------------------------------------------------
+
+def _make_failed_run(tmp_path: Path) -> tuple[str, str]:
+    job = tmp_path / "outputs" / "dashboard" / "jobs" / "20260610_183451_774b43"
+    run = job / "runs" / "20260610_203452__dashboard_audit_academiccloud_mistral"
+    sd = run / "agent_demos" / "sample_18452_count_rows"
+    sd.mkdir(parents=True)
+    (job / "llm_profile_used.json").write_text(json.dumps({
+        "profile_id": "academiccloud", "model": "mistral-large-3-675b-instruct-2512",
+        "effective_model_name": "mistral-large-3-675b-instruct-2512",
+        "api_base": "https://chat-ai.academiccloud.de/v1",
+    }), encoding="utf-8")
+    (job / "job.json").write_text(json.dumps({
+        "job_id": "20260610_183451_774b43", "status": "failed",
+        "params": {"selection": {"sample_ids": ["18452"], "exact_sample_ids_only": True}},
+    }), encoding="utf-8")
+    # Empty per-sample model_calls + placeholder final_prediction (failed run).
+    (sd / "agent_trace.json").write_text(json.dumps({"sample_id": "18452", "model_calls": [], "kg_queries": []}), encoding="utf-8")
+    (sd / "model_calls.jsonl").write_text("", encoding="utf-8")
+    (sd / "kg_tool_calls.jsonl").write_text("", encoding="utf-8")
+    (sd / "sample.json").write_text(json.dumps({"sample_id": "18452", "project": "rockhopper", "func_name": "count_rows", "is_vulnerable": True}), encoding="utf-8")
+    (sd / "final_prediction.json").write_text(json.dumps({
+        "sample_id": "18452", "is_vulnerable": False, "confidence": 0.0,
+        "decision_status": "running", "model_backend": "openai_compatible",
+    }), encoding="utf-8")
+    # metrics with zero valid predictions
+    (run / "metrics.json").write_text(json.dumps({"binary": {"n": 0, "valid_predictions": 0, "tp": 0, "tn": 0, "fp": 0, "fn": 0, "rows": []}}), encoding="utf-8")
+    # run.log with partial stage events + kg_tools summary + Sample failed
+    (run / "run.log").write_text(
+        "20:34:56 | INFO | model.generate_start | sample=18452 | stage=01_source_only_hypothesis | attempt=primary | prompt_chars=3064\n"
+        "20:36:04 | INFO | model.generate_done | sample=18452 | stage=01_source_only_hypothesis | attempt=primary | elapsed=68.0s | response_chars=6356 | completion_tokens=1535 | enable_thinking=False\n"
+        "20:36:50 | INFO | agent.kg_tools | sample=18452 | round=agentic_proof | queries=8 | returned_items=256 | evidence_items=268\n"
+        "20:36:50 | INFO | model.generate_start | sample=18452 | stage=04_hypothesis_verification | attempt=primary | prompt_chars=30097\n"
+        "20:38:50 | ERROR | Sample failed: 18452 18452:rockhopper:rockhopper/src/ragged_array.c:count_rows:vulnerable\n",
+        encoding="utf-8",
+    )
+    return run.name, "18452"
+
+
+def test_failed_run_no_fake_safe_prediction(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_failed_run(tmp_path)
+    n = client.get(f"/api/research/runs/{run_id}/samples/{sid}/trace-normalized?mode=admin").json()
+    assert n["status"] == "failed"
+    assert n["failed"] is True
+    assert n["prediction_available"] is False
+    assert n["prediction"] is None  # NOT "safe"
+    assert n["confidence"] is None
+    assert n["correct"] is None
+    assert n["true_label"] == "vulnerable"
+
+
+def test_failed_run_partial_stage_timeline_from_logs(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_failed_run(tmp_path)
+    n = client.get(f"/api/research/runs/{run_id}/samples/{sid}/trace-normalized?mode=admin").json()
+    stages = n["stages"]
+    assert len(stages) >= 2  # not zero
+    assert stages[0]["stage"] == "01_source_only_hypothesis"
+    assert stages[0]["status"] == "completed"
+    assert stages[0]["source"] == "log"
+    assert stages[0]["tokens"]["completion"] == 1535
+    # the started-but-not-done stage is the failure point
+    assert n["failed_stage"] in ("04_hypothesis_verification", "01_source_only_hypothesis")
+    assert n["kg_loaded"] in (True, False)
+
+
+def test_failed_run_metrics_unavailable(client: TestClient, tmp_path: Path):
+    run_id, _ = _make_failed_run(tmp_path)
+    m = client.get(f"/api/research/runs/{run_id}/metrics-live?mode=admin").json()
+    assert m["available"] is False
+    assert "no completed predictions" in m["reason"]
+    assert m["completed_predictions"] == 0
+    assert m["failed_samples"] >= 1
+    s = client.get(f"/api/research/runs/{run_id}/summary?mode=admin").json()
+    assert s["metrics_available"] is False
+    assert s["metrics_reason"] == "no completed predictions"
+
+
+def test_failed_run_kg_query_summary_fallback(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_failed_run(tmp_path)
+    qs = client.get(f"/api/research/runs/{run_id}/samples/{sid}/kg-queries").json()
+    assert len(qs) == 1
+    assert qs[0]["_summary_only"] is True
+    assert qs[0]["queries"] == 8
+    assert "unavailable" in qs[0]["reason"].lower()
+
+
+def test_token_counts_not_redacted():
+    from student_system_creator.dashboard.research import _mask_secrets
+    obj = {"usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300},
+           "max_tokens": 8000, "api_key": "sk-secret"}
+    masked = _mask_secrets(obj)
+    assert masked["usage"]["prompt_tokens"] == 100
+    assert masked["usage"]["total_tokens"] == 300
+    assert masked["max_tokens"] == 8000
+    assert masked["api_key"] == "***redacted***"
+
+
+def test_frontend_academiccloud_default_model_and_max_tokens():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "frontend" / "src" / "pages" / "ResearchRunPage.tsx").read_text(encoding="utf-8")
+    assert "mistral-large-3-675b-instruct-2512" in page
+    assert 'useState("8000")' in page
+
+
 def test_research_job_selection_enforced(tmp_path: Path):
     _make_research_tree(tmp_path)
     import yaml

@@ -265,7 +265,12 @@ export default function LLMProvidersPage() {
                         background: selectedModel === m.id ? "#f0f0ff" : "transparent",
                       }}
                     >
-                      <td className="mono" style={{ fontSize: "11px" }}>{m.id}</td>
+                      <td className="mono" style={{ fontSize: "11px" }}>
+                        {m.id}
+                        {selectedProfile === "academiccloud" && m.id === "mistral-large-3-675b-instruct-2512" && (
+                          <span className="badge blue" style={{ marginLeft: 6 }}>default</span>
+                        )}
+                      </td>
                       <td>{m.display_name}</td>
                       {prof.provider_type === "openai_compatible" && (
                         <>
