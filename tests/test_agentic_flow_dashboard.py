@@ -530,3 +530,238 @@ class TestRoutePathConsistency:
         backend_app = Path(__file__).parents[1] / "src" / "student_system_creator" / "dashboard" / "app.py"
         app_content = backend_app.read_text(encoding="utf-8")
         assert "/flow" in app_content, "backend must have /flow endpoint"
+
+    def test_agent_flow_page_download_button_label_is_full(self):
+        """AgentFlowPage download button must be labelled 'Download full flow report'."""
+        tsx = Path(__file__).parents[1] / "frontend" / "src" / "pages" / "AgentFlowPage.tsx"
+        assert tsx.exists(), "AgentFlowPage.tsx not found"
+        content = tsx.read_text(encoding="utf-8")
+        assert "Download full flow report" in content, (
+            "AgentFlowPage.tsx must contain the text 'Download full flow report' "
+            "on the download anchor so users can find it easily"
+        )
+
+
+# ---------------------------------------------------------------------------
+# New: flow_report() must include commit message and target function source
+# ---------------------------------------------------------------------------
+
+class TestFlowReportCommitMessage:
+    """flow_report() must include commit_message when sample.json has it."""
+
+    def test_flow_report_includes_commit_message(self, tmp_path):
+        """flow_report() must include the commit message from sample.json in the report text."""
+        sd = _make_run(tmp_path, "run_cm1", "200", "myfunc")
+        sd.joinpath("sample.json").write_text(
+            json.dumps({
+                "func_name": "myfunc",
+                "filepath": "src/foo.c",
+                "commit_message": "fix: prevent buffer overflow in myfunc by adding bounds check",
+                "is_vulnerable": True,
+            }),
+            encoding="utf-8",
+        )
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({"is_vulnerable": True, "confidence": 0.9,
+                        "resolved_commit_id": "abc123", "reasoning_summary": "r"}),
+            encoding="utf-8",
+        )
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "s", "user_prompt": "u",
+             "response": "{}", "parse_status": "valid", "parsed_answer": {"hypotheses": []}}
+        ])
+        inv = _make_inventory(tmp_path)
+        report = inv.flow_report("run_cm1", "200")
+        assert report is not None, "flow_report() must return a string"
+        assert "prevent buffer overflow" in report, (
+            "flow_report() must include commit_message text from sample.json"
+        )
+
+    def test_flow_report_shows_commit_unavailable_when_missing(self, tmp_path):
+        """flow_report() must handle missing commit_message gracefully."""
+        sd = _make_run(tmp_path, "run_cm2", "201", "bar")
+        sd.joinpath("sample.json").write_text(
+            json.dumps({"func_name": "bar", "filepath": "bar.c"}),
+            encoding="utf-8",
+        )
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({"is_vulnerable": False, "confidence": 0.8,
+                        "resolved_commit_id": "def456", "reasoning_summary": "r"}),
+            encoding="utf-8",
+        )
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "s", "user_prompt": "u",
+             "response": "{}", "parse_status": "valid", "parsed_answer": {}}
+        ])
+        inv = _make_inventory(tmp_path)
+        report = inv.flow_report("run_cm2", "201")
+        assert report is not None
+        # Must not crash; should show unavailable marker
+        assert "unavailable" in report.lower() or "commit_message" in report.lower(), (
+            "flow_report() must mention commit_message or 'unavailable' when it is absent"
+        )
+
+
+class TestFlowReportFuncBody:
+    """flow_report() must include target function source (func_body) from sample.json."""
+
+    def test_flow_report_includes_target_function_source(self, tmp_path):
+        """flow_report() must include the target function source in the report."""
+        sd = _make_run(tmp_path, "run_fb1", "202", "count_rows")
+        sd.joinpath("sample.json").write_text(
+            json.dumps({
+                "func_name": "count_rows",
+                "filepath": "db/query.c",
+                "func_body": "int count_rows(DB *db) { return db->rows; }",
+            }),
+            encoding="utf-8",
+        )
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({"is_vulnerable": False, "confidence": 0.7,
+                        "resolved_commit_id": "fe3f", "reasoning_summary": "r"}),
+            encoding="utf-8",
+        )
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "s", "user_prompt": "u",
+             "response": "{}", "parse_status": "valid", "parsed_answer": {}}
+        ])
+        inv = _make_inventory(tmp_path)
+        report = inv.flow_report("run_fb1", "202")
+        assert report is not None
+        assert "count_rows" in report, (
+            "flow_report() must include the function name from func_body in the report"
+        )
+        assert "db->rows" in report, (
+            "flow_report() must include target function source (func_body) text in the report"
+        )
+
+    def test_flow_report_includes_target_source_section_header(self, tmp_path):
+        """flow_report() must include a TARGET FUNCTION SOURCE section header."""
+        sd = _make_run(tmp_path, "run_fb2", "203", "do_something")
+        sd.joinpath("sample.json").write_text(
+            json.dumps({
+                "func_name": "do_something",
+                "filepath": "lib/util.c",
+                "func_body": "void do_something(void) {}",
+            }),
+            encoding="utf-8",
+        )
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({"is_vulnerable": False, "confidence": 0.6,
+                        "resolved_commit_id": "aa01", "reasoning_summary": "r"}),
+            encoding="utf-8",
+        )
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "s", "user_prompt": "u",
+             "response": "{}", "parse_status": "valid", "parsed_answer": {}}
+        ])
+        inv = _make_inventory(tmp_path)
+        report = inv.flow_report("run_fb2", "203")
+        assert report is not None
+        assert "TARGET FUNCTION SOURCE" in report, (
+            "flow_report() must have a 'TARGET FUNCTION SOURCE' section header"
+        )
+
+
+# ---------------------------------------------------------------------------
+# New: trace_normalized() must expose commit_message + target_function_source
+# ---------------------------------------------------------------------------
+
+class TestTraceNormalizedNewFields:
+    """trace_normalized() must return commit_message and target_function_source."""
+
+    def _make_trace_run(self, tmp_path: Path, run_id: str, sample_id: str,
+                        func_name: str = "myfunc",
+                        commit_message: str | None = None,
+                        func_body: str | None = None) -> Path:
+        run_dir = tmp_path / "runs" / run_id
+        (run_dir / "agent_demos" / f"sample_{sample_id}_{func_name}").mkdir(parents=True)
+        sd = run_dir / "agent_demos" / f"sample_{sample_id}_{func_name}"
+        sample_data: dict = {"func_name": func_name, "filepath": "src/f.c",
+                             "is_vulnerable": True}
+        if commit_message is not None:
+            sample_data["commit_message"] = commit_message
+        if func_body is not None:
+            sample_data["func_body"] = func_body
+        sd.joinpath("sample.json").write_text(json.dumps(sample_data), encoding="utf-8")
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({"is_vulnerable": True, "confidence": 0.9,
+                        "resolved_commit_id": "cafecafe", "reasoning_summary": "text"}),
+            encoding="utf-8",
+        )
+        (run_dir / "run_meta.json").write_text(
+            json.dumps({"llm": {}, "kg": {}, "status": "completed"}), encoding="utf-8"
+        )
+        return sd
+
+    def test_trace_normalized_returns_commit_message_in_admin_mode(self, tmp_path):
+        """trace_normalized() must return commit_message when mode='admin'."""
+        self._make_trace_run(
+            tmp_path, "run_tn1", "300",
+            commit_message="fix: null deref in parser",
+        )
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_tn1", "300", mode="admin")
+        assert result is not None, "trace_normalized must return a dict"
+        assert "commit_message" in result, (
+            "trace_normalized() must include 'commit_message' key in admin mode"
+        )
+        assert result["commit_message"] == "fix: null deref in parser", (
+            "commit_message must match the value from sample.json"
+        )
+
+    def test_trace_normalized_commit_message_hidden_in_student_mode(self, tmp_path):
+        """trace_normalized() must hide commit_message when mode='student'."""
+        self._make_trace_run(
+            tmp_path, "run_tn2", "301",
+            commit_message="fix: null deref in parser",
+        )
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_tn2", "301", mode="student")
+        assert result is not None
+        # commit_message must either be absent or None in student mode
+        assert result.get("commit_message") is None, (
+            "commit_message must be None/absent in student mode (same gate as true_label)"
+        )
+
+    def test_trace_normalized_commit_message_none_when_missing(self, tmp_path):
+        """trace_normalized() must return None for commit_message when sample.json lacks it."""
+        self._make_trace_run(tmp_path, "run_tn3", "302")  # no commit_message
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_tn3", "302", mode="admin")
+        assert result is not None
+        assert "commit_message" in result, (
+            "commit_message key must always be present in the response"
+        )
+        assert result["commit_message"] is None, (
+            "commit_message must be None when not in sample.json"
+        )
+
+    def test_trace_normalized_returns_target_function_source(self, tmp_path):
+        """trace_normalized() must return target_function_source from sample.json func_body."""
+        self._make_trace_run(
+            tmp_path, "run_tn4", "303",
+            func_body="int myfunc(void) { return 42; }",
+        )
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_tn4", "303", mode="admin")
+        assert result is not None
+        assert "target_function_source" in result, (
+            "trace_normalized() must include 'target_function_source' key"
+        )
+        assert result["target_function_source"] == "int myfunc(void) { return 42; }", (
+            "target_function_source must match func_body from sample.json"
+        )
+
+    def test_trace_normalized_target_function_source_none_when_missing(self, tmp_path):
+        """trace_normalized() must return None for target_function_source when func_body absent."""
+        self._make_trace_run(tmp_path, "run_tn5", "304")  # no func_body
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_tn5", "304", mode="admin")
+        assert result is not None
+        assert "target_function_source" in result, (
+            "target_function_source key must always be present in the response"
+        )
+        assert result["target_function_source"] is None, (
+            "target_function_source must be None when sample.json has no func_body"
+        )
