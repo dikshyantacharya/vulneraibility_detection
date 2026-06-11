@@ -36,6 +36,7 @@ export default function App() {
         <Route path="/research/runs" element={<ResearchRunsPage />} />
         <Route path="/research/live/:jobId" element={<LiveDashboardPage />} />
         <Route path="/research/trace/:runId/:sampleId" element={<AgentTracePage />} />
+        <Route path="/research/flow" element={<AgentFlowPage />} />
         <Route path="/research/flow/:runId/:sampleId" element={<AgentFlowPage />} />
         <Route path="/research/kg/:runId/:sampleId" element={<KGQueryFlowPage />} />
         <Route path="/validation" element={<ValidationPage />} />

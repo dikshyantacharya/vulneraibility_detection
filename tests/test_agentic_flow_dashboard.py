@@ -543,6 +543,96 @@ class TestRoutePathConsistency:
 
 
 # ---------------------------------------------------------------------------
+# Generic /research/flow landing page — RED tests
+# ---------------------------------------------------------------------------
+
+class TestAgentFlowLandingPage:
+    """The generic /research/flow route must not be blank."""
+
+    def _app_tsx(self) -> str:
+        p = Path(__file__).parents[1] / "frontend" / "src" / "App.tsx"
+        assert p.exists(), "App.tsx not found"
+        return p.read_text(encoding="utf-8")
+
+    def _sidebar_tsx(self) -> str:
+        p = Path(__file__).parents[1] / "frontend" / "src" / "components" / "Sidebar.tsx"
+        assert p.exists(), "Sidebar.tsx not found"
+        return p.read_text(encoding="utf-8")
+
+    def _flow_tsx(self) -> str:
+        p = Path(__file__).parents[1] / "frontend" / "src" / "pages" / "AgentFlowPage.tsx"
+        assert p.exists(), "AgentFlowPage.tsx not found"
+        return p.read_text(encoding="utf-8")
+
+    def test_app_tsx_has_generic_flow_route(self):
+        """App.tsx must register a /research/flow route with no required params
+        so the sidebar link does not render a blank page."""
+        content = self._app_tsx()
+        # Must have path="/research/flow" without :runId/:sampleId
+        assert '"/research/flow"' in content or "'/research/flow'" in content, (
+            "App.tsx must include a <Route path=\"/research/flow\"> "
+            "(no :runId/:sampleId) so the sidebar link is not blank"
+        )
+
+    def test_app_tsx_still_has_specific_flow_route(self):
+        """App.tsx must still have the specific /research/flow/:runId/:sampleId route."""
+        content = self._app_tsx()
+        assert "/research/flow/:runId/:sampleId" in content, (
+            "App.tsx must keep the /research/flow/:runId/:sampleId route "
+            "for the detailed per-sample flow view"
+        )
+
+    def test_sidebar_links_to_generic_flow(self):
+        """Sidebar Agentic Flow link must point to /research/flow."""
+        content = self._sidebar_tsx()
+        assert '"/research/flow"' in content or "'/research/flow'" in content, (
+            "Sidebar must link to /research/flow for the Agentic Flow entry"
+        )
+
+    def test_flow_page_has_landing_title(self):
+        """AgentFlowPage must show 'Agentic Flow' as a page title in landing mode."""
+        content = self._flow_tsx()
+        assert "Agentic Flow" in content, (
+            "AgentFlowPage.tsx must contain 'Agentic Flow' title for the landing mode"
+        )
+
+    def test_flow_page_has_run_audit_link(self):
+        """AgentFlowPage landing mode must include a link/button to Run Audit (/research)."""
+        content = self._flow_tsx()
+        # Check for navigation to /research (the Run Audit page)
+        assert '"/research"' in content or "'/research'" in content, (
+            "AgentFlowPage.tsx landing mode must include a link to /research (Run Audit) "
+            "so users can start a new audit when no runs exist"
+        )
+
+    def test_flow_page_has_empty_state_text(self):
+        """AgentFlowPage must show a non-blank empty state when no runs exist."""
+        content = self._flow_tsx()
+        assert "No agentic audit runs" in content or "no runs" in content.lower() or \
+               "Start one from" in content or "Run Audit" in content, (
+            "AgentFlowPage.tsx must contain empty-state text explaining "
+            "there are no runs and how to start one"
+        )
+
+    def test_flow_page_open_flow_link_uses_run_and_sample(self):
+        """AgentFlowPage landing mode must build 'Open flow' links with runId and sampleId."""
+        content = self._flow_tsx()
+        # The landing page must construct URLs like /research/flow/${run.run_id}/${s.sample_id}
+        assert "/research/flow/" in content, (
+            "AgentFlowPage.tsx must contain /research/flow/ URL fragments "
+            "to build per-sample Open flow links"
+        )
+
+    def test_flow_page_view_runs_link(self):
+        """AgentFlowPage landing must include a link to /research/runs (View audit runs)."""
+        content = self._flow_tsx()
+        assert '"/research/runs"' in content or "'/research/runs'" in content or \
+               "/research/runs" in content, (
+            "AgentFlowPage.tsx must link to /research/runs so users can browse all runs"
+        )
+
+
+# ---------------------------------------------------------------------------
 # New: flow_report() must include commit message and target function source
 # ---------------------------------------------------------------------------
 

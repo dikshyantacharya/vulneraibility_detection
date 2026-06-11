@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { research, type AgentFlow, type FlowStage, type IterationSummary } from "../api/research";
+import { research, type AgentFlow, type FlowStage, type IterationSummary, type ResearchRun, type ResearchSample } from "../api/research";
 import { useAsync } from "../state";
 import { subscribeDashboard } from "../api/websocket";
 
@@ -298,27 +298,173 @@ function IterationRow({ it }: { it: IterationSummary }) {
 }
 
 // ---------------------------------------------------------------------------
-// Main page
+// Landing page (no runId/sampleId)
 // ---------------------------------------------------------------------------
 
-export default function AgentFlowPage() {
-  const { runId, sampleId } = useParams();
+function PredBadge({ p }: { p?: string | null }) {
+  if (p === "vulnerable") return <span className="badge red">vulnerable</span>;
+  if (p === "safe") return <span className="badge green">safe</span>;
+  return <span className="badge gray">{p || "—"}</span>;
+}
+
+function AgentFlowLanding() {
   const nav = useNavigate();
-  const fetched = useAsync<AgentFlow>(() => research.flow(runId!, sampleId!), [runId, sampleId]);
+  const runs = useAsync<ResearchRun[]>(() => research.runs(), []);
+  const sorted = (runs.data || []).slice().sort((a, b) => b.mtime - a.mtime);
+  const latestRun = sorted[0] ?? null;
+  const latestSamples = useAsync<ResearchSample[]>(
+    () => latestRun ? research.samples(latestRun.run_id) : Promise.resolve([]),
+    [latestRun?.run_id],
+  );
+
+  return (
+    <div>
+      <h1 className="page-title">Agentic Flow</h1>
+      <p className="page-sub">
+        Select an audit run/sample to inspect the full agentic decision flow — stages, prompts,
+        responses, KG evidence, loop iterations, and final decision.
+      </p>
+
+      <div className="btn-row" style={{ marginBottom: 16 }}>
+        <button className="btn btn-primary" onClick={() => nav("/research")}>Run new audit</button>
+        <button className="btn" onClick={() => nav("/research/runs")}>View audit runs</button>
+      </div>
+
+      {runs.loading && <div className="empty">Loading recent runs…</div>}
+
+      {runs.error && (
+        <div className="card" style={{ borderLeft: "4px solid var(--red, #dc2626)" }}>
+          <div className="muted">Could not load audit runs: {runs.error}</div>
+          <div className="btn-row" style={{ marginTop: 8 }}>
+            <button className="btn" onClick={runs.reload}>Retry</button>
+            <button className="btn" onClick={() => nav("/research")}>Run Audit</button>
+          </div>
+        </div>
+      )}
+
+      {!runs.loading && !runs.error && sorted.length === 0 && (
+        <div className="card" style={{ textAlign: "center", padding: 32 }}>
+          <div style={{ fontSize: 15, marginBottom: 8 }}>No agentic audit runs found.</div>
+          <div className="muted" style={{ marginBottom: 16 }}>
+            Start one from Run Audit to see agentic flow timelines here.
+          </div>
+          <button className="btn btn-primary" onClick={() => nav("/research")}>Run Audit</button>
+        </div>
+      )}
+
+      {sorted.length > 0 && (
+        <>
+          {/* Latest run — show samples inline */}
+          <div className="section-title">
+            Latest run: <span className="mono" style={{ fontSize: 12 }}>{latestRun!.run_id}</span>
+            <span className="muted" style={{ fontSize: 11, marginLeft: 8 }}>
+              {new Date(latestRun!.mtime * 1000).toLocaleString()}
+            </span>
+          </div>
+
+          {latestSamples.loading && <div className="empty">Loading samples…</div>}
+
+          {!latestSamples.loading && (latestSamples.data || []).length === 0 && (
+            <div className="banner warn">No samples found in this run.</div>
+          )}
+
+          {(latestSamples.data || []).length > 0 && (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
+              <thead>
+                <tr style={{ borderBottom: "2px solid var(--border, #e2e8f0)", textAlign: "left" }}>
+                  <th style={{ padding: "4px 8px" }}>Function</th>
+                  <th style={{ padding: "4px 8px" }}>Prediction</th>
+                  <th style={{ padding: "4px 8px" }}>Status</th>
+                  <th style={{ padding: "4px 8px" }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(latestSamples.data || []).map((s) => (
+                  <tr key={s.sample_id} style={{ borderBottom: "1px solid var(--border, #e2e8f0)" }}>
+                    <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>
+                      {s.function_name || s.sample_id}
+                    </td>
+                    <td style={{ padding: "4px 8px" }}>
+                      <PredBadge p={s.prediction} />
+                      {s.confidence != null && (
+                        <span className="muted" style={{ marginLeft: 4 }}>
+                          {(s.confidence * 100).toFixed(0)}%
+                        </span>
+                      )}
+                    </td>
+                    <td style={{ padding: "4px 8px", color: "var(--muted, #64748b)" }}>
+                      {s.decision_status || "—"}
+                    </td>
+                    <td style={{ padding: "4px 8px" }}>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button
+                          className="btn"
+                          style={{ fontSize: 11, padding: "2px 8px" }}
+                          onClick={() => nav(`/research/flow/${encodeURIComponent(latestRun!.run_id)}/${encodeURIComponent(s.sample_id)}`)}
+                        >
+                          Open flow
+                        </button>
+                        <a
+                          className="btn"
+                          style={{ fontSize: 11, padding: "2px 8px" }}
+                          href={research.flowReportUrl(latestRun!.run_id, s.sample_id)}
+                          download
+                          title="Download full-flow text report"
+                        >
+                          Report
+                        </a>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {/* Older runs — compact list */}
+          {sorted.length > 1 && (
+            <>
+              <div className="section-title">Older runs</div>
+              {sorted.slice(1, 8).map((r) => (
+                <div key={r.run_id} className="card" style={{ marginBottom: 6, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <span className="mono" style={{ fontSize: 12, flex: 1 }}>{r.run_id}</span>
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    {new Date(r.mtime * 1000).toLocaleString()} · {r.samples} sample{r.samples !== 1 ? "s" : ""}
+                  </span>
+                  <button
+                    className="btn"
+                    style={{ fontSize: 11, padding: "2px 8px" }}
+                    onClick={() => nav(`/research/runs`)}
+                  >
+                    Browse samples
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Detail view (runId + sampleId present) — extracted so hooks are unconditional
+// ---------------------------------------------------------------------------
+
+function AgentFlowDetail({ runId, sampleId }: { runId: string; sampleId: string }) {
+  const nav = useNavigate();
+  const fetched = useAsync<AgentFlow>(() => research.flow(runId, sampleId), [runId, sampleId]);
   const [flow, dispatch] = useReducer(flowReducer, null);
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
-  // Ref so the WS closure can trigger a refetch without a stale dependency.
   const reloadRef = useRef(fetched.reload);
   reloadRef.current = fetched.reload;
 
-  // Hydrate from REST fetch
   useEffect(() => {
     if (fetched.data) dispatch({ type: "SET_FLOW", flow: fetched.data });
   }, [fetched.data]);
 
-  // Subscribe to live WS events for this sample
   useEffect(() => {
-    if (!sampleId) return;
     const handle = subscribeDashboard((msg: any) => {
       const d = msg?.event?.data || msg?.data || {};
       const sid = d?.sample_id || d?.sid;
@@ -331,7 +477,6 @@ export default function AgentFlowPage() {
         dispatch({ type: "STAGE_STARTED", stage });
       } else if (etype === "model_call.done" && stage) {
         dispatch({ type: "STAGE_COMPLETED", stage, data: d });
-        // Refetch to pick up newly written model_calls.jsonl content (prompts/responses).
         reloadRef.current();
       } else if (etype === "model_call.error" && stage) {
         dispatch({ type: "STAGE_FAILED", stage, error: d?.error });
@@ -361,12 +506,13 @@ export default function AgentFlowPage() {
         <button className="btn" onClick={() => { fetched.reload(); dispatch({ type: "SET_FLOW", flow: { stages: [], iterations: [] } }); }}>Refresh</button>
         <a
           className="btn btn-primary"
-          href={research.flowReportUrl(runId!, sampleId!)}
+          href={research.flowReportUrl(runId, sampleId)}
           download
           title="Download full-flow text report (prompts, responses, parsed JSON, KG queries, final decision)"
         >
           Download full flow report
         </a>
+        <button className="btn" onClick={() => nav("/research/flow")}>← Agentic Flow</button>
         <button className="btn" onClick={() => nav("/research/runs")}>← Runs</button>
       </div>
 
@@ -392,14 +538,12 @@ export default function AgentFlowPage() {
                     : <span className="badge amber">0</span>}
                 </span>
               )}
-              {/* Show explicit stop reason — especially important for 0-iteration runs */}
               {f.loop_stop_reason && (
                 <span>
                   <span className="muted">Stop reason:</span>{" "}
                   <code style={{ fontSize: 11 }}>{f.loop_stop_reason}</code>
                 </span>
               )}
-              {/* Warn explicitly when loop was enabled but produced 0 iterations */}
               {f.iterative_loop_enabled && f.iterations_completed === 0 && !f.loop_stop_reason && (
                 <span className="badge amber" title="Loop enabled but no iteration summary recorded">0 iterations — no stop reason recorded</span>
               )}
@@ -415,7 +559,6 @@ export default function AgentFlowPage() {
             </div>
           </div>
 
-          {/* Iteration summaries */}
           {iterations.length > 0 && (
             <>
               <div className="section-title">Evidence iterations ({iterations.length})</div>
@@ -423,7 +566,6 @@ export default function AgentFlowPage() {
             </>
           )}
 
-          {/* Stage timeline */}
           <div className="section-title" style={{ marginTop: 12 }}>
             Stage timeline ({stages.length})
             {stages.length > 0 && (
@@ -456,4 +598,14 @@ export default function AgentFlowPage() {
       )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Main page — dispatches to landing or detail based on URL params
+// ---------------------------------------------------------------------------
+
+export default function AgentFlowPage() {
+  const { runId, sampleId } = useParams();
+  if (runId && sampleId) return <AgentFlowDetail runId={runId} sampleId={sampleId} />;
+  return <AgentFlowLanding />;
 }
