@@ -782,6 +782,39 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         return FileResponse(str(f))
 
     # ---- old CodeKG static dashboard (the high-quality explorer) -----
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/flow")
+    def research_agent_flow(run_id: str, sample_id: str) -> dict[str, Any]:
+        """Return agent_flow.json data for the Agentic Flow dashboard tab.
+
+        Reads iterative-loop artifacts (agent_flow.json, evidence_iterations.jsonl)
+        for finished runs. Falls back gracefully for old non-iterative runs.
+        """
+        flow = research.flow(run_id, sample_id)
+        if flow is None:
+            raise HTTPException(status_code=404, detail="run or sample not found")
+        return flow
+
+    @app.get("/api/research/runs/{run_id}/samples/{sample_id}/flow/report")
+    def research_flow_report(run_id: str, sample_id: str):
+        """Return a sanitized full-flow text report for download.
+
+        Generates agent_flow_<run_id>_<func>.txt containing all prompts, responses,
+        parsed JSON, KG queries, loop iterations, and final decision.
+        """
+        from fastapi.responses import Response as FastAPIResponse
+        report_text = research.flow_report(run_id, sample_id)
+        if report_text is None:
+            raise HTTPException(status_code=404, detail="run or sample not found")
+        # Derive a user-friendly filename from the sample directory name.
+        sd = research._sample_dir(run_id, sample_id)
+        func_slug = "_".join(sd.name.split("_")[2:]) if sd and sd.name.count("_") >= 2 else sample_id
+        filename = f"agent_flow_{run_id}_{func_slug}.txt"
+        return FastAPIResponse(
+            content=report_text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @app.get("/api/research/runs/{run_id}/samples/{sample_id}/kg-dashboard")
     def research_kg_dashboard(run_id: str, sample_id: str) -> dict[str, Any]:
         """Discover the old static CodeKG dashboard/index.html for a sample and

@@ -108,6 +108,10 @@ export const research = {
     http<NormalizedSample>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/trace-normalized?mode=${mode}`),
   sampleStages: (run: string, s: string) =>
     http<Stage[]>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/stages`),
+  flow: (run: string, s: string) =>
+    http<AgentFlow>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/flow`),
+  flowReportUrl: (run: string, s: string) =>
+    `${BASE}/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/flow/report`,
 };
 
 export interface RunLLM {
@@ -192,6 +196,62 @@ export interface Stage {
   requested_max_tokens?: number | null;
   effective_max_tokens?: number | null;
 }
+export interface FlowStage {
+  stage?: string | null;
+  status?: "pending" | "running" | "completed" | "failed" | "skipped";
+  elapsed_seconds?: number | null;
+  finish_reason?: string | null;
+  was_truncated?: boolean;
+  requested_max_tokens?: number | null;
+  effective_max_tokens?: number | null;
+  prompt_chars?: number | null;
+  response_chars?: number | null;
+  usage?: { prompt?: number; completion?: number; total?: number; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+  error?: string | null;
+  // Iteration info parsed from stage name (e.g. "04_evidence_gap_iter2")
+  iteration?: number;
+  // Full content fields (available after incremental model_calls.jsonl write)
+  kind?: string | null;
+  system_prompt?: string | null;
+  user_prompt?: string | null;
+  messages?: { role: string; content: string }[] | null;
+  response?: string | null;
+  parsed_answer?: any;
+  // Parse diagnostics (populated by _enrich_call_parse_result in pipeline.py)
+  answer_text?: string | null;
+  parse_status?: "valid" | "invalid" | "repaired" | "repair_failed" | "text_only" | "failed" | null;
+  parse_error?: string | null;
+  validation_error?: string | null;
+  repair_status?: string | null;
+}
+
+export interface IterationSummary {
+  iteration?: number | null;
+  phase?: string | null;
+  new_evidence_count?: number | null;
+  stop_reason?: string | null;
+}
+
+export interface AgentFlow {
+  sample_id?: string;
+  fallback?: boolean;
+  iterative_loop_enabled?: boolean;
+  loop_stop_reason?: string | null;
+  iterations_completed?: number;
+  stages: FlowStage[];
+  iterations: IterationSummary[];
+  total_evidence_items?: number | null;
+  initial_evidence_items?: number | null;
+}
+
+export interface RunLoopSpec {
+  loop_enabled?: boolean;                     // default true for dashboard runs
+  enable_counter_evidence_loop?: boolean;     // default = loop_enabled
+  max_evidence_iterations?: number;           // default 3
+  max_counter_iterations?: number;            // default 2
+  max_queries_per_iteration?: number;         // default 5
+}
+
 export interface NormalizedSample {
   run_id: string;
   sample_id: string;

@@ -46,6 +46,56 @@ from vuln_commit_kg.utils.jsonl import append_jsonl, write_json, write_jsonl
 from vuln_commit_kg.utils.paths import make_run_dir
 
 
+def _enrich_call_parse_result(call: dict[str, Any]) -> None:
+    """Post-parse enrichment: extract <answer> JSON and add parse diagnostics to call record.
+
+    Mutates *call* in-place adding:
+      parsed_answer, answer_text, parse_status, parse_error, json_status (updated).
+
+    Called once after run_agentic_proof_pipeline() returns so model_calls.jsonl is
+    rewritten with parse diagnostics. Tests import this function directly.
+    """
+    from vckg_agentic_proof.parser import extract_answer_text, ANSWER_RE
+
+    name = call.get("name") or ""
+
+    # final_decision is a synthetic record already validated; mark it directly.
+    if name == "final_decision" or call.get("json_status") == "json_ok":
+        call.setdefault("parse_status", "valid")
+        call.setdefault("parsed_answer", call.get("parsed") or call.get("parsed_answer"))
+        call.setdefault("answer_text", call.get("response") or "")
+        return
+
+    # Error stages: no response to parse.
+    if call.get("error") or not (call.get("response") or "").strip():
+        call["parse_status"] = "failed"
+        return
+
+    response = call.get("response") or ""
+    try:
+        _, answer_text = extract_answer_text(response)
+        has_answer_tag = bool(ANSWER_RE.search(response))
+        call["answer_text"] = answer_text
+        if answer_text:
+            try:
+                parsed = json.loads(answer_text)
+                call["parsed_answer"] = parsed
+                call["parse_status"] = "valid"
+                call["json_status"] = "json_ok"
+            except Exception as e:
+                call["parse_status"] = "invalid"
+                call["parse_error"] = str(e)
+                call["json_status"] = "json_invalid"
+        else:
+            # extract_answer_text fell back to the full response (no <answer> tag)
+            call["parse_status"] = "text_only" if not has_answer_tag else "invalid"
+            if not has_answer_tag:
+                call["json_status"] = "text_only"
+    except Exception as e:
+        call["parse_status"] = "invalid"
+        call["parse_error"] = str(e)
+
+
 class PipelineResult:
     def __init__(self, run_dir: Path, metrics_path: Path):
         self.run_dir = run_dir
@@ -778,12 +828,21 @@ class CommitKGPipeline:
             max_hypotheses=int(getattr(ap_cfg, "max_hypotheses", 12) or 12),
             max_queries_per_hypothesis=int(getattr(ap_cfg, "max_queries_per_hypothesis", 6) or 6),
             evidence_limit_per_query=int(getattr(ap_cfg, "evidence_limit_per_query", 8) or 8),
-            max_tokens_source_only_hypothesis=int(getattr(ap_cfg, "max_tokens_source_only_hypothesis", 4096) or 4096),
-            max_tokens_kg_query_planning=int(getattr(ap_cfg, "max_tokens_kg_query_planning", 2048) or 2048),
-            max_tokens_hypothesis_verification=int(getattr(ap_cfg, "max_tokens_hypothesis_verification", 4096) or 4096),
-            max_tokens_counter_evidence_review=int(getattr(ap_cfg, "max_tokens_counter_evidence_review", 4096) or 4096),
-            max_tokens_final_decision=int(getattr(ap_cfg, "max_tokens_final_decision", 4096) or 4096),
-            max_tokens_schema_repair=int(getattr(ap_cfg, "max_tokens_schema_repair", 2048) or 2048),
+            max_tokens_source_only_hypothesis=int(getattr(ap_cfg, "max_tokens_source_only_hypothesis", 16384) or 16384),
+            max_tokens_kg_query_planning=int(getattr(ap_cfg, "max_tokens_kg_query_planning", 8192) or 8192),
+            max_tokens_hypothesis_verification=int(getattr(ap_cfg, "max_tokens_hypothesis_verification", 16384) or 16384),
+            max_tokens_counter_evidence_review=int(getattr(ap_cfg, "max_tokens_counter_evidence_review", 16384) or 16384),
+            max_tokens_final_decision=int(getattr(ap_cfg, "max_tokens_final_decision", 8192) or 8192),
+            max_tokens_schema_repair=int(getattr(ap_cfg, "max_tokens_schema_repair", 4096) or 4096),
+            max_tokens_evidence_gap_analysis=int(getattr(ap_cfg, "max_tokens_evidence_gap_analysis", 8192) or 8192),
+            iterative_evidence_loop=bool(getattr(ap_cfg, "iterative_evidence_loop", False)),
+            max_evidence_iterations=int(getattr(ap_cfg, "max_evidence_iterations", 3) or 3),
+            max_queries_per_iteration=int(getattr(ap_cfg, "max_queries_per_iteration", 5) or 5),
+            stop_when_no_new_evidence=bool(getattr(ap_cfg, "stop_when_no_new_evidence", True)),
+            stop_when_no_new_queries=bool(getattr(ap_cfg, "stop_when_no_new_queries", True)),
+            stop_when_all_hypotheses_resolved=bool(getattr(ap_cfg, "stop_when_all_hypotheses_resolved", True)),
+            enable_counter_evidence_loop=bool(getattr(ap_cfg, "enable_counter_evidence_loop", False)),
+            max_counter_iterations=int(getattr(ap_cfg, "max_counter_iterations", 2) or 2),
             temperature=float(getattr(self.cfg.model, "temperature", 0.0) or 0.0),
             provider_extra_body=dict(getattr(self.cfg.model, "api_extra_body", {}) or {"chat_template_kwargs": {"enable_thinking": False}}),
             enable_pair_aware_dev_mode=bool(getattr(ap_cfg, "pair_aware_dev_mode", False)),
@@ -934,6 +993,14 @@ class CommitKGPipeline:
                     "was_truncated": was_truncated,
                 }
                 trace.model_calls.append(call_record)
+                # Write incrementally so flow() can read it during a live run.
+                try:
+                    _mc_path = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}" / "model_calls.jsonl"
+                    _mc_path.parent.mkdir(parents=True, exist_ok=True)
+                    with _mc_path.open("a", encoding="utf-8") as _mcf:
+                        _mcf.write(json.dumps(call_record, ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    pass
                 trace.raw_outputs.append(text)
                 if self.live:
                     done_payload = {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars, "response_chars": len(text), "elapsed_seconds": elapsed, "usage": usage, "json_status": "raw_agentic_proof_pending_parse"}
@@ -972,6 +1039,15 @@ class CommitKGPipeline:
                 if self.live:
                     self.live.event("model_call.error", {"sample_id": sample.sample_id, "stage": stage, "elapsed_seconds": elapsed, "error": error_text, "prompt_chars": prompt_chars})
                     self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "error", "last_model_error": error_text, "last_model_elapsed_seconds": elapsed})
+                # Persist the error record to disk so Agentic Flow can display
+                # the failed stage even when the exception later fails the sample.
+                try:
+                    _mc_err_path = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}" / "model_calls.jsonl"
+                    _mc_err_path.parent.mkdir(parents=True, exist_ok=True)
+                    with _mc_err_path.open("a", encoding="utf-8") as _mcef:
+                        _mcef.write(json.dumps(trace.model_calls[-1], ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    pass
                 raise
             finally:
                 if hasattr(model, "cfg"):
@@ -1034,6 +1110,38 @@ class CommitKGPipeline:
             return [evidence_to_dict(i) for i in new_items]
 
         sample_obj = sample
+
+        # evidence_iterations.jsonl — one row per follow-up retrieval round
+        _iter_log_path = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}" / "evidence_iterations.jsonl"
+        _iter_rows: list[dict[str, Any]] = []
+
+        def _on_iteration_event(event_type: str, data: dict[str, Any]) -> None:
+            """Relay adapter iteration events to live dashboard and durable JSONL artifact."""
+            if self.live:
+                if event_type == "evidence_iteration_started":
+                    self.live.event("evidence_iteration_started", data)
+                    self.live.update_sample(sample.sample_id, {
+                        "status": "running",
+                        "agent_stage": f"evidence_iteration_{data.get('iteration')}",
+                        "evidence_phase": data.get("phase"),
+                    })
+                elif event_type == "evidence_iteration_completed":
+                    self.live.event("evidence_iteration_completed", data)
+            if event_type == "evidence_iteration_completed":
+                row = {
+                    "iteration": data.get("iteration"),
+                    "phase": data.get("phase"),
+                    "new_evidence_count": data.get("new_evidence_count", 0),
+                    "stop_reason": data.get("stop_reason"),
+                }
+                _iter_rows.append(row)
+                try:
+                    _iter_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with _iter_log_path.open("a", encoding="utf-8") as _f:
+                        _f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+
         result = run_agentic_proof_pipeline(
             sample=public_sample_dict(),
             target_source=sample.func_body,
@@ -1041,6 +1149,7 @@ class CommitKGPipeline:
             llm_generate=llm_generate,
             kg_search=kg_search,
             config=proof_cfg,
+            on_iteration_event=_on_iteration_event,
         )
         decision = result.decision.normalize_prediction_bool()
         final_json = decision.model_dump(mode="json")
@@ -1073,6 +1182,59 @@ class CommitKGPipeline:
                         "after": final_json,
                     })
         trace.final_validator_modifications = validator_mods
+
+        # Post-parse enrichment: add parsed_answer / parse_status / answer_text to
+        # every model_calls entry, then rewrite model_calls.jsonl so the Agentic Flow
+        # dashboard can show the correct JSON valid/invalid badge and detail panel.
+        for _call in trace.model_calls:
+            _enrich_call_parse_result(_call)
+        try:
+            _mc_enrich_path = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}" / "model_calls.jsonl"
+            _mc_enrich_path.parent.mkdir(parents=True, exist_ok=True)
+            _mc_enrich_path.write_text(
+                "\n".join(json.dumps(c, ensure_ascii=False, default=str) for c in trace.model_calls) + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        # Write agent_flow.json — durable artifact for the Agentic Flow dashboard tab.
+        # Captures the full stage sequence with iteration metadata so finished runs
+        # can be inspected without the live WS connection.
+        try:
+            _flow_path = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}" / "agent_flow.json"
+            _flow_path.parent.mkdir(parents=True, exist_ok=True)
+            _flow_data = {
+                "sample_id": sample.sample_id,
+                "loop_stop_reason": getattr(result, "loop_stop_reason", None),
+                "iterations_completed": getattr(result, "iterations_completed", 0),
+                "iterative_loop_enabled": proof_cfg.iterative_evidence_loop,
+                "stages": [
+                    {
+                        "stage": c.get("name"),
+                        "status": "completed" if not c.get("error") else "failed",
+                        "elapsed_seconds": c.get("elapsed_seconds"),
+                        "finish_reason": c.get("finish_reason"),
+                        "was_truncated": c.get("was_truncated", False),
+                        "requested_max_tokens": c.get("requested_max_tokens"),
+                        "effective_max_tokens": c.get("effective_max_tokens"),
+                        "prompt_chars": c.get("prompt_chars"),
+                        "response_chars": len(c.get("response") or ""),
+                        "usage": c.get("usage") or {},
+                    }
+                    for c in (trace.model_calls or [])
+                    if c.get("name") not in ("final_decision",)
+                ],
+                "iterations": _iter_rows,
+                "total_evidence_items": len(evidence.items),
+                "initial_evidence_items": trace.initial_evidence_count,
+            }
+            _flow_path.write_text(
+                json.dumps(_flow_data, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
         usage = dict(result.usage or {})
         pt = int(usage.get("prompt_tokens") or 0)

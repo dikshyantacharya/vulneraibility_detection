@@ -304,6 +304,98 @@ class ResearchInventory:
             "dashboard_available": (sd / "index.html").exists(),
         }
 
+    def flow(self, run_id: str, sample_id: str) -> dict[str, Any] | None:
+        """Return agentic flow data for the Agentic Flow dashboard tab.
+
+        Merges all available artifacts to build a complete, content-rich view:
+        - agent_flow.json (finished-run summary, if written)
+        - model_calls.jsonl (full LLM stage content — written incrementally
+          during a live run so this endpoint works before the run ends)
+        - evidence_iterations.jsonl (loop iteration rows)
+        Falls back gracefully for old non-iterative artifacts.
+        """
+        sd = self._sample_dir(run_id, sample_id)
+        if not sd:
+            return None
+
+        flow_json = _read_json(sd / "agent_flow.json")
+        iter_rows = _read_jsonl(sd / "evidence_iterations.jsonl")
+
+        # Always read model_calls for full content (system/user prompt, messages,
+        # response). These are written incrementally during a live run so the
+        # flow endpoint returns real data even before the run finishes.
+        trace = _read_json(sd / "agent_trace.json") or {}
+        calls = trace.get("model_calls") or _read_jsonl(sd / "model_calls.jsonl")
+        calls_by_stage: dict[str, dict[str, Any]] = {}
+        for c in (calls or []):
+            name = c.get("name") or c.get("stage") or ""
+            if name and name not in calls_by_stage:
+                calls_by_stage[name] = c
+
+        def _enrich(summary: dict[str, Any]) -> dict[str, Any]:
+            """Merge full content from model_calls into a stage summary dict."""
+            name = summary.get("stage") or ""
+            c = calls_by_stage.get(name) or {}
+            return {
+                **summary,
+                "kind": "llm",
+                "system_prompt": c.get("system_prompt") or c.get("system"),
+                "user_prompt": c.get("user_prompt") or c.get("prompt"),
+                "messages": c.get("messages"),
+                "response": c.get("response") or c.get("raw"),
+                "usage": c.get("usage") or summary.get("usage") or {},
+                "error": c.get("error") or summary.get("error"),
+                # Parse diagnostics — preserve from model_calls even when summary
+                # is compact (agent_flow.json never wrote these fields).
+                "parsed_answer": c.get("parsed_answer"),
+                "answer_text": c.get("answer_text"),
+                "parse_status": c.get("parse_status"),
+                "parse_error": c.get("parse_error"),
+                "validation_error": c.get("validation_error"),
+                "repair_status": c.get("repair_status"),
+            }
+
+        if flow_json is None:
+            # No finished-run artifact: synthesize from model_calls.
+            # This path is hit both for in-progress runs (model_calls.jsonl
+            # written incrementally) and old pre-iterative runs.
+            stages = [
+                _enrich({
+                    "stage": c.get("name") or c.get("stage"),
+                    "status": "failed" if c.get("error") else "completed",
+                    "elapsed_seconds": c.get("elapsed_seconds"),
+                    "finish_reason": c.get("finish_reason"),
+                    "was_truncated": c.get("was_truncated", False),
+                    "requested_max_tokens": c.get("requested_max_tokens"),
+                    "effective_max_tokens": c.get("effective_max_tokens"),
+                    "prompt_chars": c.get("prompt_chars"),
+                    "usage": c.get("usage") or {},
+                    "error": c.get("error"),
+                })
+                for c in (calls or [])
+                if (c.get("name") or c.get("stage")) not in ("final_decision",)
+            ]
+            return _mask_secrets({
+                "sample_id": sample_id,
+                "fallback": True,
+                "iterative_loop_enabled": False,
+                "loop_stop_reason": None,
+                "iterations_completed": 0,
+                "stages": stages,
+                "iterations": iter_rows,
+                "total_evidence_items": None,
+                "initial_evidence_items": None,
+            })
+
+        # Merge iterations from JSONL if agent_flow.json didn't capture them.
+        if not flow_json.get("iterations") and iter_rows:
+            flow_json["iterations"] = iter_rows
+
+        # Enrich agent_flow.json summary stages with full content from model_calls.
+        flow_json["stages"] = [_enrich(s) for s in (flow_json.get("stages") or [])]
+
+        return _mask_secrets(flow_json)
+
     def dashboard_file(self, run_id: str, sample_id: str, rel: str) -> Path | None:
         """Resolve a file inside a sample dir for the embedded static dashboard.
 
@@ -833,6 +925,21 @@ class ResearchInventory:
                         messages.append({"role": "system", "content": system_prompt})
                     if user_prompt:
                         messages.append({"role": "user", "content": user_prompt})
+                # Determine json_valid from parse_status (Phase B enriched field) first,
+                # then fall back to the legacy parsed_response file, then to None (unknown).
+                # NEVER return False when the file is merely absent — that causes a false
+                # 'JSON invalid' badge. False is only correct when parse genuinely failed.
+                parse_status_field = c.get("parse_status")
+                if parse_status_field == "valid":
+                    json_valid_val: bool | None = True
+                elif parse_status_field in ("invalid", "failed"):
+                    json_valid_val = False
+                elif parsed is not None:
+                    json_valid_val = True      # legacy: parsed_response file exists
+                elif meta["json_expected"]:
+                    json_valid_val = None      # unknown — not yet enriched or file absent
+                else:
+                    json_valid_val = None
                 out.append({
                     "index": i, "stage": name, "status": status, "source": "model_calls",
                     "prompt": user_prompt, "system": system_prompt,
@@ -849,7 +956,9 @@ class ResearchInventory:
                     "elapsed_seconds": c.get("elapsed_seconds"),
                     "json_status": json_status,
                     "json_expected": meta["json_expected"],
-                    "json_valid": (parsed is not None) if meta["json_expected"] else None,
+                    "json_valid": json_valid_val,
+                    "parse_status": parse_status_field,
+                    "parse_error": c.get("parse_error"),
                     "error": err,
                     "is_repair": meta["is_repair"], "is_planning": meta["is_planning"], "is_final": meta["is_final"],
                     # Token budget and truncation fields (new artifacts; None for old runs).
@@ -1172,3 +1281,185 @@ class ResearchInventory:
                     "tree_total_bytes": r.get("tree_total_bytes"),
                 })
         return out
+
+    # ---- full-flow text report ----------------------------------------------
+
+    def flow_report(self, run_id: str, sample_id: str) -> str | None:
+        """Generate a sanitized, human-readable full-flow text report for one sample.
+
+        Returns a multi-section plain-text string suitable for download, or None when
+        the sample directory does not exist.  All secrets are masked via _mask_secrets.
+        """
+        sd = self._sample_dir(run_id, sample_id)
+        if not sd:
+            return None
+
+        lines: list[str] = []
+        _HR = "=" * 72
+        _hr = "-" * 72
+
+        def _sec(title: str) -> None:
+            lines.append(_HR)
+            lines.append(f"  {title}")
+            lines.append(_HR)
+            lines.append("")
+
+        def _subsec(title: str) -> None:
+            lines.append(_hr)
+            lines.append(f"  {title}")
+            lines.append(_hr)
+            lines.append("")
+
+        def _kv(k: str, v: Any) -> None:
+            lines.append(f"  {k}: {v}")
+
+        def _block(label: str, text: str | None) -> None:
+            if not text:
+                lines.append(f"  [{label}: not available]")
+            else:
+                lines.append(f"  --- {label} ---")
+                for ln in str(text).splitlines():
+                    lines.append("  " + ln)
+            lines.append("")
+
+        # ── Run / sample metadata ────────────────────────────────────────────
+        _sec("FULL AGENTIC FLOW REPORT")
+        run_meta = self.run_meta(run_id)
+        fp = _read_json(sd / "final_prediction.json") or {}
+        flow_json = _read_json(sd / "agent_flow.json") or {}
+        sample_json = _read_json(sd / "sample.json") or {}
+
+        _kv("run_id", run_id)
+        _kv("sample_id", sample_id)
+        _kv("target_function", sample_json.get("func_name") or sample_json.get("function_name") or "—")
+        _kv("target_file", sample_json.get("filepath") or "—")
+        llm_meta = run_meta.get("llm") or {}
+        _kv("provider", llm_meta.get("provider_name") or llm_meta.get("model_backend") or "—")
+        _kv("model", llm_meta.get("model") or "—")
+        _kv("loop_enabled", flow_json.get("iterative_loop_enabled", "—"))
+        _kv("iterations_completed", flow_json.get("iterations_completed", "—"))
+        _kv("loop_stop_reason", flow_json.get("loop_stop_reason") or fp.get("loop_stop_reason") or "—")
+        _kv("final_prediction", fp.get("is_vulnerable"))
+        _kv("confidence", fp.get("confidence") or "—")
+        _kv("decision_status", fp.get("decision_status") or "—")
+        lines.append("")
+
+        # ── Stage timeline ───────────────────────────────────────────────────
+        trace = _read_json(sd / "agent_trace.json") or {}
+        calls = trace.get("model_calls") or _read_jsonl(sd / "model_calls.jsonl")
+        calls = _mask_secrets(calls or [])
+
+        _sec("STAGE TIMELINE")
+        if not calls:
+            lines.append("  [No model_calls artifacts found]")
+            lines.append("")
+        else:
+            for i, c in enumerate(calls, start=1):
+                name = c.get("name") or c.get("stage") or f"stage_{i}"
+                status = "failed" if c.get("error") else "completed"
+                parse_status = c.get("parse_status") or "—"
+                repair_status = c.get("repair_status") or "—"
+                elapsed = c.get("elapsed_seconds")
+                usage = c.get("usage") or {}
+                tok = usage.get("total_tokens") or usage.get("total") or "—"
+                lines.append(
+                    f"  {i:2d}. {name:<48} status={status:<10} "
+                    f"parse={parse_status:<12} repair={repair_status:<18} "
+                    f"tok={tok} elapsed={elapsed}s"
+                )
+            lines.append("")
+
+        # ── Per-stage detail ─────────────────────────────────────────────────
+        _sec("PER-STAGE DETAIL")
+        for i, c in enumerate(calls, start=1):
+            name = c.get("name") or c.get("stage") or f"stage_{i}"
+            _subsec(f"Stage {i}: {name}")
+            _kv("status", "failed" if c.get("error") else "completed")
+            _kv("parse_status", c.get("parse_status") or "—")
+            _kv("parse_error", c.get("parse_error") or "—")
+            _kv("validation_error", c.get("validation_error") or "—")
+            _kv("repair_status", c.get("repair_status") or "—")
+            _kv("elapsed_seconds", c.get("elapsed_seconds") or "—")
+            _kv("finish_reason", c.get("finish_reason") or "—")
+            _kv("was_truncated", c.get("was_truncated", False))
+            usage = c.get("usage") or {}
+            _kv("prompt_tokens", usage.get("prompt_tokens") or "—")
+            _kv("completion_tokens", usage.get("completion_tokens") or "—")
+            _kv("total_tokens", usage.get("total_tokens") or "—")
+            _kv("max_tokens_requested", c.get("requested_max_tokens") or "—")
+            lines.append("")
+            _block("System Prompt", c.get("system_prompt") or c.get("system"))
+            _block("User Prompt", c.get("user_prompt") or c.get("prompt"))
+            _block("Raw Response", c.get("response") or c.get("raw"))
+            answer_text = c.get("answer_text")
+            if answer_text:
+                _block("Extracted <answer>", answer_text)
+            parsed = c.get("parsed_answer")
+            if parsed is not None:
+                try:
+                    _block("Parsed JSON", json.dumps(parsed, indent=2, ensure_ascii=False))
+                except Exception:
+                    _block("Parsed JSON", str(parsed))
+            if c.get("error"):
+                _block("Error", c.get("error"))
+
+        # ── KG queries ───────────────────────────────────────────────────────
+        kg_qs = self.kg_queries(run_id, sample_id)
+        if kg_qs:
+            _sec("KG QUERIES")
+            for j, q in enumerate(kg_qs, start=1):
+                if q.get("_summary_only"):
+                    lines.append(f"  [Summary only — {q.get('queries')} queries, "
+                                 f"{q.get('returned_items')} returned, "
+                                 f"{q.get('evidence_items')} accumulated]")
+                    lines.append("")
+                    continue
+                _subsec(f"KG Query {j}: {q.get('query_id') or q.get('query_type') or '?'}")
+                _kv("type", q.get("query_type") or "—")
+                _kv("query", q.get("query") or q.get("query_text") or "—")
+                _kv("expected_evidence", q.get("expected_evidence") or q.get("wanted_evidence") or "—")
+                _kv("returned_items", q.get("returned_items") or len(q.get("items") or []))
+                _kv("new_evidence_count", q.get("new_items") or "—")
+                items = q.get("items") or []
+                if items:
+                    lines.append("  Evidence items:")
+                    for item in items[:4]:
+                        snippet = str(item.get("text") or item.get("content") or "")[:200]
+                        lines.append(f"    [{item.get('evidence_id') or item.get('id') or '?'}] {snippet}")
+                lines.append("")
+
+        # ── Loop iterations ──────────────────────────────────────────────────
+        iter_rows = _read_jsonl(sd / "evidence_iterations.jsonl")
+        if iter_rows:
+            _sec("EVIDENCE LOOP ITERATIONS")
+            for it in iter_rows:
+                lines.append(
+                    f"  phase={it.get('phase') or '?'}  iter={it.get('iteration')}  "
+                    f"new_evidence={it.get('new_evidence_count')}  stop={it.get('stop_reason') or '—'}"
+                )
+            lines.append("")
+
+        # ── Final decision ───────────────────────────────────────────────────
+        if fp:
+            _sec("FINAL DECISION")
+            try:
+                _block("final_prediction.json", json.dumps(_mask_secrets(fp), indent=2, ensure_ascii=False))
+            except Exception:
+                _block("final_prediction.json", str(fp))
+
+        # ── Errors / limitations ─────────────────────────────────────────────
+        errors: list[str] = []
+        for c in calls:
+            if c.get("error"):
+                errors.append(f"  Stage {c.get('name')}: {c.get('error')}")
+            if c.get("parse_error"):
+                errors.append(f"  Stage {c.get('name')} parse_error: {c.get('parse_error')}")
+        if errors:
+            _sec("ERRORS / PARSE FAILURES")
+            lines.extend(errors)
+            lines.append("")
+
+        lines.append(_HR)
+        lines.append("  END OF REPORT")
+        lines.append(_HR)
+        return "\n".join(lines)
