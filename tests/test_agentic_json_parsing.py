@@ -1090,3 +1090,154 @@ class TestParseModelObjectRepairRouting:
             f"Expected decision_status='failed_parse' for schema-invalid Stage 06, "
             f"got {result.decision.decision_status!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# I. Null proof normalization in FinalDecision
+# ---------------------------------------------------------------------------
+
+class TestNullProofNormalization:
+    """FinalDecision model_validator must normalize null proof fields in
+    final_hypothesis_statuses before Pydantic field validation runs."""
+
+    def _make_fd_dict_with_null_proof(self, hyp_id: str = "HYP-01") -> dict:
+        return {
+            "prediction": "fixed/non-vulnerable",
+            "confidence": 0.6,
+            "local_risk_present": False,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [
+                {
+                    "hypothesis_id": hyp_id,
+                    "status": "insufficient_evidence",
+                    "local_risk_present": False,
+                    "confirmed_security_vulnerability": False,
+                    "proof": None,
+                    "supporting_evidence_ids": [],
+                    "counter_evidence_ids": [],
+                    "missing_evidence": [],
+                    "explanation": "no evidence found",
+                }
+            ],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "insufficient evidence",
+            "limitations": [],
+        }
+
+    def test_null_proof_is_normalized_to_empty_proof(self):
+        """FinalDecision.model_validate with proof=null must succeed and normalize proof."""
+        from vckg_agentic_proof.schemas import FinalDecision, MinimumVulnerabilityProof
+        data = self._make_fd_dict_with_null_proof()
+        decision = FinalDecision.model_validate(data)
+        proof = decision.final_hypothesis_statuses[0].proof
+        assert isinstance(proof, MinimumVulnerabilityProof), (
+            f"Null proof must be normalized to MinimumVulnerabilityProof, got {type(proof)!r}"
+        )
+
+    def test_normalization_warning_is_recorded(self):
+        """normalization_warnings must mention the affected hypothesis ID."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        data = self._make_fd_dict_with_null_proof("HYP-01")
+        decision = FinalDecision.model_validate(data)
+        assert decision.normalization_warnings, (
+            "normalization_warnings must be non-empty when null proof is normalized"
+        )
+        assert any("HYP-01" in w for w in decision.normalization_warnings), (
+            f"normalization_warnings must mention the affected hypothesis ID. "
+            f"Got: {decision.normalization_warnings}"
+        )
+
+    def test_final_decision_source_set_to_stage06_normalized(self):
+        """final_decision_source must be 'stage06_normalized' after null proof normalization."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        data = self._make_fd_dict_with_null_proof()
+        decision = FinalDecision.model_validate(data)
+        assert decision.final_decision_source == "stage06_normalized", (
+            f"final_decision_source must be 'stage06_normalized', got {decision.final_decision_source!r}"
+        )
+
+    def test_non_null_proof_is_not_modified(self):
+        """Valid proof objects must not be altered; normalization_warnings must be empty."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        data = {
+            "prediction": "fixed/non-vulnerable",
+            "confidence": 0.5,
+            "local_risk_present": False,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [
+                {
+                    "hypothesis_id": "HYP-01",
+                    "status": "refuted_by_guard",
+                    "local_risk_present": False,
+                    "confirmed_security_vulnerability": False,
+                    "proof": {
+                        "input_control": "user controls size",
+                        "dangerous_operation": "malloc(size)",
+                        "missing_or_failed_guard": "none",
+                        "unsafe_use": "overflow",
+                        "security_impact": "heap overwrite",
+                        "cited_evidence_ids": ["EV-1"],
+                    },
+                    "supporting_evidence_ids": ["EV-1"],
+                    "counter_evidence_ids": [],
+                    "missing_evidence": [],
+                    "explanation": "refuted",
+                }
+            ],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "safe",
+            "limitations": [],
+        }
+        decision = FinalDecision.model_validate(data)
+        assert not decision.normalization_warnings, (
+            f"normalization_warnings must be empty when proof is not null, "
+            f"got {decision.normalization_warnings!r}"
+        )
+        assert decision.final_decision_source is None, (
+            f"final_decision_source must be None when no normalization occurred, "
+            f"got {decision.final_decision_source!r}"
+        )
+        assert decision.final_hypothesis_statuses[0].proof.input_control == "user controls size", (
+            "Valid proof fields must not be modified by normalizer"
+        )
+
+    def test_multiple_null_proofs_all_normalized(self):
+        """All hypotheses with null proof must be normalized, not just the first."""
+        from vckg_agentic_proof.schemas import FinalDecision, MinimumVulnerabilityProof
+        data = {
+            "prediction": "fixed/non-vulnerable",
+            "confidence": 0.3,
+            "local_risk_present": False,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [
+                {
+                    "hypothesis_id": f"HYP-0{i}",
+                    "status": "insufficient_evidence",
+                    "local_risk_present": False,
+                    "confirmed_security_vulnerability": False,
+                    "proof": None,
+                    "supporting_evidence_ids": [],
+                    "counter_evidence_ids": [],
+                    "missing_evidence": [],
+                    "explanation": "no evidence",
+                }
+                for i in range(1, 5)
+            ],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "insufficient",
+            "limitations": [],
+        }
+        decision = FinalDecision.model_validate(data)
+        for hyp in decision.final_hypothesis_statuses:
+            assert isinstance(hyp.proof, MinimumVulnerabilityProof), (
+                f"All null proofs must be normalized; {hyp.hypothesis_id} has proof={hyp.proof!r}"
+            )
+        assert decision.normalization_warnings, (
+            "normalization_warnings must be set when multiple null proofs are normalized"
+        )

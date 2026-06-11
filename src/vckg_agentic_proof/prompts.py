@@ -244,7 +244,9 @@ def final_decision_prompt(
             "a guard, caller constraint, patched logic, safe invariant, or unreachable dangerous path. "
             "If proof is incomplete but local risk is present, choose vulnerable with lower confidence. "
             "If risk is speculative and counter-evidence dominates, choose fixed/non-vulnerable. "
-            "Keep local suspiciousness separate from confirmed vulnerability. Always cite evidence IDs."
+            "Keep local suspiciousness separate from confirmed vulnerability. Always cite evidence IDs. "
+            "For each final_hypothesis_statuses entry, always output a proof object (even if all fields "
+            "are empty strings and cited_evidence_ids is empty). Never output \"proof\": null."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"

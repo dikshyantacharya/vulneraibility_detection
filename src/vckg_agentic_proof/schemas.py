@@ -1,7 +1,7 @@
 from __future__ import annotations
 from enum import Enum
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 class HypothesisStatus(str, Enum):
     confirmed_vulnerability = "confirmed_vulnerability"
@@ -107,6 +107,34 @@ class FinalDecision(BaseModel):
     why_forced_binary: Optional[str] = None
     evidence_exhausted: bool = False
     loop_stop_reason: Optional[str] = None
+    final_decision_source: Optional[str] = None
+    normalization_warnings: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_null_proofs(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        statuses = data.get("final_hypothesis_statuses")
+        if not isinstance(statuses, list):
+            return data
+        null_ids: List[str] = []
+        new_statuses = []
+        for h in statuses:
+            if isinstance(h, dict) and h.get("proof") is None:
+                h = {**h, "proof": {}}
+                null_ids.append(h.get("hypothesis_id") or "unknown")
+            new_statuses.append(h)
+        if null_ids:
+            existing = list(data.get("normalization_warnings") or [])
+            existing.append(f"normalized_null_proof_fields: {null_ids}")
+            data = {
+                **data,
+                "final_hypothesis_statuses": new_statuses,
+                "normalization_warnings": existing,
+                "final_decision_source": data.get("final_decision_source") or "stage06_normalized",
+            }
+        return data
 
     def normalize_prediction_bool(self) -> "FinalDecision":
         if self.prediction == FinalPrediction.vulnerable:

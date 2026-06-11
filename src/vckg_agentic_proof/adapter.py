@@ -615,6 +615,8 @@ def run_agentic_proof_pipeline(
         events.append(AgentEvent(sample_id, "06_final_adjudication", "validated", details={
             "validator_notes": list(notes), "modified": bool(modified),
             "prediction": decision.prediction.value, "confidence": decision.confidence,
+            "final_decision_source": decision.final_decision_source,
+            "normalization_warnings": list(decision.normalization_warnings or []),
         }))
     except Exception as _stage06_exc:
         _err_msg = f"{type(_stage06_exc).__name__}: {_stage06_exc}"

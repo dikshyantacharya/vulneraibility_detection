@@ -1089,3 +1089,48 @@ class TestStage06RecoveryAndRepairRouting:
         assert d.confidence == 0.0, (
             f"Emergency fallback must have confidence=0.0, got {d.confidence!r}"
         )
+
+    def _make_null_proof_stage06_json(self) -> str:
+        return json.dumps({
+            "prediction": "fixed/non-vulnerable",
+            "confidence": 0.7,
+            "local_risk_present": False,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [
+                {
+                    "hypothesis_id": "HYP-01",
+                    "status": "insufficient_evidence",
+                    "local_risk_present": False,
+                    "confirmed_security_vulnerability": False,
+                    "proof": None,
+                    "supporting_evidence_ids": [],
+                    "counter_evidence_ids": [],
+                    "missing_evidence": [],
+                    "explanation": "no evidence",
+                }
+            ],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "insufficient evidence",
+            "limitations": [],
+        })
+
+    def test_stage06_null_proof_does_not_trigger_emergency_fallback(self):
+        """Stage 06 with valid JSON and proof=null must produce a real prediction,
+        not an emergency fallback (decision_status must not be 'failed_parse')."""
+        result, _ = self._run_pipeline(self._make_null_proof_stage06_json())
+        assert result is not None
+        assert result.decision.decision_status != "failed_parse", (
+            f"Stage 06 with null proof must not trigger emergency fallback. "
+            f"Got decision_status={result.decision.decision_status!r}"
+        )
+
+    def test_stage06_null_proof_does_not_trigger_json_repair(self):
+        """Stage 06 with valid JSON and proof=null must not trigger JSON repair
+        — schema normalization handles null proof deterministically."""
+        result, json_repair_stages = self._run_pipeline(self._make_null_proof_stage06_json())
+        assert "06_final_adjudication_json_repair" not in json_repair_stages, (
+            f"JSON repair must not fire for null proof (normalizer should handle it). "
+            f"Got json_repair_stages={json_repair_stages}"
+        )
