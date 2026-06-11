@@ -52,7 +52,10 @@ export default function ResearchRunPage() {
   const [llmModels, setLLMModels] = useState<LLMModel[]>([]);
   const [selectedLLMModel, setSelectedLLMModel] = useState("");
   const [llmTemperature, setLLMTemperature] = useState("0.0");
-  const [llmMaxTokens, setLLMMaxTokens] = useState("8000");
+  // "maximum" sends null → jobs.py does not override, config default (32768) wins.
+  // "manual" lets the user set an explicit int.
+  const [llmMaxTokensMode, setLLMMaxTokensMode] = useState<"maximum" | "manual">("maximum");
+  const [llmMaxTokens, setLLMMaxTokens] = useState("32768");
   const [llmLoading, setLLMLoading] = useState(false);
   const [llmHealth, setLLMHealth] = useState<Record<string, any>>({});
 
@@ -211,7 +214,8 @@ export default function ResearchRunPage() {
           profile_id: selectedLLMProfile,
           model: selectedLLMModel,
           temperature: parseFloat(llmTemperature),
-          max_tokens: parseInt(llmMaxTokens),
+          // null = "maximum / use config default"; positive int = explicit budget.
+          max_tokens: llmMaxTokensMode === "maximum" ? null : (parseInt(llmMaxTokens) || null),
         },
         // Send the preset id PLUS the resolved valid backend. The server maps
         // the preset to validated config keys; it never receives a raw
@@ -347,8 +351,18 @@ export default function ResearchRunPage() {
               </label>
 
               <label className="field">
-                <span>Max tokens</span>
-                <input type="number" value={llmMaxTokens} onChange={(e) => setLLMMaxTokens(e.target.value)} />
+                <span>Max output tokens</span>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <select value={llmMaxTokensMode} onChange={(e) => setLLMMaxTokensMode(e.target.value as "maximum" | "manual")}>
+                    <option value="maximum">Maximum (use provider/config default)</option>
+                    <option value="manual">Manual override</option>
+                  </select>
+                  {llmMaxTokensMode === "manual" && (
+                    <input type="number" value={llmMaxTokens} min="256" step="1024"
+                      onChange={(e) => setLLMMaxTokens(e.target.value)}
+                      style={{ width: 100 }} />
+                  )}
+                </div>
               </label>
             </>
           )}
@@ -443,7 +457,7 @@ export default function ResearchRunPage() {
                 <dt>Include pairs</dt><dd>{selected.size > 0 ? "false" : "—"}</dd>
                 <dt>Reuse / rebuild</dt><dd>{kgReuseCache ? "reuse" : "rebuild"}{kgForceRebuild ? " · force" : ""}</dd>
                 <dt>Temperature</dt><dd>{llmTemperature}</dd>
-                <dt>Max tokens</dt><dd>{llmMaxTokens}</dd>
+                <dt>Max tokens</dt><dd>{llmMaxTokensMode === "maximum" ? "maximum (config default)" : llmMaxTokens}</dd>
               </dl>
             </div>
           </div>

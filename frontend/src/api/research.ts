@@ -157,6 +157,10 @@ export interface LiveMetrics {
   vulnerable_recall?: number; safe_recall?: number;
   per_sample?: any[];
 }
+export interface ChatMessage {
+  role: string;
+  content: string;
+}
 export interface Stage {
   index: number;
   stage: string;
@@ -164,6 +168,11 @@ export interface Stage {
   source?: string;
   prompt?: string | null;
   system?: string | null;
+  system_prompt?: string | null;
+  user_prompt?: string | null;
+  messages?: ChatMessage[] | null;
+  legacy_prompt_only?: boolean;
+  request_payload_keys?: string[] | null;
   response?: string | null;
   parsed_json?: any;
   prompt_chars?: number | null;
@@ -178,6 +187,10 @@ export interface Stage {
   is_repair?: boolean;
   is_planning?: boolean;
   is_final?: boolean;
+  finish_reason?: string | null;
+  was_truncated?: boolean;
+  requested_max_tokens?: number | null;
+  effective_max_tokens?: number | null;
 }
 export interface NormalizedSample {
   run_id: string;

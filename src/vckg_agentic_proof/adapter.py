@@ -13,12 +13,12 @@ class AgenticProofConfig:
     max_hypotheses: int = 12
     max_queries_per_hypothesis: int = 6
     evidence_limit_per_query: int = 8
-    max_tokens_source_only_hypothesis: int = 4096
-    max_tokens_kg_query_planning: int = 2048
-    max_tokens_hypothesis_verification: int = 4096
-    max_tokens_counter_evidence_review: int = 4096
-    max_tokens_final_decision: int = 4096
-    max_tokens_schema_repair: int = 2048
+    max_tokens_source_only_hypothesis: int = 16384
+    max_tokens_kg_query_planning: int = 8192
+    max_tokens_hypothesis_verification: int = 16384
+    max_tokens_counter_evidence_review: int = 16384
+    max_tokens_final_decision: int = 8192
+    max_tokens_schema_repair: int = 4096
     temperature: float = 0.0
     provider_extra_body: Dict[str, Any] = field(default_factory=lambda: {"chat_template_kwargs": {"enable_thinking": False}})
     enable_pair_aware_dev_mode: bool = False

@@ -396,7 +396,8 @@ def _apply_llm_override(
 
     if temperature is not None:
         model_cfg["temperature"] = float(temperature)
-    if max_tokens is not None:
+    # max_tokens=None or 0 means "maximum / use config default" — do not override.
+    if max_tokens is not None and int(max_tokens) > 0:
         model_cfg["max_tokens"] = int(max_tokens)
 
     # The selected model must win over any base-config model_fallbacks (config

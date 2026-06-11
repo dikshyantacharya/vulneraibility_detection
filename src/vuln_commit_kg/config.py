@@ -410,7 +410,7 @@ class ModelConfig(BaseModel):
     # Generation
     temperature: float = 0.0
     top_p: float = 1.0
-    max_tokens: int = 700
+    max_tokens: int = 32768
     stop: list[str] | None = None
     request_json_object: bool = True
     # Optional OpenAI-compatible provider extensions. These are copied as
@@ -465,12 +465,12 @@ class AgenticProofRuntimeConfig(BaseModel):
     separate_local_risk_from_confirmed_vulnerability: bool = True
     confidence_policy: str = "evidence_completeness"
     pair_aware_dev_mode: bool = False
-    max_tokens_source_only_hypothesis: int = 4096
-    max_tokens_kg_query_planning: int = 2048
-    max_tokens_hypothesis_verification: int = 4096
-    max_tokens_counter_evidence_review: int = 4096
-    max_tokens_final_decision: int = 4096
-    max_tokens_schema_repair: int = 2048
+    max_tokens_source_only_hypothesis: int = 16384
+    max_tokens_kg_query_planning: int = 8192
+    max_tokens_hypothesis_verification: int = 16384
+    max_tokens_counter_evidence_review: int = 16384
+    max_tokens_final_decision: int = 8192
+    max_tokens_schema_repair: int = 4096
 
 class APIQuotaConfig(BaseModel):
     """Provider-side quota contract used by the shared request scheduler.

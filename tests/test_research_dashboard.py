@@ -440,7 +440,115 @@ def test_frontend_academiccloud_default_model_and_max_tokens():
     root = Path(__file__).resolve().parents[1]
     page = (root / "frontend" / "src" / "pages" / "ResearchRunPage.tsx").read_text(encoding="utf-8")
     assert "mistral-large-3-675b-instruct-2512" in page
-    assert 'useState("8000")' in page
+    # Default changed from "8000" to maximum-mode with "32768" as manual override default
+    assert 'useState("8000")' not in page
+    assert 'useState("32768")' in page or 'llmMaxTokensMode' in page
+
+
+# --------------------------------------------------------------------------
+# Prompt context hygiene (stage 01 / 02) + system/user prompt visibility
+# --------------------------------------------------------------------------
+
+_FORBIDDEN_META = ["18452", "project_url", "github.com", "SAMPLE METADATA", "INITIAL EVIDENCE"]
+
+
+def test_stage01_source_only_prompt_excludes_metadata_and_evidence():
+    from vckg_agentic_proof.prompts import source_only_hypothesis_prompt
+    sample = {"sample_id": "18452", "project": "rockhopper", "project_url": "https://github.com/x/rockhopper",
+              "filepath": "rockhopper/src/secret_file.c", "function": "count_rows", "label": 1, "commit": "abc123"}
+    msgs = source_only_hypothesis_prompt(sample, "int count_rows(void){ return 0; }")
+    assert any(m["role"] == "system" for m in msgs)
+    user = next(m["content"] for m in msgs if m["role"] == "user")
+    for bad in _FORBIDDEN_META + ["secret_file.c", "abc123"]:
+        assert bad not in user, bad
+    assert "SCHEMA" in user
+    assert "TARGET FUNCTION SOURCE" in user
+    assert "count_rows" in user  # function name allowed for readability
+    assert "plausible vulnerability hypotheses" in user
+
+
+def test_stage02_kg_query_planning_prompt_excludes_evidence_and_metadata():
+    from vckg_agentic_proof.prompts import kg_query_planning_prompt
+    sample = {"sample_id": "18452", "project": "rockhopper", "project_url": "https://github.com/x/rockhopper",
+              "filepath": "rockhopper/src/ragged_array.c", "function": "count_rows", "label": 1,
+              "commit": "abc123", "resolved_commit": "def456"}
+    hyps = [{"hypothesis_id": "HYP-01", "title": "potential oob read"}]
+    msgs = kg_query_planning_prompt(sample, hyps, [{"id": "ev1", "text": "SECRET_EVIDENCE_BLOB"}])
+    user = next(m["content"] for m in msgs if m["role"] == "user")
+    for bad in _FORBIDDEN_META + ["SECRET_EVIDENCE_BLOB", "abc123", "def456"]:
+        assert bad not in user, bad
+    assert "CODEKG QUERY CONTRACT" in user
+    assert "ANSWER JSON SCHEMA" in user
+    assert "HYP-01" in user
+    assert "count_rows" in user
+    assert "ragged_array.c" in user  # optional target file is allowed
+
+
+def test_stage_context_policy_declares_forbidden_for_01_and_02():
+    from vckg_agentic_proof.prompts import STAGE_CONTEXT_POLICY
+    assert "initial_evidence" in STAGE_CONTEXT_POLICY["01_source_only_hypothesis"]["forbidden"]
+    assert "initial_evidence" in STAGE_CONTEXT_POLICY["02_kg_query_planning"]["forbidden"]
+    assert "sample_id" in STAGE_CONTEXT_POLICY["02_kg_query_planning"]["forbidden"]
+
+
+def _make_run_with_calls(tmp_path: Path, calls: list) -> tuple[str, str]:
+    run = tmp_path / "outputs" / "runs" / "20260611_000000__prompt_demo"
+    sd = run / "agent_demos" / "sample_18452_count_rows"
+    sd.mkdir(parents=True)
+    (sd / "sample.json").write_text(json.dumps({"sample_id": "18452", "project": "rockhopper", "func_name": "count_rows", "is_vulnerable": True}), encoding="utf-8")
+    (sd / "final_prediction.json").write_text(json.dumps({"sample_id": "18452", "is_vulnerable": False, "confidence": 0.9, "decision_status": "fixed/non-vulnerable"}), encoding="utf-8")
+    (sd / "agent_trace.json").write_text(json.dumps({"sample_id": "18452", "model_calls": calls, "kg_queries": []}), encoding="utf-8")
+    return run.name, "18452"
+
+
+def test_stages_expose_system_and_user_prompt_separately(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_run_with_calls(tmp_path, [{
+        "name": "01_source_only_hypothesis",
+        "messages": [{"role": "system", "content": "SYS HYP"}, {"role": "user", "content": "USER HYP"}],
+        "system_prompt": "SYS HYP", "user_prompt": "USER HYP",
+        "request_payload_keys": ["model", "messages", "temperature", "max_tokens"],
+        "prompt": "USER HYP", "system": "SYS HYP", "response": "R",
+    }])
+    stages = client.get(f"/api/research/runs/{run_id}/samples/{sid}/stages").json()
+    st = stages[0]
+    assert st["system_prompt"] == "SYS HYP"
+    assert st["user_prompt"] == "USER HYP"
+    assert {m["role"] for m in st["messages"]} == {"system", "user"}
+    assert st["legacy_prompt_only"] is False
+    assert st["request_payload_keys"] == ["model", "messages", "temperature", "max_tokens"]
+
+
+def test_stages_backward_compat_legacy_prompt_only(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_run_with_calls(tmp_path, [{
+        "name": "01_source_only_hypothesis", "prompt": "LEGACY USER PROMPT", "response": "R",
+    }])
+    stages = client.get(f"/api/research/runs/{run_id}/samples/{sid}/stages").json()
+    st = stages[0]
+    assert st["legacy_prompt_only"] is True
+    assert st["user_prompt"] == "LEGACY USER PROMPT"
+    assert st["system_prompt"] in (None, "")
+    # synthesized messages still contain the legacy prompt as a user message
+    assert any(m["role"] == "user" and m["content"] == "LEGACY USER PROMPT" for m in st["messages"])
+
+
+def test_prompt_artifacts_contain_no_api_keys(client: TestClient, tmp_path: Path):
+    run_id, sid = _make_run_with_calls(tmp_path, [{
+        "name": "01_source_only_hypothesis",
+        "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "user"}],
+        "system_prompt": "sys", "user_prompt": "user", "prompt": "user", "response": "R",
+    }])
+    import json as _json
+    blob = _json.dumps(client.get(f"/api/research/runs/{run_id}/samples/{sid}/stages").json())
+    for bad in ("Authorization", "Bearer ", "api_key", "sk-"):
+        assert bad not in blob
+
+
+def test_frontend_agenttrace_has_prompt_tabs():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "frontend" / "src" / "pages" / "AgentTracePage.tsx").read_text(encoding="utf-8")
+    for label in ("System Prompt", "User Prompt", "Full Messages", "Response", "Parsed JSON", "Error"):
+        assert label in page
+    assert "Legacy Prompt" in page  # backward-compat label
 
 
 def test_research_job_selection_enforced(tmp_path: Path):

@@ -55,11 +55,47 @@ def parse_json_answer(raw_text: str) -> ParsedTaggedJson:
         raise TaggedJsonParseError("Top-level <answer> JSON must be an object.")
     return ParsedTaggedJson(analysis=analysis, answer_text=answer_text, parsed=parsed, raw_text=raw_text)
 
+def detect_truncation(raw_text: str) -> bool:
+    """Return True if the raw LLM output looks truncated (no closing tag, unbalanced JSON)."""
+    text = (raw_text or "").strip()
+    if not text:
+        return True
+    # If there is a complete <answer>…</answer> tag, not truncated.
+    if ANSWER_RE.search(text):
+        return False
+    # Count brace/bracket depth — unbalanced means truncated.
+    depth = 0
+    for ch in text:
+        if ch in ('{', '['):
+            depth += 1
+        elif ch in ('}', ']'):
+            depth -= 1
+    if depth > 0:
+        return True
+    # Even if balanced, truncation if it doesn't end on a closed structure.
+    stripped = text.rstrip()
+    if not stripped.endswith(('}', ']')):
+        return True
+    return False
+
+
 def build_json_repair_prompt(raw_text: str, answer_text: Optional[str], schema_name: str, schema_json: Dict[str, Any]) -> list[dict[str, str]]:
+    # Use the extracted <answer> content only to avoid duplicating <analysis> chain-of-thought.
     repair_target = answer_text if answer_text is not None else raw_text
     return [
-        {"role": "system", "content": "You repair malformed JSON only. Do not add new security reasoning. Return exactly <analysis>brief repair note</analysis><answer>{valid JSON object}</answer>."},
-        {"role": "user", "content": f"SCHEMA NAME: {schema_name}\nJSON SCHEMA:\n{json.dumps(schema_json, indent=2)}\n\nMALFORMED OUTPUT:\n{repair_target}\n\nRepair JSON conservatively."},
+        {"role": "system", "content": (
+            "You repair malformed JSON only. Do not add new security reasoning, "
+            "new evidence IDs, new hypotheses, or new vulnerability claims. "
+            "Close open arrays/objects conservatively. "
+            "Return exactly <analysis>brief repair note</analysis>"
+            "<answer>{repaired JSON object}</answer>."
+        )},
+        {"role": "user", "content": (
+            f"SCHEMA:\n{json.dumps(schema_json, indent=2)}\n\n"
+            f"MALFORMED <answer> CONTENT:\n{repair_target}\n\n"
+            "Repair the JSON conservatively. "
+            "Do not invent missing queries, hypotheses, evidence IDs, or final predictions."
+        )},
     ]
 
 def parse_model_object(raw_text: str, model_cls: Type[T], *, llm_repair: Optional[Callable[[list[dict[str, str]]], str]] = None) -> tuple[T, ParsedTaggedJson]:

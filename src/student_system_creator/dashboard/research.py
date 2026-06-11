@@ -821,9 +821,25 @@ class ResearchInventory:
                 else:
                     status = "completed"
                 tok = usage or {}
+                # System/user prompts + full messages, with backward compat for
+                # older artifacts that only stored a single "prompt" string.
+                system_prompt = c.get("system_prompt") if c.get("system_prompt") is not None else c.get("system")
+                user_prompt = c.get("user_prompt") if c.get("user_prompt") is not None else c.get("prompt")
+                messages = c.get("messages")
+                legacy_only = not messages and c.get("system_prompt") is None and c.get("user_prompt") is None
+                if not messages:
+                    messages = []
+                    if system_prompt:
+                        messages.append({"role": "system", "content": system_prompt})
+                    if user_prompt:
+                        messages.append({"role": "user", "content": user_prompt})
                 out.append({
                     "index": i, "stage": name, "status": status, "source": "model_calls",
-                    "prompt": c.get("prompt"), "system": c.get("system"),
+                    "prompt": user_prompt, "system": system_prompt,
+                    "system_prompt": system_prompt, "user_prompt": user_prompt,
+                    "messages": messages,
+                    "legacy_prompt_only": legacy_only,
+                    "request_payload_keys": c.get("request_payload_keys"),
                     "response": c.get("response") or c.get("raw"),
                     "parsed_json": _mask_secrets(parsed) if parsed is not None else None,
                     "prompt_chars": c.get("prompt_chars") or len(str(c.get("prompt") or "")),
@@ -836,6 +852,11 @@ class ResearchInventory:
                     "json_valid": (parsed is not None) if meta["json_expected"] else None,
                     "error": err,
                     "is_repair": meta["is_repair"], "is_planning": meta["is_planning"], "is_final": meta["is_final"],
+                    # Token budget and truncation fields (new artifacts; None for old runs).
+                    "finish_reason": c.get("finish_reason"),
+                    "was_truncated": c.get("was_truncated", False),
+                    "requested_max_tokens": c.get("requested_max_tokens"),
+                    "effective_max_tokens": c.get("effective_max_tokens"),
                 })
         else:
             # Failed/interrupted run: recover the partial timeline from run logs.

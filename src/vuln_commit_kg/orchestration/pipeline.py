@@ -897,12 +897,26 @@ class CommitKGPipeline:
                     pt = int(usage.get("prompt_tokens") or 0)
                     ct = int(usage.get("completion_tokens") or 0)
                     usage["cost_total_usd"] = (pt / 1000 * self.cfg.model.cost.input_per_1k_usd) + (ct / 1000 * self.cfg.model.cost.output_per_1k_usd)
+                # Extract finish_reason and detect truncation from the raw response.
+                raw_resp = getattr(resp, "raw", None) or {}
+                finish_reason: str | None = None
+                if isinstance(raw_resp, dict):
+                    finish_reason = raw_resp.get("response_stats", {}).get("finish_reason")
+                was_truncated = finish_reason in ("length", "content_filter")
                 self.logger.info(
-                    "model.generate_done | sample=%s | stage=%s | attempt=primary | elapsed=%.1fs | response_chars=%s | completion_tokens=%s | enable_thinking=%s",
-                    sample.sample_id, stage, elapsed, len(text), usage.get("completion_tokens"), proof_cfg.provider_extra_body.get("chat_template_kwargs", {}).get("enable_thinking"),
+                    "model.generate_done | sample=%s | stage=%s | attempt=primary | elapsed=%.1fs | response_chars=%s | completion_tokens=%s | finish_reason=%s | was_truncated=%s | enable_thinking=%s",
+                    sample.sample_id, stage, elapsed, len(text), usage.get("completion_tokens"),
+                    finish_reason, was_truncated,
+                    proof_cfg.provider_extra_body.get("chat_template_kwargs", {}).get("enable_thinking"),
                 )
                 call_record = {
                     "name": stage,
+                    # Full chat messages (no secrets — only prompt content).
+                    "messages": [dict(m) for m in messages],
+                    "system_prompt": system,
+                    "user_prompt": prompt,
+                    "request_payload_keys": ["model", "messages", "temperature", "max_tokens"],
+                    # Backward-compatible single-string fields kept for old readers.
                     "prompt": prompt,
                     "system": system,
                     "prompt_chars": prompt_chars,
@@ -912,7 +926,12 @@ class CommitKGPipeline:
                     "total_stage_usage": usage,
                     "elapsed_seconds": elapsed,
                     "json_status": "raw_agentic_proof_pending_parse",
-                    "provider_raw": getattr(resp, "raw", None),
+                    "provider_raw": raw_resp,
+                    # Token budget and truncation fields.
+                    "requested_max_tokens": max_tokens,
+                    "effective_max_tokens": int(max_tokens),
+                    "finish_reason": finish_reason,
+                    "was_truncated": was_truncated,
                 }
                 trace.model_calls.append(call_record)
                 trace.raw_outputs.append(text)
@@ -932,6 +951,10 @@ class CommitKGPipeline:
                 )
                 trace.model_calls.append({
                     "name": stage,
+                    "messages": [dict(m) for m in messages],
+                    "system_prompt": system,
+                    "user_prompt": prompt,
+                    "request_payload_keys": ["model", "messages", "temperature", "max_tokens"],
                     "prompt": prompt,
                     "system": system,
                     "prompt_chars": prompt_chars,
@@ -941,6 +964,10 @@ class CommitKGPipeline:
                     "elapsed_seconds": elapsed,
                     "json_status": "provider_error",
                     "error": error_text,
+                    "requested_max_tokens": max_tokens,
+                    "effective_max_tokens": int(max_tokens),
+                    "finish_reason": None,
+                    "was_truncated": False,
                 })
                 if self.live:
                     self.live.event("model_call.error", {"sample_id": sample.sample_id, "stage": stage, "elapsed_seconds": elapsed, "error": error_text, "prompt_chars": prompt_chars})

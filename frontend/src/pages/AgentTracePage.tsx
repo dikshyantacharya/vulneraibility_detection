@@ -4,8 +4,18 @@ import { research, type NormalizedSample, type Stage } from "../api/research";
 import { useApp, useAsync } from "../state";
 import TextPanel from "../components/TextPanel";
 
-type StageTab = "prompt" | "response" | "parsed" | "summary" | "error";
+type StageTab = "system" | "user" | "messages" | "response" | "parsed" | "error";
 type Filter = "all" | "failed" | "repair" | "planning" | "final";
+
+function messagesText(s: Stage): string {
+  if (s.messages && s.messages.length) {
+    return s.messages.map((m) => `### ${m.role.toUpperCase()}\n${m.content}`).join("\n\n");
+  }
+  const parts: string[] = [];
+  if (s.system_prompt) parts.push(`### SYSTEM\n${s.system_prompt}`);
+  if (s.user_prompt || s.prompt) parts.push(`### USER\n${s.user_prompt || s.prompt}`);
+  return parts.join("\n\n");
+}
 
 function VerdictBadge({ label }: { label?: string | null }) {
   if (label === "vulnerable") return <span className="badge red">vulnerable</span>;
@@ -37,9 +47,11 @@ function jsonStatusBadge(s: Stage) {
 
 function StageCard({ s }: { s: Stage }) {
   const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<StageTab>("response");
+  const [tab, setTab] = useState<StageTab>("user");
   const [compare, setCompare] = useState(false);
   const statusColor = s.status === "failed" ? "red" : s.status === "repaired" ? "amber" : s.status === "completed" ? "green" : "gray";
+  const legacy = s.legacy_prompt_only;
+  const userLabel = legacy ? "Legacy Prompt" : "User Prompt";
 
   return (
     <div className="card" style={{ marginBottom: 8 }}>
@@ -48,6 +60,10 @@ function StageCard({ s }: { s: Stage }) {
         <strong>{s.index}. {s.stage}</strong>
         <span className={`badge ${statusColor}`}>{s.status || "?"}</span>
         {jsonStatusBadge(s)}
+        {s.was_truncated && <span className="badge red" title="finish_reason=length — response was cut off">truncated</span>}
+        {s.finish_reason && s.finish_reason !== "stop" && !s.was_truncated && (
+          <span className="badge amber" title={`finish_reason: ${s.finish_reason}`}>{s.finish_reason}</span>
+        )}
         {s.source === "log" && <span className="badge gray" title="recovered from run log">log</span>}
         <span style={{ flex: 1 }} />
         <span className="muted" style={{ fontSize: 12 }}>
@@ -64,40 +80,45 @@ function StageCard({ s }: { s: Stage }) {
             </div>
           )}
           <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
-            {(["prompt", "response", "parsed", "summary", "error"] as StageTab[]).map((t) => (
-              <button key={t} className={`btn small ${tab === t ? "primary" : ""}`} onClick={() => setTab(t)}>{t}</button>
+            {([
+              ["system", legacy ? "System Prompt (none)" : "System Prompt"],
+              ["user", userLabel],
+              ["messages", "Full Messages"],
+              ["response", "Response"],
+              ["parsed", "Parsed JSON"],
+              ["error", "Error"],
+            ] as [StageTab, string][]).map(([t, lbl]) => (
+              <button key={t} className={`btn small ${tab === t ? "primary" : ""}`} onClick={() => setTab(t)}>{lbl}</button>
             ))}
             <span style={{ flex: 1 }} />
-            {(s.prompt || s.response) && (
+            {((s.user_prompt || s.prompt) || s.response) && (
               <button className={`btn small ${compare ? "primary" : ""}`} onClick={() => setCompare((c) => !c)}>Compare prompt/response</button>
             )}
           </div>
 
           {compare ? (
             <div className="grid cols-2">
-              <TextPanel title="Prompt" text={s.prompt} height={360} />
+              <TextPanel title={userLabel} text={s.user_prompt || s.prompt} height={360} />
               <TextPanel title="Response" text={s.response} height={360} />
             </div>
           ) : (
             <>
-              {tab === "prompt" && (s.prompt ? <TextPanel title="Prompt" text={s.prompt} height={360} /> : <div className="muted">Prompt text not available.</div>)}
-              {tab === "response" && (s.response ? <TextPanel title="Response" text={s.response} json height={360} /> : <div className="muted">Response text not available.</div>)}
+              {tab === "system" && (
+                s.system_prompt
+                  ? <TextPanel title="System Prompt" text={s.system_prompt} height={300} />
+                  : <div className="muted">{legacy ? "No system prompt recorded (legacy artifact)." : "No system prompt for this stage."}</div>
+              )}
+              {tab === "user" && ((s.user_prompt || s.prompt) ? <TextPanel title={userLabel} text={s.user_prompt || s.prompt} height={400} /> : <div className="muted">User prompt text not available.</div>)}
+              {tab === "messages" && (
+                messagesText(s)
+                  ? <TextPanel title="Full chat messages" text={messagesText(s)} height={420} />
+                  : <div className="muted">No messages recorded for this stage.</div>
+              )}
+              {tab === "response" && (s.response ? <TextPanel title="Response" text={s.response} json height={400} /> : <div className="muted">Response text not available.</div>)}
               {tab === "parsed" && (
                 s.parsed_json != null
                   ? <TextPanel title="Parsed JSON" text={JSON.stringify(s.parsed_json, null, 2)} height={320} />
                   : <div className="banner warn">No parsed JSON{s.json_valid === false ? " (invalid — see Error tab for raw response)" : s.json_expected ? "" : " (free-text stage)"}.</div>
-              )}
-              {tab === "summary" && (
-                <dl className="kv" style={{ fontSize: 12 }}>
-                  <dt>Stage</dt><dd>{s.stage}</dd>
-                  <dt>Status</dt><dd>{s.status}</dd>
-                  <dt>JSON expected</dt><dd>{s.json_expected ? "yes" : "no (text)"}</dd>
-                  <dt>Prompt chars</dt><dd>{s.prompt_chars ?? "—"}</dd>
-                  <dt>Response chars</dt><dd>{s.response_chars ?? "—"}</dd>
-                  <dt>Tokens</dt><dd>{tokensLabel(s.tokens)}</dd>
-                  <dt>Elapsed</dt><dd>{s.elapsed_seconds != null ? `${Number(s.elapsed_seconds).toFixed(2)}s` : "—"}</dd>
-                  <dt>Repair stage</dt><dd>{s.is_repair ? "yes" : "no"}</dd>
-                </dl>
               )}
               {tab === "error" && (
                 s.error
@@ -107,6 +128,16 @@ function StageCard({ s }: { s: Stage }) {
                     : <div className="muted">No error for this stage.</div>
               )}
             </>
+          )}
+          {s.request_payload_keys && (
+            <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>request payload keys: {s.request_payload_keys.join(", ")}</div>
+          )}
+          {(s.requested_max_tokens != null || s.finish_reason) && (
+            <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+              {s.requested_max_tokens != null && <>max_tokens: req={s.requested_max_tokens} / eff={s.effective_max_tokens ?? s.requested_max_tokens}</>}
+              {s.finish_reason && <> · finish_reason: <strong>{s.finish_reason}</strong></>}
+              {s.was_truncated && <> · <span style={{ color: "var(--red, #b91c1c)" }}>response truncated</span></>}
+            </div>
           )}
         </div>
       )}
