@@ -284,4 +284,7 @@ export interface NormalizedSample {
   usage?: any;
   stages: Stage[];
   kg_queries: any[];
+  // Dashboard-display-only — never injected into LLM prompts.
+  commit_message?: string | null;
+  target_function_source?: string | null;
 }

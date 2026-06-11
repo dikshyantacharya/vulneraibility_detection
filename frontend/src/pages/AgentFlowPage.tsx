@@ -360,12 +360,12 @@ export default function AgentFlowPage() {
         <button className="btn" onClick={() => nav(`/research/kg/${runId}/${sampleId}`)}>KG Query Flow</button>
         <button className="btn" onClick={() => { fetched.reload(); dispatch({ type: "SET_FLOW", flow: { stages: [], iterations: [] } }); }}>Refresh</button>
         <a
-          className="btn"
+          className="btn btn-primary"
           href={research.flowReportUrl(runId!, sampleId!)}
           download
           title="Download full-flow text report (prompts, responses, parsed JSON, KG queries, final decision)"
         >
-          Download flow report
+          Download full flow report
         </a>
         <button className="btn" onClick={() => nav("/research/runs")}>← Runs</button>
       </div>

@@ -1083,6 +1083,9 @@ class ResearchInventory:
             "usage": fp.get("usage"),
             "stages": stages,
             "kg_queries": kg_queries,
+            # Dashboard-display-only fields — never injected into LLM prompts.
+            "commit_message": sample.get("commit_message") if mode == "admin" else None,
+            "target_function_source": sample.get("func_body") or None,
         }
 
     def sample_normalized(self, run_id: str, sample_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
@@ -1336,13 +1339,32 @@ class ResearchInventory:
         llm_meta = run_meta.get("llm") or {}
         _kv("provider", llm_meta.get("provider_name") or llm_meta.get("model_backend") or "—")
         _kv("model", llm_meta.get("model") or "—")
+        _kv("resolved_commit", fp.get("resolved_commit_id") or "—")
         _kv("loop_enabled", flow_json.get("iterative_loop_enabled", "—"))
         _kv("iterations_completed", flow_json.get("iterations_completed", "—"))
         _kv("loop_stop_reason", flow_json.get("loop_stop_reason") or fp.get("loop_stop_reason") or "—")
         _kv("final_prediction", fp.get("is_vulnerable"))
         _kv("confidence", fp.get("confidence") or "—")
         _kv("decision_status", fp.get("decision_status") or "—")
+        commit_msg = sample_json.get("commit_message")
+        _kv("commit_message", commit_msg if commit_msg else "unavailable")
         lines.append("")
+
+        # ── Target function source ────────────────────────────────────────────
+        func_body = sample_json.get("func_body")
+        _sec("TARGET FUNCTION SOURCE")
+        if func_body:
+            _block(f"{sample_json.get('filepath') or '?'} :: {sample_json.get('func_name') or '?'}",
+                   func_body)
+        else:
+            # Fall back to target_function.c if written by the pipeline
+            tf_file = sd / "target_function.c"
+            if tf_file.exists():
+                _block(f"{sample_json.get('filepath') or '?'} :: {sample_json.get('func_name') or '?'}",
+                       tf_file.read_text(encoding="utf-8", errors="replace"))
+            else:
+                lines.append("  [target function source not available]")
+                lines.append("")
 
         # ── Stage timeline ───────────────────────────────────────────────────
         trace = _read_json(sd / "agent_trace.json") or {}

@@ -153,6 +153,7 @@ export default function AgentTracePage() {
   const [filter, setFilter] = useState<Filter>("all");
   const [reloadKey, setReloadKey] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [showSource, setShowSource] = useState(false);
 
   const n = norm.data;
   const stages = (n?.stages || []).filter((s) => {
@@ -206,12 +207,47 @@ export default function AgentTracePage() {
             <dt>LLM</dt><dd><strong>{n.llm?.provider_name || n.llm?.model_backend || "—"}</strong> · {n.llm?.model || "—"}</dd>
             <dt>Decision status</dt><dd>{failed && !predAvail ? `failed at ${n.failed_stage || "unknown stage"}` : (n.decision_status || "—")}</dd>
             <dt>Resolved commit</dt><dd className="mono">{n.resolved_commit || "—"}</dd>
+            <dt>Commit message</dt>
+            <dd style={{ fontStyle: n.commit_message ? "normal" : "italic", color: n.commit_message ? "inherit" : "var(--muted, #64748b)" }}>
+              {n.commit_message || "Commit message unavailable"}
+            </dd>
           </dl>
           {n.verdict_text && (
             <>
               <div className="section-title">Final reasoning</div>
               <pre className="log-viewer" style={{ height: 130, whiteSpace: "pre-wrap" }}>{n.verdict_text}</pre>
             </>
+          )}
+          {n.target_function_source && (
+            <div style={{ marginTop: 10 }}>
+              <button
+                className="btn btn-secondary"
+                style={{ fontSize: 12, padding: "2px 10px" }}
+                onClick={() => setShowSource((v) => !v)}
+              >
+                {showSource ? "Hide target function source" : "Show target function source"}
+              </button>
+              {showSource && (
+                <div style={{ marginTop: 8 }}>
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 4 }}>
+                    {n.filepath || "?"} :: <strong>{n.function || "?"}</strong>
+                  </div>
+                  <pre style={{
+                    background: "var(--surface2, #f8fafc)",
+                    border: "1px solid var(--border, #e2e8f0)",
+                    borderRadius: 4,
+                    padding: "8px 10px",
+                    fontSize: 11,
+                    fontFamily: "monospace",
+                    whiteSpace: "pre",
+                    overflowX: "auto",
+                    maxHeight: 400,
+                    overflowY: "auto",
+                    margin: 0,
+                  }}>{n.target_function_source}</pre>
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
