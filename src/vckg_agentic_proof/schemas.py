@@ -137,7 +137,9 @@ class FinalDecision(BaseModel):
         return data
 
     def normalize_prediction_bool(self) -> "FinalDecision":
-        if self.prediction == FinalPrediction.vulnerable:
+        if self.forced_prediction_bool is not None:
+            self.prediction_bool = self.forced_prediction_bool
+        elif self.prediction == FinalPrediction.vulnerable:
             self.prediction_bool = True
         elif self.prediction == FinalPrediction.fixed_or_non_vulnerable:
             self.prediction_bool = False

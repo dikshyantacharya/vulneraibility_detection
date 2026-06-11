@@ -15,6 +15,41 @@ The <answer> tag must contain JSON only. Do not place markdown/code fences insid
 def schema_block(model_cls: Any) -> str:
     return json.dumps(model_cls.model_json_schema(), indent=2)
 
+
+def _binary_final_decision_schema() -> str:
+    """Compact schema for final_decision_prompt and consistency_repair_prompt.
+
+    Uses the full FinalDecision JSON schema but replaces the FinalPrediction enum
+    with a binary-only version (no 'inconclusive') so the LLM cannot pick it.
+    """
+    schema = FinalDecision.model_json_schema()
+    defs = schema.get("$defs", {})
+    if "FinalPrediction" in defs:
+        defs["FinalPrediction"]["enum"] = ["vulnerable", "fixed/non-vulnerable"]
+    return json.dumps(schema, indent=2)
+
+
+# Compact binary-only output contract for consistency_repair_prompt.
+# Much smaller than the full Pydantic schema (~14KB) so it fits in repair token budgets.
+_BINARY_REPAIR_CONTRACT = json.dumps({
+    "prediction": "vulnerable | fixed/non-vulnerable  (ONLY these two — no inconclusive)",
+    "confidence": 0.0,
+    "local_risk_present": True,
+    "confirmed_security_vulnerability": False,
+    "final_hypothesis_statuses": "(keep existing array unchanged)",
+    "minimum_vulnerability_proof": "(keep or set to null)",
+    "decisive_evidence_ids": [],
+    "decisive_counter_evidence_ids": [],
+    "explanation": "string",
+    "limitations": [],
+    "forced_prediction": "vulnerable | fixed/non-vulnerable",
+    "forced_prediction_bool": True,
+    "decision_status": "confirmed_vulnerable | confirmed_non_vulnerable | forced_binary_vulnerable | forced_binary_non_vulnerable",
+    "evidence_strength": "confirmed | likely | weak | insufficient_static_evidence",
+    "why_forced_binary": "string or null",
+    "evidence_exhausted": False,
+}, indent=2)
+
 def compact_json(data: Any, max_chars: int = 24000) -> str:
     text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     return text if len(text) <= max_chars else text[:max_chars] + "\n...<truncated>..."
@@ -250,7 +285,7 @@ def final_decision_prompt(
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
-            f"ANSWER JSON SCHEMA:\n{schema_block(FinalDecision)}\n\n"
+            f"ANSWER JSON SCHEMA:\n{_binary_final_decision_schema()}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
             f"VERIFICATIONS:\n{compact_json(verifications, 18000)}\n\n"
             f"COUNTER REVIEW:\n{compact_json(counter_review, 14000)}\n\n"
@@ -393,8 +428,8 @@ def consistency_repair_prompt(decision: Dict[str, Any], validation_notes: List[s
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
-            f"ANSWER JSON SCHEMA:\n{schema_block(FinalDecision)}\n\n"
+            f"REQUIRED OUTPUT CONTRACT (binary only — no inconclusive):\n{_BINARY_REPAIR_CONTRACT}\n\n"
             f"VALIDATION NOTES:\n{json.dumps(validation_notes, indent=2)}\n\n"
-            f"CURRENT DECISION:\n{compact_json(decision, 22000)}"
+            f"CURRENT DECISION:\n{compact_json(decision, 12000)}"
         )},
     ]

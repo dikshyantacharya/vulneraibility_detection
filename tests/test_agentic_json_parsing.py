@@ -1241,3 +1241,119 @@ class TestNullProofNormalization:
         assert decision.normalization_warnings, (
             "normalization_warnings must be set when multiple null proofs are normalized"
         )
+
+
+# ---------------------------------------------------------------------------
+# J. normalize_prediction_bool respects forced_prediction_bool (Bug 1)
+# ---------------------------------------------------------------------------
+
+class TestNormalizePredictionBool:
+    """normalize_prediction_bool() must NOT overwrite forced_prediction_bool set by validator."""
+
+    def _inconclusive_with_local_risk(self) -> "FinalDecision":
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        from vckg_agentic_proof.validator import validate_final_decision
+        d = FinalDecision(
+            prediction=FinalPrediction.inconclusive,
+            confidence=0.4,
+            local_risk_present=True,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="test",
+            limitations=[],
+        )
+        d, _, _ = validate_final_decision(d)
+        return d
+
+    def test_forced_prediction_bool_survives_normalize_call(self):
+        """After validate_final_decision(), prediction_bool must equal forced_prediction_bool."""
+        d = self._inconclusive_with_local_risk()
+        assert d.forced_prediction_bool is True, "validator must set forced_prediction_bool=True"
+        assert d.prediction_bool is True, (
+            f"normalize_prediction_bool() must propagate forced_prediction_bool=True to "
+            f"prediction_bool; got prediction_bool={d.prediction_bool!r}. "
+            f"This is the root cause of is_vulnerable=False written to disk."
+        )
+
+    def test_prediction_bool_false_for_inconclusive_no_local_risk(self):
+        """Inconclusive with local_risk=False → forced_prediction_bool=False → prediction_bool=False."""
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        from vckg_agentic_proof.validator import validate_final_decision
+        d = FinalDecision(
+            prediction=FinalPrediction.inconclusive,
+            confidence=0.4,
+            local_risk_present=False,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="test",
+            limitations=[],
+        )
+        d, _, _ = validate_final_decision(d)
+        assert d.forced_prediction_bool is False
+        assert d.prediction_bool is False, (
+            f"prediction_bool must be False for inconclusive+no_local_risk; got {d.prediction_bool!r}"
+        )
+
+    def test_explicit_normalize_call_respects_forced_bool(self):
+        """Directly calling normalize_prediction_bool() with forced_prediction_bool set must use it."""
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        d = FinalDecision(
+            prediction=FinalPrediction.inconclusive,
+            confidence=0.4,
+            local_risk_present=True,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="test",
+            limitations=[],
+            forced_prediction_bool=True,  # set directly
+        )
+        d.normalize_prediction_bool()
+        assert d.prediction_bool is True, (
+            f"normalize_prediction_bool() must use forced_prediction_bool=True when set; "
+            f"got prediction_bool={d.prediction_bool!r}"
+        )
+
+    def test_vulnerable_prediction_still_sets_true(self):
+        """normalize_prediction_bool() with prediction=vulnerable and no forced must set True."""
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        d = FinalDecision(
+            prediction=FinalPrediction.vulnerable,
+            confidence=0.9,
+            local_risk_present=True,
+            confirmed_security_vulnerability=True,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="vuln",
+            limitations=[],
+        )
+        d.normalize_prediction_bool()
+        assert d.prediction_bool is True
+
+    def test_fixed_prediction_sets_false(self):
+        """normalize_prediction_bool() with prediction=fixed/non-vulnerable sets False."""
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        d = FinalDecision(
+            prediction=FinalPrediction.fixed_or_non_vulnerable,
+            confidence=0.85,
+            local_risk_present=False,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="safe",
+            limitations=[],
+        )
+        d.normalize_prediction_bool()
+        assert d.prediction_bool is False

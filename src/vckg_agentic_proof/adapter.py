@@ -68,7 +68,7 @@ class AgenticProofConfig:
     max_tokens_hypothesis_verification: int = 16384
     max_tokens_counter_evidence_review: int = 16384
     max_tokens_final_decision: int = 8192
-    max_tokens_schema_repair: int = 4096
+    max_tokens_schema_repair: int = 8192
     max_tokens_evidence_gap_analysis: int = 8192
     # Iterative evidence loop controls
     iterative_evidence_loop: bool = False
@@ -199,6 +199,24 @@ def _call_llm(
                                        "enable_thinking": config.provider_extra_body.get(
                                            "chat_template_kwargs", {}).get("enable_thinking")}))
     return text, usage
+
+
+_BINARY_DECISION_STATUSES = frozenset({
+    "confirmed_vulnerable", "confirmed_non_vulnerable",
+    "forced_binary_vulnerable", "forced_binary_non_vulnerable",
+})
+
+
+def _decision_has_valid_binary(decision: "FinalDecision") -> bool:
+    """Return True when the validator has already produced a definitive binary decision.
+
+    When True, Stage 07 consistency repair is unnecessary — the forced binary choice
+    (forced_prediction_bool) is already set deterministically.
+    """
+    return (
+        decision.forced_prediction_bool is not None
+        and decision.decision_status in _BINARY_DECISION_STATUSES
+    )
 
 
 def _repair_llm(
@@ -630,7 +648,9 @@ def run_agentic_proof_pipeline(
         }))
 
     # ── Stage 07: Schema consistency repair (conditional) ────────────────────
-    if modified:
+    # Skip repair when the validator has already produced a definitive forced binary
+    # decision — repair cannot improve on a deterministically-set forced_prediction_bool.
+    if modified and not _decision_has_valid_binary(decision):
         _fallback_decision = decision  # save stage-06 validated decision before attempting repair
         try:
             text, usage = _call_llm(

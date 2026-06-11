@@ -115,7 +115,7 @@ _INCOMPLETE_STATUSES = {"running", "in_progress", "in progress", "pending",
 
 # Decision-status substrings that mark a prediction as inconclusive (complete
 # but not definitively classified as vulnerable or safe).
-_INCONCLUSIVE_HINTS = ("inconclusive",)
+_INCONCLUSIVE_HINTS = ("inconclusive", "forced_binary")
 
 
 def _prediction_is_available(fp: dict[str, Any] | None) -> bool:
@@ -418,6 +418,11 @@ class ResearchInventory:
             sample_data = _read_json(sd / "sample.json") or {}
             avail = _prediction_is_available(fp)
             pred_is_vuln = fp.get("is_vulnerable")
+            _ds = str(fp.get("decision_status") or "")
+            if avail and "forced_binary" in _ds and fp.get("forced_prediction_bool") is not None:
+                pred_is_vuln = fp.get("forced_prediction_bool")
+            elif avail and pred_is_vuln is None:
+                pred_is_vuln = fp.get("forced_prediction_bool")
             true_is_vuln = sample_data.get("is_vulnerable")
 
             result: str | None = None
@@ -1298,7 +1303,16 @@ class ResearchInventory:
                 last_completed = s.get("stage")
 
         true_is_vuln = sample.get("is_vulnerable")
-        pred_is_vuln = fp.get("is_vulnerable") if pred_available else None
+        if pred_available:
+            pred_is_vuln = fp.get("is_vulnerable")
+            if pred_is_vuln is None:
+                pred_is_vuln = fp.get("forced_prediction_bool")
+            # forced_binary_* statuses: prefer forced_prediction_bool over stale is_vulnerable
+            _ds = str(fp.get("decision_status") or "")
+            if "forced_binary" in _ds and fp.get("forced_prediction_bool") is not None:
+                pred_is_vuln = fp.get("forced_prediction_bool")
+        else:
+            pred_is_vuln = None
         true_label = None if true_is_vuln is None or mode != "admin" else ("vulnerable" if true_is_vuln else "safe")
         prediction = None if pred_is_vuln is None else ("vulnerable" if pred_is_vuln else "safe")
         correct = None
@@ -1359,48 +1373,6 @@ class ResearchInventory:
             # Dashboard-display-only fields — never injected into LLM prompts.
             "commit_message": sample.get("commit_message") if mode == "admin" else None,
             "target_function_source": sample.get("func_body") or None,
-        }
-
-    def sample_normalized(self, run_id: str, sample_id: str, mode: Mode = "admin") -> dict[str, Any] | None:
-        sd = self._sample_dir(run_id, sample_id)
-        if not sd:
-            return None
-        meta = self.run_meta(run_id)
-        fp = _read_json(sd / "final_prediction.json") or {}
-        sample = _read_json(sd / "sample.json") or {}
-        true_is_vuln = sample.get("is_vulnerable")
-        pred_is_vuln = fp.get("is_vulnerable")
-        true_label = None if true_is_vuln is None or mode != "admin" else ("vulnerable" if true_is_vuln else "safe")
-        prediction = None if pred_is_vuln is None else ("vulnerable" if pred_is_vuln else "safe")
-        correct = None
-        if mode == "admin" and true_is_vuln is not None and pred_is_vuln is not None:
-            correct = bool(true_is_vuln) == bool(pred_is_vuln)
-        kg_info = self.kg_dashboard(run_id, sample_id)
-        return {
-            "run_id": run_id,
-            "sample_id": str(sample_id),
-            "project": sample.get("project"),
-            "function": sample.get("func_name") or sample.get("function_name"),
-            "filepath": sample.get("filepath"),
-            "true_label": true_label,
-            "prediction": prediction,
-            "correct": correct,
-            "decision_status": fp.get("decision_status"),
-            "confidence": fp.get("confidence"),
-            "verdict_text": fp.get("reasoning_summary"),
-            "primary_vulnerability_type": fp.get("primary_vulnerability_type"),
-            "parse_error": fp.get("parse_error"),
-            "resolved_commit": fp.get("resolved_commit_id"),
-            "llm": meta.get("llm"),
-            "kg": {
-                **meta.get("kg", {}),
-                "graph_dir": kg_info.get("graph_dir"),
-                "dashboard_url": kg_info.get("iframe_url"),
-                "dashboard_exists": kg_info.get("exists"),
-            },
-            "usage": fp.get("usage"),
-            "stages": self.sample_stages(run_id, sample_id),
-            "kg_queries": self.kg_queries(run_id, sample_id),
         }
 
     # ---- end-to-end inventory summary -------------------------------
@@ -1616,7 +1588,13 @@ class ResearchInventory:
         _kv("loop_enabled", flow_json.get("iterative_loop_enabled", "—"))
         _kv("iterations_completed", flow_json.get("iterations_completed", "—"))
         _kv("loop_stop_reason", flow_json.get("loop_stop_reason") or fp.get("loop_stop_reason") or "—")
-        _kv("final_prediction", fp.get("is_vulnerable"))
+        _fp_bool = fp.get("is_vulnerable")
+        _ds_fr = str(fp.get("decision_status") or "")
+        if "forced_binary" in _ds_fr and fp.get("forced_prediction_bool") is not None:
+            _fp_bool = fp.get("forced_prediction_bool")
+        elif _fp_bool is None:
+            _fp_bool = fp.get("forced_prediction_bool")
+        _kv("final_prediction", _fp_bool)
         _kv("confidence", fp.get("confidence") or "—")
         _kv("decision_status", fp.get("decision_status") or "—")
         commit_msg = sample_json.get("commit_message")

@@ -175,6 +175,11 @@ export default function AgentTracePage() {
 
       <div className="btn-row" style={{ marginBottom: 12 }}>
         <button className="btn" onClick={() => nav(`/research/kg/${runId}/${sampleId}`)}>KG Query Flow</button>
+        <a
+          className="btn"
+          href={research.flowReportUrl(runId!, sampleId!)}
+          download={`flow_report_${runId}_${sampleId}.txt`}
+        >Download full flow report</a>
         <button className="btn" onClick={() => nav("/research/runs")}>← Runs</button>
       </div>
 

@@ -855,3 +855,212 @@ class TestTraceNormalizedNewFields:
         assert result["target_function_source"] is None, (
             "target_function_source must be None when sample.json has no func_body"
         )
+
+
+# ---------------------------------------------------------------------------
+# RED: canonical prediction mapping (Bug 1 — dashboard side)
+# ---------------------------------------------------------------------------
+
+class TestCanonicalPredictionMapping:
+    """trace_normalized() must use forced_prediction_bool/decision_status when
+    is_vulnerable is stale (False) but decision_status=forced_binary_vulnerable."""
+
+    def _make_forced_binary_run(self, tmp_path: Path, run_id: str, sample_id: str,
+                                 decision_status: str, forced_prediction_bool: bool,
+                                 stale_is_vulnerable: bool) -> None:
+        sd = _make_run(tmp_path, run_id, sample_id, "count_rows")
+        sd.joinpath("sample.json").write_text(
+            json.dumps({"func_name": "count_rows", "filepath": "db.c", "is_vulnerable": True}),
+            encoding="utf-8",
+        )
+        sd.joinpath("final_prediction.json").write_text(
+            json.dumps({
+                "is_vulnerable": stale_is_vulnerable,  # stale/wrong value
+                "forced_prediction_bool": forced_prediction_bool,
+                "decision_status": decision_status,
+                "confidence": 0.55,
+                "reasoning_summary": "forced binary chosen",
+            }),
+            encoding="utf-8",
+        )
+        (tmp_path / "runs" / run_id / "run_meta.json").write_text(
+            json.dumps({"llm": {}, "kg": {}, "status": "completed"}), encoding="utf-8"
+        )
+
+    def test_trace_normalized_uses_forced_bool_not_stale_is_vulnerable(self, tmp_path):
+        """When is_vulnerable=False but forced_prediction_bool=True+forced_binary_vulnerable,
+        trace_normalized() must return prediction='vulnerable', not 'safe'."""
+        self._make_forced_binary_run(
+            tmp_path, "run_fp1", "400",
+            decision_status="forced_binary_vulnerable",
+            forced_prediction_bool=True,
+            stale_is_vulnerable=False,  # the stale/wrong value on disk
+        )
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_fp1", "400")
+        assert result is not None
+        assert result.get("prediction") == "vulnerable", (
+            f"trace_normalized() must return prediction='vulnerable' when "
+            f"decision_status=forced_binary_vulnerable even if is_vulnerable=False on disk. "
+            f"Got prediction={result.get('prediction')!r}. "
+            f"This is the root cause of the contradictory Trace card display."
+        )
+
+    def test_trace_normalized_forced_non_vuln_shows_safe(self, tmp_path):
+        """forced_binary_non_vulnerable + forced_prediction_bool=False → prediction='safe'."""
+        self._make_forced_binary_run(
+            tmp_path, "run_fp2", "401",
+            decision_status="forced_binary_non_vulnerable",
+            forced_prediction_bool=False,
+            stale_is_vulnerable=False,
+        )
+        inv = _make_inventory(tmp_path)
+        result = inv.trace_normalized("run_fp2", "401")
+        assert result is not None
+        assert result.get("prediction") == "safe"
+
+    def test_classify_sample_forced_binary_vulnerable_is_tp(self, tmp_path):
+        """_classify_sample with forced_binary_vulnerable + true_label=vulnerable must be TP."""
+        from student_system_creator.dashboard.research import _classify_sample
+        fp = {
+            "is_vulnerable": False,  # stale wrong value
+            "forced_prediction_bool": True,
+            "decision_status": "forced_binary_vulnerable",
+            "confidence": 0.55,
+        }
+        sample = {"is_vulnerable": True}
+        result, error_type, outcome = _classify_sample(fp, sample)
+        assert result == "correct" and error_type == "tp" and outcome == "TP", (
+            f"forced_binary_vulnerable with true_label=vulnerable must be TP. "
+            f"Got result={result!r}, error_type={error_type!r}, outcome={outcome!r}. "
+            f"This mismatch is caused by _is_inconclusive_status() not matching 'forced_binary_*'."
+        )
+
+    def test_classify_sample_forced_binary_non_vuln_is_tn(self, tmp_path):
+        """_classify_sample with forced_binary_non_vulnerable + true_label=non-vuln must be TN."""
+        from student_system_creator.dashboard.research import _classify_sample
+        fp = {
+            "is_vulnerable": False,
+            "forced_prediction_bool": False,
+            "decision_status": "forced_binary_non_vulnerable",
+            "confidence": 0.45,
+        }
+        sample = {"is_vulnerable": False}
+        result, error_type, outcome = _classify_sample(fp, sample)
+        assert result == "correct" and error_type == "tn" and outcome == "TN", (
+            f"forced_binary_non_vulnerable with true_label=non-vuln must be TN. "
+            f"Got result={result!r}, error_type={error_type!r}, outcome={outcome!r}."
+        )
+
+    def test_list_samples_forced_binary_shows_vulnerable(self, tmp_path):
+        """list_samples() must show prediction='vulnerable' for forced_binary_vulnerable samples."""
+        self._make_forced_binary_run(
+            tmp_path, "run_fp3", "402",
+            decision_status="forced_binary_vulnerable",
+            forced_prediction_bool=True,
+            stale_is_vulnerable=False,
+        )
+        inv = _make_inventory(tmp_path)
+        samples = inv.list_samples("run_fp3")
+        assert len(samples) == 1
+        s = samples[0]
+        assert s.get("prediction") == "vulnerable", (
+            f"list_samples() must show prediction='vulnerable' for forced_binary_vulnerable. "
+            f"Got {s.get('prediction')!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED: consistency repair policy (Bug 2 — adapter.py Stage 07)
+# ---------------------------------------------------------------------------
+
+class TestConsistencyRepairPolicy:
+    """Stage 07 consistency repair must NOT run when the validator has already
+    produced a definitive forced binary decision (forced_prediction_bool is set).
+
+    The real-world trigger: Stage 06 returns 'vulnerable' but validator downgrades
+    to 'inconclusive' because proof is incomplete. modified=True fires Stage 07.
+    But the forced binary (forced_binary_vulnerable/non_vulnerable) is already
+    deterministically set — Stage 07 should be skipped.
+    """
+
+    def _run_pipeline_downgraded_vulnerable(self, local_risk: bool) -> tuple:
+        """Stage 06 returns 'vulnerable' → validator downgrades to inconclusive.
+        Returns (result, repair_stages_called)."""
+        import json
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        def _xml(data):
+            return f"<analysis>brief</analysis><answer>{json.dumps(data)}</answer>"
+
+        hyp = [{"hypothesis_id": "HYP-01", "title": "OOB", "risk_summary": "r",
+                "required_proof_questions": []}]
+        verifications = [{
+            "hypothesis_id": "HYP-01", "status": "insufficient_evidence",
+            "local_risk_present": local_risk, "confirmed_security_vulnerability": False,
+            "proof": {"input_control": "", "dangerous_operation": "",
+                      "missing_or_failed_guard": "", "unsafe_use": "",
+                      "security_impact": "", "cited_evidence_ids": []},
+            "supporting_evidence_ids": [], "counter_evidence_ids": [],
+            "missing_evidence": [], "explanation": "none",
+        }]
+        # Stage 06 claims 'vulnerable' but provides no proof → validator downgrades
+        stage_responses = {
+            "01_source_only_hypothesis": {"hypotheses": hyp, "source_observations": [],
+                                          "non_vulnerability_possibilities": []},
+            "02_kg_query_planning": {"queries": []},
+            "04_hypothesis_verification": {"verifications": verifications},
+            "05_counter_evidence_review": {"findings": [], "overall_notes": ""},
+            "06_final_adjudication": {
+                "prediction": "vulnerable", "confidence": 0.8,
+                "local_risk_present": local_risk, "confirmed_security_vulnerability": True,
+                "final_hypothesis_statuses": verifications,
+                "minimum_vulnerability_proof": None,  # no proof → validator downgrades
+                "decisive_evidence_ids": [], "decisive_counter_evidence_ids": [],
+                "explanation": "looks vulnerable", "limitations": [],
+            },
+        }
+        repair_stages_called = []
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            if "07_schema_consistency_repair" in stage:
+                repair_stages_called.append(stage)
+            base = stage.split("_json_repair")[0]
+            data = stage_responses.get(stage) or stage_responses.get(base)
+            if data is None:
+                return _xml({"findings": [], "overall_notes": ""})
+            return _xml(data)
+
+        cfg = AgenticProofConfig(iterative_evidence_loop=False)
+        result = run_agentic_proof_pipeline(
+            sample={"function": "fn", "filepath": "f.c", "func_body": "int fn(){}"},
+            target_source="int fn(){}",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=cfg,
+        )
+        return result, repair_stages_called
+
+    def test_stage07_not_called_when_downgraded_to_forced_binary_vulnerable(self):
+        """When Stage 06 returns vulnerable → validator downgrades to forced_binary_vulnerable,
+        Stage 07 must NOT be called (forced binary is already definitively set)."""
+        result, repair_stages = self._run_pipeline_downgraded_vulnerable(local_risk=True)
+        assert result.decision.decision_status in (
+            "forced_binary_vulnerable", "forced_binary_non_vulnerable",
+            "confirmed_non_vulnerable",
+        ), f"Expected forced binary status, got {result.decision.decision_status!r}"
+        assert len(repair_stages) == 0, (
+            f"Stage 07 consistency repair must NOT be called when the validator already "
+            f"produces a definitive forced binary decision. Got: {repair_stages}. "
+            f"Bug 2: modified=True fires Stage 07 even when forced_prediction_bool is set."
+        )
+
+    def test_stage07_not_called_when_downgraded_to_forced_binary_non_vulnerable(self):
+        """Stage 06 returns vulnerable, validator downgrades, local_risk=False →
+        forced_binary_non_vulnerable. Stage 07 must NOT run."""
+        result, repair_stages = self._run_pipeline_downgraded_vulnerable(local_risk=False)
+        assert len(repair_stages) == 0, (
+            f"Stage 07 must not run for forced_binary_non_vulnerable downgrade. "
+            f"Got: {repair_stages}"
+        )

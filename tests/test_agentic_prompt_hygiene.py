@@ -557,3 +557,109 @@ class TestSecretSafety:
         assert masked["prompt_tokens"] == 100
         assert masked["total_tokens"] == 150
         assert masked["max_tokens"] == 32768
+
+
+# ---------------------------------------------------------------------------
+# M. Consistency repair prompt must not expose "inconclusive" (Bug 3/4)
+# ---------------------------------------------------------------------------
+
+class TestConsistencyRepairPromptSchema:
+    """consistency_repair_prompt() must use a compact binary-only output contract
+    that does NOT mention "inconclusive" as an allowed prediction value."""
+
+    def _repair_prompt_text(self) -> str:
+        from vckg_agentic_proof.prompts import consistency_repair_prompt
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        decision = FinalDecision(
+            prediction=FinalPrediction.inconclusive,
+            confidence=0.4,
+            local_risk_present=True,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="test",
+            limitations=[],
+            forced_prediction_bool=True,
+            decision_status="forced_binary_vulnerable",
+        )
+        msgs = consistency_repair_prompt(decision.model_dump(mode="json"), ["validator note"])
+        return "\n".join(m.get("content", "") for m in msgs)
+
+    def test_repair_prompt_no_inconclusive_enum(self):
+        """consistency_repair_prompt() must not expose 'inconclusive' as an allowed value
+        in the output contract/schema section shown to the LLM.
+
+        The CURRENT DECISION section may legitimately show the current (inconclusive) state
+        being repaired. What must be absent is 'inconclusive' as an enum option in the
+        contract or schema block shown as the allowed output choices.
+        """
+        from vckg_agentic_proof.prompts import consistency_repair_prompt
+        from vckg_agentic_proof.schemas import FinalDecision, FinalPrediction
+        decision = FinalDecision(
+            prediction=FinalPrediction.inconclusive,
+            confidence=0.4,
+            local_risk_present=True,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="test",
+            limitations=[],
+            forced_prediction_bool=True,
+            decision_status="forced_binary_vulnerable",
+        )
+        msgs = consistency_repair_prompt(decision.model_dump(mode="json"), ["validator note"])
+        # Extract only the schema/contract portion from the user message (before CURRENT DECISION)
+        user_content = next(m["content"] for m in msgs if m["role"] == "user")
+        contract_section = user_content.split("CURRENT DECISION")[0]
+        assert '"inconclusive"' not in contract_section and "'inconclusive'" not in contract_section, (
+            "consistency_repair_prompt() must NOT expose 'inconclusive' as an allowed "
+            "prediction value in the output contract/schema section. Using schema_block(FinalDecision) "
+            "includes it as an enum value, causing the LLM to ignore the system-prompt instruction. "
+            f"Contract section: {contract_section[:500]!r}"
+        )
+
+    def test_repair_prompt_mentions_binary_choices(self):
+        """Repair prompt must mention the two allowed binary choices explicitly."""
+        text = self._repair_prompt_text()
+        assert "vulnerable" in text and "non-vulnerable" in text, (
+            "consistency_repair_prompt() must list 'vulnerable' and 'non-vulnerable' "
+            "as the only allowed prediction values."
+        )
+
+    def test_repair_prompt_size_is_reasonable(self):
+        """Repair prompt must not include the full Pydantic schema dump (too large).
+        Total prompt must be under 4000 chars (compact contract, not full schema)."""
+        text = self._repair_prompt_text()
+        assert len(text) < 4000, (
+            f"consistency_repair_prompt() is {len(text)} chars — too large. "
+            f"Using schema_block(FinalDecision) produces ~14KB prompts that get truncated "
+            f"at 2048 tokens. Use a compact binary-only contract instead."
+        )
+
+    def test_final_decision_prompt_no_inconclusive_in_schema_block(self):
+        """final_decision_prompt() schema block must not expose 'inconclusive' to the LLM.
+        The system prompt says 'Inconclusive is NOT allowed' but schema_block() contradicts it."""
+        from vckg_agentic_proof.prompts import final_decision_prompt
+
+        _SAMPLE = {"function": "fn", "filepath": "f.c", "func_name": "fn"}
+        msgs = final_decision_prompt(_SAMPLE, [], {}, [])
+        text = "\n".join(m.get("content", "") for m in msgs)
+        # The schema shown to the LLM must not list "inconclusive" as a valid enum value
+        assert '"inconclusive"' not in text, (
+            "final_decision_prompt() must not expose 'inconclusive' in the schema block "
+            "shown to the LLM. It causes the model to output inconclusive even when the "
+            "system prompt says it is not allowed."
+        )
+
+    def test_max_tokens_schema_repair_default_is_high(self):
+        """AgenticProofConfig.max_tokens_schema_repair default must be >= 8192."""
+        from vckg_agentic_proof.adapter import AgenticProofConfig
+        cfg = AgenticProofConfig()
+        assert cfg.max_tokens_schema_repair >= 8192, (
+            f"max_tokens_schema_repair default is {cfg.max_tokens_schema_repair}, "
+            f"must be >= 8192. YAML overrides to 2048 cause repair stage truncation."
+        )

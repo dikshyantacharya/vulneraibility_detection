@@ -1326,7 +1326,7 @@ class CommitKGPipeline:
         usage.setdefault("total_tokens", pt + ct)
         usage.setdefault("cost_total_usd", (pt / 1000 * self.cfg.model.cost.input_per_1k_usd) + (ct / 1000 * self.cfg.model.cost.output_per_1k_usd))
         usage.setdefault("estimated", False)
-        pred_bool = decision.prediction_bool
+        pred_bool = decision.prediction_bool if decision.prediction_bool is not None else decision.forced_prediction_bool
         pred = Prediction(
             sample_id=sample.sample_id,
             is_vulnerable=bool(pred_bool) if pred_bool is not None else False,
