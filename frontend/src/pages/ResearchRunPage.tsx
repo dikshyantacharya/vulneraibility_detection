@@ -68,6 +68,12 @@ export default function ResearchRunPage() {
   const [kgReuseCache, setKgReuseCache] = useState(true);
   const [kgForceRebuild, setKgForceRebuild] = useState(false);
 
+  // Loop state — iterative evidence loop defaults ON for dashboard runs.
+  const [loopEnabled, setLoopEnabled] = useState(true);
+  const [loopMaxIter, setLoopMaxIter] = useState("3");
+  const [loopCounterEnabled, setLoopCounterEnabled] = useState(true);
+  const [loopMaxCounterIter, setLoopMaxCounterIter] = useState("2");
+
   // Load valid KG backend presets (single source of truth from the server).
   useEffect(() => {
     api.kgBackends()
@@ -225,6 +231,13 @@ export default function ResearchRunPage() {
           backend: kgEffectiveBackend || undefined,
           reuse_cache: kgReuseCache,
           force_rebuild: kgForceRebuild,
+        },
+        loop: {
+          loop_enabled: loopEnabled,
+          enable_counter_evidence_loop: loopCounterEnabled && loopEnabled,
+          max_evidence_iterations: parseInt(loopMaxIter) || 3,
+          max_counter_iterations: parseInt(loopMaxCounterIter) || 2,
+          max_queries_per_iteration: 5,
         },
         dry_run: dryRun,
       };
@@ -423,6 +436,50 @@ export default function ResearchRunPage() {
         </div>
       </div>
 
+      {/* Loop settings */}
+      <div className="card" style={{ marginBottom: 12 }}>
+        <h3 className="section-title" style={{ marginTop: 0 }}>5. Iterative Evidence Loop</h3>
+        <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px" }}>
+          After initial KG retrieval and hypothesis verification, the LLM decides whether more evidence is needed.
+          If yes, a bounded follow-up loop executes. If no, the stop reason is recorded in Agentic Flow.
+        </p>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+            <input type="checkbox" checked={loopEnabled} onChange={e => setLoopEnabled(e.target.checked)} />
+            Enable iterative evidence loop (default: on)
+          </label>
+          {loopEnabled && (
+            <>
+              <label style={{ fontSize: 13 }}>
+                Max verification iterations{" "}
+                <input
+                  type="number" min={1} max={10} value={loopMaxIter} style={{ width: 52 }}
+                  onChange={e => setLoopMaxIter(e.target.value)}
+                />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                <input type="checkbox" checked={loopCounterEnabled} onChange={e => setLoopCounterEnabled(e.target.checked)} />
+                Counter-evidence loop
+              </label>
+              {loopCounterEnabled && (
+                <label style={{ fontSize: 13 }}>
+                  Max counter iterations{" "}
+                  <input
+                    type="number" min={1} max={10} value={loopMaxCounterIter} style={{ width: 52 }}
+                    onChange={e => setLoopMaxCounterIter(e.target.value)}
+                  />
+                </label>
+              )}
+            </>
+          )}
+        </div>
+        {!loopEnabled && (
+          <div className="banner warn" style={{ marginTop: 8, fontSize: 12 }}>
+            Loop disabled: pipeline will run sequentially. Agentic Flow will show loop_stop_reason = loop_disabled.
+          </div>
+        )}
+      </div>
+
       {/* Original config vs Effective overrides */}
       {(() => {
         const overrideActive =
@@ -475,6 +532,7 @@ export default function ResearchRunPage() {
           <li>Effective KG backend: <span className="mono">{kgEffectiveBackend || "—"}</span></li>
           <li>Samples: {selected.size > 0 ? `${selected.size} exact sample${selected.size > 1 ? "s" : ""}` : "config default"}</li>
           <li>Pairs: {selected.size > 0 ? "disabled" : "config default"}</li>
+          <li>Iterative loop: <strong>{loopEnabled ? `enabled (max ${loopMaxIter} iter${loopCounterEnabled ? `, counter max ${loopMaxCounterIter}` : ""})` : "disabled"}</strong></li>
         </ul>
       </div>
 

@@ -312,6 +312,26 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
         for secret_key in ("api_key", "api_secret", "authorization", "token"):
             model_block.pop(secret_key, None)
 
+    # Dashboard Research Audit: enable iterative evidence loop by default.
+    # The base config default is False (backward-compatible), but dashboard runs
+    # should seek evidence iteratively unless the caller explicitly disables it.
+    loop_spec = params.get("loop") or {}
+    loop_enabled = bool(loop_spec.get("loop_enabled", True))  # default ON for dashboard runs
+    ap = base.setdefault("agentic_proof", {})
+    ap["iterative_evidence_loop"] = loop_enabled
+    ap["enable_counter_evidence_loop"] = bool(
+        loop_spec.get("enable_counter_evidence_loop", loop_enabled)
+    )
+    if "max_evidence_iterations" not in ap:
+        ap["max_evidence_iterations"] = int(loop_spec.get("max_evidence_iterations", 3))
+    if "max_counter_iterations" not in ap:
+        ap["max_counter_iterations"] = int(loop_spec.get("max_counter_iterations", 2))
+    if "max_queries_per_iteration" not in ap:
+        ap["max_queries_per_iteration"] = int(loop_spec.get("max_queries_per_iteration", 5))
+    ap["stop_when_no_new_evidence"] = True
+    ap["stop_when_no_new_queries"] = True
+    ap["stop_when_all_hypotheses_resolved"] = True
+
     exp_block = base.setdefault("experiment", {})
     exp_block["output_root"] = str((job_dir / "runs").as_posix())
     # experiment.name is required by AppConfig; ensure one exists even if the
@@ -376,6 +396,12 @@ def _apply_llm_override(
         model_cfg["api_key_env"] = "ACADEMIC_CLOUD_API_KEY"
         # AcademicCloud's gateway returns 400 on vendor extensions -> minimal.
         _strip_vendor_thinking_extras(model_cfg)
+        # Qwen 3.5 397B on the shared GWDG cluster can take 300-600s per call
+        # at max_tokens=16384. The iterative evidence loop makes 5-9 calls per
+        # sample, so the base-config 180s timeout causes cascade failures.
+        # Raise to at least 600s; preserve any higher value already set.
+        _existing_to = int(model_cfg.get("timeout_seconds") or 120)
+        model_cfg["timeout_seconds"] = max(600, _existing_to)
 
     elif profile_id == "tu_berlin_ollama":
         # Use OpenAI-compatible endpoint (smallest robust solution)

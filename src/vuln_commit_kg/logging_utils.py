@@ -40,6 +40,70 @@ def fmt_seconds(seconds: float) -> str:
     return f"{int(hours)}h{int(rem):02d}m{sec:04.1f}s"
 
 
+class _SafeWriter:
+    """Stream wrapper that replaces unencodable characters instead of raising.
+
+    On Windows with a legacy cp1252 console, Rich's Unicode box-drawing chars
+    (━, │, etc.) and any non-cp1252 characters in log messages cause
+    UnicodeEncodeError.  This wrapper intercepts write() and silently replaces
+    characters that cannot be encoded to the underlying stream's encoding.
+    """
+
+    def __init__(self, wrapped: object, orig_enc: str) -> None:
+        self._wrapped = wrapped
+        self._orig_enc = orig_enc
+        self.encoding = "utf-8"  # report UTF-8 to Rich so it emits Unicode freely
+
+    def write(self, text: str) -> int:
+        try:
+            text.encode(self._orig_enc)
+        except UnicodeEncodeError:
+            text = text.encode(self._orig_enc, errors="replace").decode(self._orig_enc)
+        return self._wrapped.write(text)  # type: ignore[attr-defined]
+
+    def flush(self) -> None:
+        if hasattr(self._wrapped, "flush"):
+            self._wrapped.flush()  # type: ignore[attr-defined]
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        if hasattr(self._wrapped, "fileno"):
+            try:
+                return self._wrapped.fileno()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        import io
+        raise io.UnsupportedOperation("fileno")
+
+
+def _safe_console_stream(stream: object) -> object:
+    """Return a write-safe stream for the given console stream.
+
+    If the stream uses a narrow encoding (cp1252, ascii, etc.) that cannot
+    represent all Unicode characters, wrap it so UnicodeEncodeError is never
+    raised — instead unrepresentable characters are replaced with '?'.
+    """
+    enc = (getattr(stream, "encoding", None) or "utf-8").lower().replace("-", "").replace("_", "")
+    if enc in ("utf8", "utf8sig"):
+        return stream  # already safe
+    # Prefer wrapping the underlying binary buffer (real terminal on Windows)
+    if hasattr(stream, "buffer"):
+        import io
+        try:
+            return io.TextIOWrapper(
+                stream.buffer,  # type: ignore[attr-defined]
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=True,
+            )
+        except Exception:
+            pass
+    # Fallback: proxy wrapper (handles StringIO in tests and other custom streams)
+    return _SafeWriter(stream, getattr(stream, "encoding", "ascii") or "ascii")
+
+
 def setup_logging(run_dir: Path | None, level: str = "INFO", use_rich: bool = True) -> logging.Logger:
     logger = logging.getLogger("vckg")
     logger.handlers.clear()
@@ -50,9 +114,20 @@ def setup_logging(run_dir: Path | None, level: str = "INFO", use_rich: bool = Tr
     datefmt = "%H:%M:%S"
     if use_rich:
         try:
+            from rich.console import Console
             from rich.logging import RichHandler
 
+            # Wrap stdout in an encoding-safe stream so cp1252 / ascii Windows
+            # consoles do not raise UnicodeEncodeError on Unicode log messages.
+            _safe_out = _safe_console_stream(sys.stdout)
+            _console = Console(
+                file=_safe_out,  # type: ignore[arg-type]
+                markup=True,
+                highlight=False,
+                safe_box=True,  # ASCII box chars in tracebacks instead of Unicode
+            )
             console_handler = RichHandler(
+                console=_console,
                 rich_tracebacks=True,
                 markup=True,
                 show_path=False,

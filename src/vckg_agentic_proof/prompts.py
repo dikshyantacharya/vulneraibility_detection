@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
-from typing import Any, Dict, List
-from .schemas import CounterEvidenceReview, FinalDecision, KGQueryPlan, HypothesisVerification, VulnerabilityHypothesis
+from typing import Any, Dict, List, Optional
+from .schemas import CounterEvidenceReview, EvidenceGapPlan, FinalDecision, KGQueryPlan, HypothesisVerification, VulnerabilityHypothesis
 
 COMMON_TAG_CONTRACT = """Return exactly:
 <analysis>
@@ -49,6 +49,20 @@ STAGE_CONTEXT_POLICY: Dict[str, Dict[str, List[str]]] = {
         "allowed": ["system_prompt", "output_format", "schema", "target_function_name",
                     "verifications", "counter_review", "evidence_index"],
         "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit"],
+    },
+    "04_evidence_gap": {
+        "allowed": ["system_prompt", "output_format", "schema", "target_function_name",
+                    "verification_statuses", "missing_evidence_fields", "executed_query_ids",
+                    "evidence_id_index", "iteration"],
+        "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit",
+                      "evidence_full_text"],
+    },
+    "05_counter_gap": {
+        "allowed": ["system_prompt", "output_format", "schema", "target_function_name",
+                    "counter_review_findings", "missing_counter_evidence", "executed_query_ids",
+                    "evidence_id_index", "iteration"],
+        "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit",
+                      "evidence_full_text"],
     },
 }
 
@@ -236,6 +250,128 @@ def final_decision_prompt(
             f"VERIFICATIONS:\n{compact_json(verifications, 18000)}\n\n"
             f"COUNTER REVIEW:\n{compact_json(counter_review, 14000)}\n\n"
             f"EVIDENCE:\n{compact_json(evidence, 18000)}"
+        )},
+    ]
+
+
+_CODEKG_QUERY_FORMS = (
+    "Allowed query_text forms:\n"
+    '- security_context(target_function="<fn>", depth=3, call_depth=2)\n'
+    '- evidence_slice(target_function="<fn>", target_statement="<expr>", relation_depth=4)\n'
+    '- variable_flow(target_function="<fn>", symbol="<var>", data_depth=4)\n'
+    '- call_neighborhood(target_function="<fn>", direction="both", call_depth=2)\n'
+    '- semantic_facts(target_function="<fn>")\n'
+    '- function_context(target_function="<fn>", depth=2)\n'
+    '- file_context(file="<relative/path.c>")\n'
+)
+
+
+def evidence_gap_analysis_prompt(
+    sample: Dict[str, Any],
+    verifications: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+    executed_query_ids: List[str],
+    iteration: int = 1,
+) -> List[Dict[str, str]]:
+    # Stage 04_evidence_gap_iter{N}: no sample/project metadata. Receives only
+    # the target function name, current verification statuses (with missing_evidence
+    # fields), an evidence ID index (not full text to save tokens), the list of
+    # already-executed query IDs to avoid duplicates, and the iteration number.
+    fn = _target_function_name(sample)
+
+    # Compact verification summary: id, status, missing_evidence only
+    verif_summary = [
+        {
+            "hypothesis_id": v.get("hypothesis_id"),
+            "status": v.get("status"),
+            "missing_evidence": v.get("missing_evidence") or [],
+        }
+        for v in (verifications or [])
+    ]
+
+    # Evidence index: id + kind only — no full text to stay within token budget
+    evidence_index = [
+        {"id": e.get("id") or e.get("evidence_id"), "kind": e.get("kind")}
+        for e in (evidence or [])
+    ]
+
+    return [
+        {"role": "system", "content": (
+            "You are an evidence-gap analyst for a security audit. "
+            "Decide whether more KG evidence is necessary based on the current verification gaps. "
+            "Set needs_more_evidence=false when: evidence is sufficient for classification, "
+            "all remaining gaps are unqueryable from static CodeKG, all useful queries already executed, "
+            "or remaining uncertainty is unavoidable. "
+            "Set needs_more_evidence=true only when missing proof elements are: "
+            "necessary for classification, likely present in static CodeKG, and not already retrieved. "
+            "For each gap, set queryable=true only if a deterministic CodeKG query can realistically return "
+            "that evidence. Set queryable=false for runtime behavior, external invariants, or gaps that "
+            "static analysis cannot resolve. "
+            "When needs_more_evidence=false, set stop_reason_if_no_queries to one of: "
+            "no_more_evidence_needed | no_queryable_gaps | duplicate_queries_only | "
+            "all_hypotheses_resolved | no_new_evidence | insufficient_static_evidence. "
+            "Generate only deterministic CodeKG queries using the allowed forms. "
+            "Do not duplicate already-executed queries (by text or id). "
+            "Do not classify vulnerability status. Do not invent evidence."
+        )},
+        {"role": "user", "content": (
+            f"{COMMON_TAG_CONTRACT}\n\n"
+            f"ANSWER JSON SCHEMA:\n{schema_block(EvidenceGapPlan)}\n\n"
+            f"{_CODEKG_QUERY_FORMS}\n"
+            f"TARGET FUNCTION:\n{fn}\n\n"
+            f"ITERATION: {iteration}\n\n"
+            f"CURRENT VERIFICATION STATUSES:\n{compact_json(verif_summary, 8000)}\n\n"
+            f"ALREADY EXECUTED QUERY IDs (do not duplicate by id or text): {json.dumps(executed_query_ids)}\n\n"
+            f"EVIDENCE ID INDEX (already retrieved):\n{compact_json(evidence_index, 4000)}\n\n"
+            "For each gap: classify proof_element, set queryable=true/false with reasoning, "
+            "assign priority (high/medium/low). "
+            "Propose follow_up_queries only for queryable=true gaps with non-duplicate query texts. "
+            "Set needs_more_evidence=false with stop_reason_if_no_queries if no useful queries exist."
+        )},
+    ]
+
+
+def counter_gap_analysis_prompt(
+    sample: Dict[str, Any],
+    counter_findings: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+    executed_query_ids: List[str],
+    iteration: int = 1,
+) -> List[Dict[str, str]]:
+    # Stage 05_counter_gap_iter{N}: no sample/project metadata. Receives only
+    # the target function name, counter-review findings, evidence ID index, and
+    # already-executed query IDs.
+    fn = _target_function_name(sample)
+    findings_summary = [
+        {
+            "hypothesis_id": f.get("hypothesis_id"),
+            "refutes_or_weakens": f.get("refutes_or_weakens"),
+            "strongest_counterargument": f.get("strongest_counterargument"),
+        }
+        for f in (counter_findings or [])
+    ]
+    evidence_index = [
+        {"id": e.get("id") or e.get("evidence_id"), "kind": e.get("kind")}
+        for e in (evidence or [])
+    ]
+    return [
+        {"role": "system", "content": (
+            "You are a security defense analyst. Generate follow-up CodeKG queries to find "
+            "concrete counter-evidence: guards, early returns, range checks, caller constraints, "
+            "safe invariants, bounded allocation, or patched logic. "
+            "Do not classify vulnerability status. Avoid duplicating already-executed queries."
+        )},
+        {"role": "user", "content": (
+            f"{COMMON_TAG_CONTRACT}\n\n"
+            f"ANSWER JSON SCHEMA:\n{schema_block(EvidenceGapPlan)}\n\n"
+            f"{_CODEKG_QUERY_FORMS}\n"
+            f"TARGET FUNCTION:\n{fn}\n\n"
+            f"ITERATION: {iteration}\n\n"
+            f"COUNTER REVIEW FINDINGS:\n{compact_json(findings_summary, 8000)}\n\n"
+            f"ALREADY EXECUTED QUERY IDs (do not duplicate): {json.dumps(executed_query_ids)}\n\n"
+            f"EVIDENCE ID INDEX:\n{compact_json(evidence_index, 4000)}\n\n"
+            "Propose follow-up queries that may find positive counter-evidence of safety. "
+            "Return needs_more_evidence=false if none are needed."
         )},
     ]
 

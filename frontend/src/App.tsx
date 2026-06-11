@@ -16,6 +16,7 @@ import KGBuilderPage from "./pages/KGBuilderPage";
 import ResearchRunPage from "./pages/ResearchRunPage";
 import ResearchRunsPage from "./pages/ResearchRunsPage";
 import AgentTracePage from "./pages/AgentTracePage";
+import AgentFlowPage from "./pages/AgentFlowPage";
 import KGQueryFlowPage from "./pages/KGQueryFlowPage";
 
 export default function App() {
@@ -35,6 +36,7 @@ export default function App() {
         <Route path="/research/runs" element={<ResearchRunsPage />} />
         <Route path="/research/live/:jobId" element={<LiveDashboardPage />} />
         <Route path="/research/trace/:runId/:sampleId" element={<AgentTracePage />} />
+        <Route path="/research/flow/:runId/:sampleId" element={<AgentFlowPage />} />
         <Route path="/research/kg/:runId/:sampleId" element={<KGQueryFlowPage />} />
         <Route path="/validation" element={<ValidationPage />} />
         <Route path="/evaluation" element={<EvaluationPage />} />

@@ -105,3 +105,35 @@ class FinalDecision(BaseModel):
         else:
             self.prediction_bool = None
         return self
+
+
+class GapItem(BaseModel):
+    """One identified proof-element gap from the LLM gap-analysis stage."""
+    gap_id: str
+    hypothesis_id: str
+    proof_element: str  # input_control | dangerous_operation | missing_or_failed_guard | unsafe_use | security_impact | counter_evidence
+    missing_evidence: str
+    queryable: bool = True
+    why_queryable_or_not: str = ""
+    priority: str = "medium"  # high | medium | low
+    recommended_query_focus: str = ""
+
+
+class EvidenceGapPlan(BaseModel):
+    """Output of the evidence-gap-analysis LLM stage.
+
+    The LLM proposes follow-up KG queries to fill missing proof elements identified
+    during hypothesis verification. Used only when iterative_evidence_loop=True.
+
+    Backward-compatible: old artifacts without 'gaps'/'reason' still parse because
+    all new fields have defaults. The legacy 'gap_summary' field is kept optional.
+    """
+    needs_more_evidence: bool
+    reason: str = ""                          # preferred; maps to gap_summary for the LLM
+    gap_summary: str = ""                     # legacy alias; kept so old model outputs still parse
+    gaps: List[GapItem] = Field(default_factory=list)
+    follow_up_queries: List[KGQuery] = Field(default_factory=list)
+    # Machine-readable stop reason when needs_more_evidence=False or no queries proposed.
+    # Allows the backend to record why no loop happened without free-text parsing.
+    stop_reason_if_no_queries: Optional[str] = None
+    stop_reason: Optional[str] = None        # legacy alias

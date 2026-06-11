@@ -385,6 +385,10 @@ class ModelConfig(BaseModel):
     api_base: str | None = None
     api_key_env: str | None = None
     timeout_seconds: int = 120
+    # Max HTTP-level retries on transient read timeouts. 0 = no retry.
+    # 1 = one retry after the first timeout, then propagate. Only Timeout
+    # exceptions are retried; HTTP 4xx/5xx and JSON-parse errors are not.
+    llm_retry_on_timeout: int = 1
 
     # llama-server-specific. The recommended workflow is to start llama-server
     # externally and point server_url at it. Set server_start=true if you want
@@ -471,6 +475,15 @@ class AgenticProofRuntimeConfig(BaseModel):
     max_tokens_counter_evidence_review: int = 16384
     max_tokens_final_decision: int = 8192
     max_tokens_schema_repair: int = 4096
+    max_tokens_evidence_gap_analysis: int = 8192
+    iterative_evidence_loop: bool = False
+    max_evidence_iterations: int = 3
+    max_queries_per_iteration: int = 5
+    stop_when_no_new_evidence: bool = True
+    stop_when_no_new_queries: bool = True
+    stop_when_all_hypotheses_resolved: bool = True
+    enable_counter_evidence_loop: bool = False
+    max_counter_iterations: int = 2
 
 class APIQuotaConfig(BaseModel):
     """Provider-side quota contract used by the shared request scheduler.

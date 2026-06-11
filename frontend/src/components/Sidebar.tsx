@@ -13,6 +13,7 @@ const SECTIONS: { title: string; links: [string, string][] }[] = [
     links: [
       ["/research", "Run Audit"],
       ["/research/runs", "Audit Runs"],
+      ["/research/flow", "Agentic Flow"],
     ],
   },
   {

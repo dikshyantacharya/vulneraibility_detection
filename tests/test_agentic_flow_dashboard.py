@@ -1,0 +1,532 @@
+"""TDD tests for Agentic Flow dashboard endpoint and pipeline artifact writes.
+
+RED phase: all tests must fail before the fix is applied.
+GREEN phase: all tests must pass after the fix.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+from student_system_creator.dashboard.research import ResearchInventory
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_run(tmp_path: Path, run_id: str, sample_id: str, func_name: str = "myfunc") -> Path:
+    run_dir = tmp_path / "runs" / run_id
+    sample_dir = run_dir / "agent_demos" / f"sample_{sample_id}_{func_name}"
+    sample_dir.mkdir(parents=True)
+    return sample_dir
+
+
+def _make_inventory(tmp_path: Path) -> ResearchInventory:
+    return ResearchInventory(
+        project_root=tmp_path,
+        runs_root="runs",
+        jobs_root="jobs",
+    )
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# 1. flow() returns stages from model_calls.jsonl even without agent_flow.json
+# ---------------------------------------------------------------------------
+
+class TestFlowFromModelCallsJsonl:
+    def test_returns_non_empty_stages_from_model_calls_jsonl(self, tmp_path):
+        """flow() must return stages during a live run (no agent_flow.json yet)."""
+        sd = _make_run(tmp_path, "run1", "42")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "01_source_only_hypothesis",
+                "system_prompt": "You are a security analyst.",
+                "user_prompt": "Analyse this function.",
+                "messages": [
+                    {"role": "system", "content": "You are a security analyst."},
+                    {"role": "user", "content": "Analyse this function."},
+                ],
+                "response": '{"hypotheses": []}',
+                "elapsed_seconds": 1.2,
+                "finish_reason": "stop",
+                "was_truncated": False,
+                "requested_max_tokens": 16384,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        result = inv.flow("run1", "42")
+        assert result is not None, "flow() must not return None"
+        assert len(result["stages"]) == 1, "should have 1 stage from model_calls.jsonl"
+        stage = result["stages"][0]
+        assert stage["stage"] == "01_source_only_hypothesis"
+
+    def test_stage_includes_system_prompt(self, tmp_path):
+        """Stages must include system_prompt from model_calls.jsonl."""
+        sd = _make_run(tmp_path, "run2", "43")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "You are a security analyst.",
+             "user_prompt": "Analyse.", "messages": [], "response": "{}", "usage": {}}
+        ])
+        result = _make_inventory(tmp_path).flow("run2", "43")
+        stage = result["stages"][0]
+        assert stage.get("system_prompt") == "You are a security analyst."
+
+    def test_stage_includes_user_prompt_and_response(self, tmp_path):
+        """Stages must include user_prompt and response from model_calls.jsonl."""
+        sd = _make_run(tmp_path, "run3", "44")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "02_kg_query_planning", "system_prompt": "sys",
+             "user_prompt": "Plan queries.", "messages": [], "response": '{"queries": []}', "usage": {}}
+        ])
+        result = _make_inventory(tmp_path).flow("run3", "44")
+        stage = result["stages"][0]
+        assert stage.get("user_prompt") == "Plan queries."
+        assert stage.get("response") == '{"queries": []}'
+
+    def test_fallback_flag_set_when_no_agent_flow_json(self, tmp_path):
+        """flow() must set fallback=True when agent_flow.json is absent."""
+        sd = _make_run(tmp_path, "run4", "45")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "s", "user_prompt": "u",
+             "messages": [], "response": "{}", "usage": {}}
+        ])
+        result = _make_inventory(tmp_path).flow("run4", "45")
+        assert result["fallback"] is True
+
+
+# ---------------------------------------------------------------------------
+# 2. flow() returns explicit diagnostic when no artifacts exist
+# ---------------------------------------------------------------------------
+
+class TestFlowNoArtifacts:
+    def test_returns_data_not_none_when_sample_dir_exists_but_empty(self, tmp_path):
+        """flow() must not return None when sample dir exists but has no artifacts."""
+        _make_run(tmp_path, "run5", "46")
+        result = _make_inventory(tmp_path).flow("run5", "46")
+        assert result is not None
+        assert "stages" in result
+        assert result["stages"] == []
+
+    def test_no_artifacts_diagnostic_field(self, tmp_path):
+        """flow() should indicate there are no artifacts yet."""
+        _make_run(tmp_path, "run6", "47")
+        result = _make_inventory(tmp_path).flow("run6", "47")
+        assert result is not None
+        # Either explicit flag or just empty stages — never a 404 or None
+        assert isinstance(result.get("stages"), list)
+
+
+# ---------------------------------------------------------------------------
+# 3. flow() enriches agent_flow.json stages with model_calls content
+# ---------------------------------------------------------------------------
+
+class TestFlowEnrichesAgentFlowJson:
+    def test_agent_flow_json_stages_enriched_with_prompts(self, tmp_path):
+        """When agent_flow.json exists, its summary stages must be enriched with
+        full content from model_calls.jsonl."""
+        sd = _make_run(tmp_path, "run7", "48")
+        # Write agent_flow.json (summary only - as written by pipeline)
+        agent_flow = {
+            "sample_id": "48",
+            "loop_stop_reason": "loop_disabled",
+            "iterations_completed": 0,
+            "iterative_loop_enabled": False,
+            "stages": [
+                {"stage": "01_source_only_hypothesis", "status": "completed",
+                 "elapsed_seconds": 1.5, "finish_reason": "stop", "was_truncated": False,
+                 "requested_max_tokens": 16384, "prompt_chars": 200, "usage": {}},
+            ],
+            "iterations": [],
+            "total_evidence_items": 5,
+            "initial_evidence_items": 5,
+        }
+        (sd / "agent_flow.json").write_text(json.dumps(agent_flow), encoding="utf-8")
+        # Write model_calls.jsonl with full content
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis", "system_prompt": "Be a security analyst.",
+             "user_prompt": "Find vulnerabilities.", "messages": [{"role": "system", "content": "Be a security analyst."}],
+             "response": '{"hypotheses": ["buffer overflow"]}', "usage": {"total_tokens": 200}}
+        ])
+        result = _make_inventory(tmp_path).flow("run7", "48")
+        assert result is not None
+        stage = result["stages"][0]
+        assert stage.get("system_prompt") == "Be a security analyst."
+        assert stage.get("user_prompt") == "Find vulnerabilities."
+        assert "buffer overflow" in (stage.get("response") or "")
+
+    def test_agent_flow_json_iterations_merged_from_jsonl(self, tmp_path):
+        """evidence_iterations.jsonl should be merged when agent_flow.json has empty iterations."""
+        sd = _make_run(tmp_path, "run8", "49")
+        agent_flow = {
+            "sample_id": "49", "loop_stop_reason": None, "iterations_completed": 1,
+            "iterative_loop_enabled": True, "stages": [], "iterations": [],
+            "total_evidence_items": 8, "initial_evidence_items": 5,
+        }
+        (sd / "agent_flow.json").write_text(json.dumps(agent_flow), encoding="utf-8")
+        _write_jsonl(sd / "evidence_iterations.jsonl", [
+            {"iteration": 1, "phase": "hypothesis", "new_evidence_count": 3, "stop_reason": None}
+        ])
+        result = _make_inventory(tmp_path).flow("run8", "49")
+        assert len(result["iterations"]) == 1
+        assert result["iterations"][0]["iteration"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 4. flow() secret masking
+# ---------------------------------------------------------------------------
+
+class TestFlowSecretMasking:
+    def test_api_key_in_prompt_is_redacted(self, tmp_path):
+        """api_key values in model call content must be masked."""
+        sd = _make_run(tmp_path, "run9", "50")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis",
+             "system_prompt": "Call with api_key=SECRET123",
+             "user_prompt": "normal user prompt",
+             "messages": [{"role": "system", "content": "Call with api_key=SECRET123"}],
+             "response": "{}",
+             "usage": {"api_key": "SHOULD_BE_MASKED"},  # api_key in nested usage
+            }
+        ])
+        result = _make_inventory(tmp_path).flow("run9", "50")
+        result_str = json.dumps(result)
+        # api_key values in dict keys should be redacted
+        assert "SHOULD_BE_MASKED" not in result_str
+
+    def test_authorization_header_not_exposed(self, tmp_path):
+        """authorization values must never appear in flow() output."""
+        sd = _make_run(tmp_path, "run10", "51")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis",
+             "system_prompt": "sys",
+             "user_prompt": "user",
+             "messages": [],
+             "response": "{}",
+             "usage": {},
+             "authorization": "Bearer sk-secret-token",
+            }
+        ])
+        result = _make_inventory(tmp_path).flow("run10", "51")
+        result_str = json.dumps(result)
+        assert "sk-secret-token" not in result_str
+
+    def test_token_counts_not_redacted(self, tmp_path):
+        """Token counts (prompt_tokens, completion_tokens, total_tokens) must NOT be redacted."""
+        sd = _make_run(tmp_path, "run11", "52")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {"name": "01_source_only_hypothesis",
+             "system_prompt": "sys", "user_prompt": "user", "messages": [], "response": "{}",
+             "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            }
+        ])
+        result = _make_inventory(tmp_path).flow("run11", "52")
+        usage = result["stages"][0].get("usage") or {}
+        assert usage.get("total_tokens") == 150, "total_tokens must not be redacted"
+        assert usage.get("prompt_tokens") == 100
+
+
+# ---------------------------------------------------------------------------
+# 5. Route path consistency check
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 6. Dashboard job loop defaults — RED phase tests
+# ---------------------------------------------------------------------------
+
+class TestDashboardJobLoopDefaults:
+    """_research_argv() must inject agentic_proof loop defaults into effective config
+    so dashboard Research Audit runs enable the bounded iterative evidence loop
+    by default without requiring the base YAML to set it explicitly.
+    """
+
+    def _build_base_config(self, tmp_path: Path) -> Path:
+        """Write a minimal valid base config (agent.mode=agentic_proof) and return its path."""
+        cfg = {
+            "experiment": {"name": "test_run"},
+            "agent": {"mode": "agentic_proof"},
+            "agentic_proof": {"enabled": True},
+            "dataset": {"path": "data/raw/fake.arrow"},
+        }
+        p = tmp_path / "base.yaml"
+        import yaml
+        p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        return p
+
+    def _call_research_argv(self, tmp_path: Path, *, loop_params: dict | None = None) -> dict:
+        """Call _research_argv and return the effective_config as a parsed dict."""
+        import yaml
+        from student_system_creator.dashboard.jobs import _research_argv, JobContext
+
+        cfg_path = self._build_base_config(tmp_path)
+        job_dir = tmp_path / "job1"
+        job_dir.mkdir()
+        ctx = JobContext(project_root=tmp_path, default_config=str(cfg_path), default_challenge="challenge")
+        params: dict = {"config_path": str(cfg_path)}
+        if loop_params is not None:
+            params["loop"] = loop_params
+        try:
+            _research_argv(params, job_dir, ctx)
+        except Exception:
+            pass  # may fail on missing vckg validate — we only care about the written config
+        effective = job_dir / "effective_config.yaml"
+        if not effective.exists():
+            return {}
+        return yaml.safe_load(effective.read_text(encoding="utf-8")) or {}
+
+    def test_iterative_evidence_loop_enabled_by_default(self, tmp_path):
+        """Dashboard Research Audit effective config must have iterative_evidence_loop=True."""
+        cfg = self._call_research_argv(tmp_path)
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("iterative_evidence_loop") is True, (
+            f"iterative_evidence_loop must be True in effective config; got {ap}"
+        )
+
+    def test_enable_counter_evidence_loop_enabled_by_default(self, tmp_path):
+        """Dashboard Research Audit effective config must have enable_counter_evidence_loop=True."""
+        cfg = self._call_research_argv(tmp_path)
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("enable_counter_evidence_loop") is True, (
+            f"enable_counter_evidence_loop must be True in effective config; got {ap}"
+        )
+
+    def test_max_evidence_iterations_in_effective_config(self, tmp_path):
+        """Effective config must record max_evidence_iterations >= 2."""
+        cfg = self._call_research_argv(tmp_path)
+        ap = cfg.get("agentic_proof") or {}
+        assert (ap.get("max_evidence_iterations") or 0) >= 2, (
+            f"max_evidence_iterations must be >= 2; got {ap}"
+        )
+
+    def test_loop_can_be_disabled_via_ui_param(self, tmp_path):
+        """Passing loop={loop_enabled: False} must disable the loop."""
+        cfg = self._call_research_argv(tmp_path, loop_params={"loop_enabled": False})
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("iterative_evidence_loop") is False, (
+            f"iterative_evidence_loop must be False when UI disables it; got {ap}"
+        )
+
+    def test_ui_can_override_max_iterations(self, tmp_path):
+        """Passing loop={max_evidence_iterations: 5} must be reflected in effective config."""
+        cfg = self._call_research_argv(tmp_path, loop_params={"max_evidence_iterations": 5})
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("max_evidence_iterations") == 5, (
+            f"max_evidence_iterations override not applied; got {ap}"
+        )
+
+    def test_stop_when_no_new_evidence_enabled_by_default(self, tmp_path):
+        """stop_when_no_new_evidence must be True in effective config."""
+        cfg = self._call_research_argv(tmp_path)
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("stop_when_no_new_evidence") is True
+
+    def test_stop_when_no_new_queries_enabled_by_default(self, tmp_path):
+        """stop_when_no_new_queries must be True in effective config."""
+        cfg = self._call_research_argv(tmp_path)
+        ap = cfg.get("agentic_proof") or {}
+        assert ap.get("stop_when_no_new_queries") is True
+
+
+# ---------------------------------------------------------------------------
+# 7. EvidenceGapPlan richer schema — RED phase tests
+# ---------------------------------------------------------------------------
+
+class TestEvidenceGapPlanRicherSchema:
+    """EvidenceGapPlan must include structured gaps list and stop_reason_if_no_queries."""
+
+    def test_evidence_gap_plan_has_gaps_field(self):
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+        plan = EvidenceGapPlan(needs_more_evidence=False, reason="all resolved")
+        assert hasattr(plan, "gaps"), "EvidenceGapPlan must have 'gaps' field"
+        assert plan.gaps == []
+
+    def test_evidence_gap_plan_has_stop_reason_if_no_queries(self):
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+        plan = EvidenceGapPlan(
+            needs_more_evidence=False,
+            reason="no queryable gaps",
+            stop_reason_if_no_queries="no_queryable_gaps",
+        )
+        assert plan.stop_reason_if_no_queries == "no_queryable_gaps"
+
+    def test_evidence_gap_plan_has_reason_field(self):
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+        plan = EvidenceGapPlan(needs_more_evidence=False, reason="evidence sufficient")
+        assert plan.reason == "evidence sufficient"
+
+    def test_gap_item_has_queryable_field(self):
+        from vckg_agentic_proof.schemas import GapItem
+        g = GapItem(
+            gap_id="GAP-01",
+            hypothesis_id="HYP-01",
+            proof_element="input_control",
+            missing_evidence="no caller evidence",
+            queryable=False,
+            why_queryable_or_not="static KG has no callers indexed",
+        )
+        assert g.queryable is False
+
+    def test_gap_item_has_priority_field(self):
+        from vckg_agentic_proof.schemas import GapItem
+        g = GapItem(
+            gap_id="GAP-01",
+            hypothesis_id="HYP-01",
+            proof_element="dangerous_operation",
+            missing_evidence="no malloc size bound",
+            priority="high",
+        )
+        assert g.priority == "high"
+
+    def test_evidence_gap_plan_with_gaps_parses(self):
+        from vckg_agentic_proof.schemas import EvidenceGapPlan, GapItem
+        data = {
+            "needs_more_evidence": True,
+            "reason": "input control path unclear",
+            "gaps": [
+                {
+                    "gap_id": "GAP-01",
+                    "hypothesis_id": "HYP-01",
+                    "proof_element": "input_control",
+                    "missing_evidence": "caller origin unknown",
+                    "queryable": True,
+                    "why_queryable_or_not": "call_neighborhood can find callers",
+                    "priority": "high",
+                    "recommended_query_focus": "call_neighborhood",
+                }
+            ],
+            "follow_up_queries": [],
+            "stop_reason_if_no_queries": None,
+        }
+        plan = EvidenceGapPlan.model_validate(data)
+        assert plan.needs_more_evidence is True
+        assert len(plan.gaps) == 1
+        assert plan.gaps[0].queryable is True
+
+    def test_old_schema_without_gaps_still_parses(self):
+        """Backward compat: old gap plans without 'gaps' must still parse."""
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+        data = {
+            "needs_more_evidence": True,
+            "gap_summary": "missing guard check",
+            "follow_up_queries": [],
+            "stop_reason": None,
+        }
+        plan = EvidenceGapPlan.model_validate(data)
+        assert plan.needs_more_evidence is True
+        assert plan.gaps == []  # default empty list
+
+
+# ---------------------------------------------------------------------------
+# 8. Query-text deduplication — RED phase test
+# ---------------------------------------------------------------------------
+
+class TestQueryTextDedup:
+    """Follow-up queries with the same query_text (normalized) as an executed query
+    must be filtered even if they have a different query_id."""
+
+    def test_same_text_different_id_is_deduped(self):
+        from vckg_agentic_proof import AgenticProofConfig, run_agentic_proof_pipeline
+
+        import json
+
+        def _xml(data):
+            return f"<analysis>brief</analysis><answer>{json.dumps(data)}</answer>"
+
+        hyp = [{"hypothesis_id": "HYP-01", "title": "OOB", "risk_summary": "r",
+                "required_proof_questions": []}]
+        initial_q_text = 'security_context(target_function="foo", depth=3)'
+        stage_responses = {
+            "01_source_only_hypothesis": {"hypotheses": hyp, "source_observations": [],
+                                          "non_vulnerability_possibilities": []},
+            "02_kg_query_planning": {"queries": [
+                {"query_id": "Q1", "hypothesis_id": "HYP-01", "purpose": "p",
+                 "query_text": initial_q_text, "variables": [], "expected_evidence": "e", "limit": 8}
+            ]},
+            "04_hypothesis_verification": {
+                "verifications": [{
+                    "hypothesis_id": "HYP-01", "status": "plausible_but_unproven",
+                    "local_risk_present": False, "confirmed_security_vulnerability": False,
+                    "proof": {"input_control": "", "dangerous_operation": "",
+                              "missing_or_failed_guard": "", "unsafe_use": "",
+                              "security_impact": "", "cited_evidence_ids": []},
+                    "supporting_evidence_ids": [], "counter_evidence_ids": [],
+                    "missing_evidence": ["guard"], "explanation": "needs more",
+                }]
+            },
+            "04_evidence_gap_iter1": {
+                "needs_more_evidence": True,
+                "reason": "guard missing",
+                "gaps": [],
+                "follow_up_queries": [
+                    # SAME query_text as Q1, DIFFERENT id → must be deduped
+                    {"query_id": "NEWID-99", "hypothesis_id": "HYP-01",
+                     "purpose": "find guard",
+                     "query_text": initial_q_text,  # identical text
+                     "variables": [], "expected_evidence": "guard", "limit": 8}
+                ],
+                "stop_reason_if_no_queries": None,
+            },
+            "05_counter_evidence_review": {"findings": [], "overall_notes": ""},
+            "06_final_adjudication": {
+                "prediction": "inconclusive", "prediction_bool": None, "confidence": 0.4,
+                "local_risk_present": False, "confirmed_security_vulnerability": False,
+                "final_hypothesis_statuses": [], "minimum_vulnerability_proof": None,
+                "decisive_evidence_ids": [], "decisive_counter_evidence_ids": [],
+                "explanation": "insufficient", "limitations": [],
+            },
+        }
+
+        kg_call_count = [0]
+
+        def llm_generate(messages, *, stage, max_tokens, temperature, extra_body=None):
+            base = stage.split("_json_repair")[0]
+            data = stage_responses.get(stage) or stage_responses.get(base)
+            if data is None:
+                raise ValueError(f"Unexpected mock stage: {stage!r}")
+            return {"content": _xml(data), "usage": {}}
+
+        def kg_search(queries, *, sample=None, limit=8):
+            kg_call_count[0] += 1
+            return [{"id": f"EV-{kg_call_count[0]}", "kind": "source", "text": "x"}]
+
+        cfg = AgenticProofConfig(iterative_evidence_loop=True, max_evidence_iterations=2,
+                                 stop_when_no_new_queries=True)
+        run_agentic_proof_pipeline(
+            sample={"function": "foo"},
+            target_source="int foo(void){ return 0; }",
+            initial_evidence=[],
+            llm_generate=llm_generate,
+            kg_search=kg_search,
+            config=cfg,
+        )
+        # Only 1 kg_search call (initial Q1). The follow-up NEWID-99 has the same
+        # text → should be deduped so stop_when_no_new_queries fires.
+        assert kg_call_count[0] == 1, (
+            f"Expected 1 kg_search call (follow-up deduped by text); got {kg_call_count[0]}"
+        )
+
+class TestRoutePathConsistency:
+    def test_frontend_flow_api_path_matches_backend(self, tmp_path):
+        """The API path used by frontend research.flow() must match the backend route."""
+        frontend_api = Path(__file__).parents[1] / "frontend" / "src" / "api" / "research.ts"
+        assert frontend_api.exists(), "research.ts not found"
+        content = frontend_api.read_text(encoding="utf-8")
+        # Frontend: http<AgentFlow>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/flow`)
+        assert "/flow`" in content or "/flow`)" in content, \
+            "frontend research.flow() must use /flow path"
+        # Backend uses /api/research/runs/{run_id}/samples/{sample_id}/flow
+        backend_app = Path(__file__).parents[1] / "src" / "student_system_creator" / "dashboard" / "app.py"
+        app_content = backend_app.read_text(encoding="utf-8")
+        assert "/flow" in app_content, "backend must have /flow endpoint"
