@@ -57,10 +57,16 @@ export interface ResearchSample {
   dir: string;
   function_name?: string;
   prediction?: string | null;
+  prediction_bool?: boolean | null;
+  prediction_available?: boolean;
   confidence?: number;
   decision_status?: string;
   resolved_commit?: string;
   model_backend?: string;
+  // Admin-only enriched fields
+  true_label?: string | null;
+  result?: "correct" | "incorrect" | "inconclusive" | "failed" | "unknown" | null;
+  error_type?: "tp" | "tn" | "fp" | "fn" | null;
 }
 
 export interface KGDashboardCandidate {
@@ -88,7 +94,7 @@ export const research = {
   candidates: (limit = 500) => http<Candidate[]>(`/candidates?limit=${limit}`),
   runs: () => http<ResearchRun[]>("/runs"),
   run: (id: string) => http<any>(`/runs/${encodeURIComponent(id)}`),
-  samples: (id: string) => http<ResearchSample[]>(`/runs/${encodeURIComponent(id)}/samples`),
+  samples: (id: string, mode = "admin") => http<ResearchSample[]>(`/runs/${encodeURIComponent(id)}/samples?mode=${mode}`),
   sample: (run: string, s: string) => http<any>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}`),
   trace: (run: string, s: string) => http<any>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/agent-trace`),
   llmCalls: (run: string, s: string) => http<any[]>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/llm-calls`),
@@ -134,6 +140,32 @@ export interface RunKG {
   reuse_cache?: boolean;
   force_rebuild?: boolean;
 }
+export interface RunMetrics {
+  available?: boolean;
+  // Live-computed fields (always present when computed from samples)
+  total?: number;
+  completed?: number;
+  failed?: number;
+  inconclusive?: number;
+  correct?: number;
+  incorrect?: number;
+  // Confusion matrix counts
+  tp?: number | null;
+  fp?: number | null;
+  tn?: number | null;
+  fn?: number | null;
+  // Classification metrics (null when denominator is zero)
+  accuracy?: number | null;
+  precision?: number | null;
+  recall?: number | null;
+  f1?: number | null;
+  specificity?: number | null;
+  // Diagnostic for all-inconclusive / no-labels cases
+  diagnostic?: string | null;
+  // Legacy fields from metrics.json binary section
+  n?: number;
+}
+
 export interface RunSummary {
   run_id: string;
   config_name?: string;
@@ -147,9 +179,11 @@ export interface RunSummary {
   samples_requested: number;
   samples_completed: number;
   samples_failed: number;
-  metrics?: Record<string, number> | null;
+  samples_pending?: number;
+  metrics?: RunMetrics | null;
   metrics_available: boolean;
   metrics_reason?: string;
+  metrics_note?: string | null;
 }
 export interface LiveMetrics {
   available: boolean;
@@ -223,6 +257,20 @@ export interface FlowStage {
   parse_error?: string | null;
   validation_error?: string | null;
   repair_status?: string | null;
+}
+
+export interface ForcedBinaryDecision {
+  /** Always "vulnerable" | "fixed/non-vulnerable" — never null once validator runs */
+  forced_prediction?: string | null;
+  forced_prediction_bool?: boolean | null;
+  /** confirmed_vulnerable | confirmed_non_vulnerable | forced_binary_vulnerable | forced_binary_non_vulnerable */
+  decision_status?: string | null;
+  /** confirmed | likely | weak | insufficient_static_evidence */
+  evidence_strength?: string | null;
+  residual_uncertainty?: string[];
+  why_forced_binary?: string | null;
+  evidence_exhausted?: boolean;
+  loop_stop_reason?: string | null;
 }
 
 export interface IterationSummary {

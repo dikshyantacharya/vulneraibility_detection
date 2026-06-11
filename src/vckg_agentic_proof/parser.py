@@ -101,8 +101,8 @@ def build_json_repair_prompt(raw_text: str, answer_text: Optional[str], schema_n
 def parse_model_object(raw_text: str, model_cls: Type[T], *, llm_repair: Optional[Callable[[list[dict[str, str]]], str]] = None) -> tuple[T, ParsedTaggedJson]:
     try:
         parsed = parse_json_answer(raw_text)
-        return model_cls.model_validate(parsed.parsed), parsed
-    except Exception:
+    except TaggedJsonParseError:
+        # JSON is malformed — attempt LLM repair if a repair callback was supplied.
         if llm_repair is None:
             raise
         _, answer_text = extract_answer_text(raw_text)
@@ -111,3 +111,5 @@ def parse_model_object(raw_text: str, model_cls: Type[T], *, llm_repair: Optiona
         repaired = parse_json_answer(repaired_text)
         repaired.used_repair = True
         return model_cls.model_validate(repaired.parsed), repaired
+    # JSON parsed successfully — let Pydantic schema failures propagate without repair.
+    return model_cls.model_validate(parsed.parsed), parsed

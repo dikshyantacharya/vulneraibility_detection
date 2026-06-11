@@ -722,8 +722,8 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         return research.run_live_metrics(run_id, mode)  # type: ignore[arg-type]
 
     @app.get("/api/research/runs/{run_id}/samples")
-    def research_run_samples(run_id: str) -> list[dict[str, Any]]:
-        return research.list_samples(run_id)
+    def research_run_samples(run_id: str, mode: str = Query("admin")) -> list[dict[str, Any]]:
+        return research.list_samples(run_id, mode)  # type: ignore[arg-type]
 
     @app.get("/api/research/runs/{run_id}/samples/{sample_id}/normalized")
     def research_sample_normalized(run_id: str, sample_id: str, mode: str = Query("admin")) -> dict[str, Any]:

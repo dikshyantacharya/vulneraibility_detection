@@ -756,3 +756,336 @@ class TestFrontendAgentFlowTypes:
         root = Path(__file__).resolve().parents[1]
         page = root / "frontend" / "src" / "pages" / "AgentFlowPage.tsx"
         assert page.exists(), "frontend/src/pages/AgentFlowPage.tsx must exist"
+
+
+# ---------------------------------------------------------------------------
+# M. Tests: stage-07 fallback, partial agent_flow.json on failure
+# ---------------------------------------------------------------------------
+
+class TestStage07FallbackAndPartialArtifacts:
+    """Stage-07 schema consistency repair must fall back to stage-06 validated
+    decision on failure, not crash the whole sample."""
+
+    def _make_sample_dict(self):
+        return {
+            "function": "vuln_fn",
+            "filepath": "src/vuln.c",
+            "func_body": "int vuln_fn(int x) { return x; }",
+        }
+
+    def _run_adapter_with_stage07_failure(self):
+        """Run adapter where stage-07 repair throws, verify fallback to stage-06."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        sample = self._make_sample_dict()
+        config = AgenticProofConfig(
+            max_tokens_source_only_hypothesis=512,
+            max_tokens_kg_query_planning=256,
+            max_tokens_hypothesis_verification=512,
+            max_tokens_counter_evidence_review=256,
+            max_tokens_final_decision=512,
+            max_tokens_schema_repair=256,
+            iterative_evidence_loop=False,
+        )
+
+        repair_attempt = {"triggered": False}
+
+        stage_responses = {
+            "01_source_only_hypothesis": json.dumps({
+                "hypotheses": [{"hypothesis_id": "HYP-01", "title": "t",
+                                "risk_summary": "r", "required_proof_questions": []}]
+            }),
+            "02_kg_query_planning": json.dumps({"queries": []}),
+            "04_hypothesis_verification": json.dumps({"verifications": [
+                {"hypothesis_id": "HYP-01", "status": "insufficient_evidence",
+                 "local_risk_present": True, "confirmed_security_vulnerability": False,
+                 "proof": {"input_control": "", "dangerous_operation": "",
+                           "missing_or_failed_guard": "", "unsafe_use": "",
+                           "security_impact": "", "cited_evidence_ids": []},
+                 "supporting_evidence_ids": [], "counter_evidence_ids": [],
+                 "missing_evidence": [], "explanation": "insufficient"}
+            ]}),
+            "05_counter_evidence_review": json.dumps({"findings": [], "overall_notes": ""}),
+            # Vulnerable without proof triggers validator downgrade → modified=True → stage 07
+            "06_final_adjudication": json.dumps({
+                "prediction": "vulnerable",
+                "confidence": 0.9,
+                "local_risk_present": True,
+                "confirmed_security_vulnerability": True,
+                "final_hypothesis_statuses": [],
+                "minimum_vulnerability_proof": None,
+                "decisive_evidence_ids": [],
+                "decisive_counter_evidence_ids": [],
+                "explanation": "test",
+                "limitations": [],
+            }),
+        }
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            if stage.startswith("07_schema_consistency_repair"):
+                repair_attempt["triggered"] = True
+                raise RuntimeError("Simulated repair LLM failure")
+            base = stage.split("_json_repair")[0]
+            resp = stage_responses.get(stage) or stage_responses.get(base)
+            if resp is None:
+                raise ValueError(f"Unexpected stage in mock: {stage!r}")
+            return resp
+
+        result = run_agentic_proof_pipeline(
+            sample=sample,
+            target_source="int vuln_fn(int x) { return x; }",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=config,
+        )
+        return result, repair_attempt
+
+    def test_stage07_fallback_returns_result_not_exception(self):
+        """run_agentic_proof_pipeline must return a result (not raise) when stage-07 fails."""
+        result, _ = self._run_adapter_with_stage07_failure()
+        assert result is not None, "Pipeline must return a result even when stage-07 repair fails"
+        assert result.decision is not None, "Decision must not be None after stage-07 fallback"
+
+    def test_stage07_fallback_decision_is_binary(self):
+        """After stage-07 fallback, the returned decision must have a binary forced_prediction."""
+        result, _ = self._run_adapter_with_stage07_failure()
+        d = result.decision
+        assert d.forced_prediction in ("vulnerable", "fixed/non-vulnerable"), (
+            f"forced_prediction must be binary after fallback, got {d.forced_prediction!r}"
+        )
+        assert d.forced_prediction_bool is not None, (
+            "forced_prediction_bool must not be None after fallback"
+        )
+
+    def test_stage07_fallback_event_recorded(self):
+        """After stage-07 fallback, the events list must contain a fallback event."""
+        result, repair_attempt = self._run_adapter_with_stage07_failure()
+        fallback_events = [
+            e for e in result.events
+            if getattr(e, "stage", None) == "07_schema_consistency_repair"
+            and getattr(e, "event", None) == "fallback"
+        ]
+        if repair_attempt["triggered"]:
+            assert fallback_events, (
+                "A fallback AgentEvent must be recorded when stage-07 fails. "
+                f"Found events: {[(getattr(e,'stage',None), getattr(e,'event_type',None)) for e in result.events]}"
+            )
+
+
+class TestForcedBinarySchemaFields:
+    """FinalDecision schema must contain all forced binary fields."""
+
+    def test_final_decision_has_forced_prediction_field(self):
+        from vckg_agentic_proof.schemas import FinalDecision
+        import inspect
+        fields = FinalDecision.model_fields if hasattr(FinalDecision, "model_fields") else {}
+        assert "forced_prediction" in fields or hasattr(FinalDecision(
+            prediction="fixed/non-vulnerable", confidence=0.5, explanation="x"
+        ), "forced_prediction"), "FinalDecision must have forced_prediction field"
+
+    def test_final_decision_has_decision_status_field(self):
+        from vckg_agentic_proof.schemas import FinalDecision
+        fd = FinalDecision(prediction="fixed/non-vulnerable", confidence=0.5, explanation="x")
+        assert hasattr(fd, "decision_status"), "FinalDecision must have decision_status field"
+
+    def test_final_decision_has_evidence_strength_field(self):
+        from vckg_agentic_proof.schemas import FinalDecision
+        fd = FinalDecision(prediction="fixed/non-vulnerable", confidence=0.5, explanation="x")
+        assert hasattr(fd, "evidence_strength"), "FinalDecision must have evidence_strength field"
+
+    def test_final_decision_has_why_forced_binary_field(self):
+        from vckg_agentic_proof.schemas import FinalDecision
+        fd = FinalDecision(prediction="fixed/non-vulnerable", confidence=0.5, explanation="x")
+        assert hasattr(fd, "why_forced_binary"), "FinalDecision must have why_forced_binary field"
+
+
+class TestPromptNoBinaryForbidden:
+    """Final adjudication prompt must not instruct the model to prefer inconclusive."""
+
+    def _get_prompt_text(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+        from vckg_agentic_proof import prompts
+        import inspect
+        return inspect.getsource(prompts)
+
+    def test_final_adjudication_prompt_no_prefer_inconclusive(self):
+        src = self._get_prompt_text()
+        assert "prefer inconclusive" not in src, (
+            "final_decision_prompt must not instruct the model to 'prefer inconclusive'. "
+            "Binary prediction is required."
+        )
+
+    def test_final_adjudication_prompt_requires_binary(self):
+        src = self._get_prompt_text()
+        assert "binary prediction" in src.lower() or "MUST produce" in src, (
+            "final_decision_prompt must instruct the model to produce a binary prediction."
+        )
+
+    def test_consistency_repair_prompt_no_choose_inconclusive(self):
+        src = self._get_prompt_text()
+        assert "choose inconclusive" not in src, (
+            "consistency_repair_prompt must not suggest choosing inconclusive. "
+            "Binary prediction is required."
+        )
+
+
+class TestStage06RecoveryAndRepairRouting:
+    """Stage 06 must not crash the pipeline when JSON parse or schema validation fails.
+    JSON repair must only fire for malformed JSON, not for schema failures."""
+
+    def _base_stage_responses(self, stage06_response: str) -> dict:
+        return {
+            "01_source_only_hypothesis": json.dumps({
+                "hypotheses": [{"hypothesis_id": "HYP-01", "title": "t",
+                                "risk_summary": "r", "required_proof_questions": []}]
+            }),
+            "02_kg_query_planning": json.dumps({"queries": []}),
+            "04_hypothesis_verification": json.dumps({"verifications": [
+                {"hypothesis_id": "HYP-01", "status": "insufficient_evidence",
+                 "local_risk_present": False, "confirmed_security_vulnerability": False,
+                 "proof": {"input_control": "", "dangerous_operation": "",
+                           "missing_or_failed_guard": "", "unsafe_use": "",
+                           "security_impact": "", "cited_evidence_ids": []},
+                 "supporting_evidence_ids": [], "counter_evidence_ids": [],
+                 "missing_evidence": [], "explanation": "none"}
+            ]}),
+            "05_counter_evidence_review": json.dumps({"findings": [], "overall_notes": ""}),
+            "06_final_adjudication": stage06_response,
+        }
+
+    def _run_pipeline(self, stage06_response: str):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        config = AgenticProofConfig(
+            max_tokens_source_only_hypothesis=512,
+            max_tokens_kg_query_planning=256,
+            max_tokens_hypothesis_verification=512,
+            max_tokens_counter_evidence_review=256,
+            max_tokens_final_decision=512,
+            max_tokens_schema_repair=256,
+            iterative_evidence_loop=False,
+        )
+        stage_responses = self._base_stage_responses(stage06_response)
+        json_repair_stages = []
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            if "_json_repair" in stage:
+                json_repair_stages.append(stage)
+            base = stage.split("_json_repair")[0]
+            resp = stage_responses.get(stage) or stage_responses.get(base)
+            if resp is None:
+                return json.dumps({"findings": [], "overall_notes": ""})
+            return resp
+
+        result = run_agentic_proof_pipeline(
+            sample={"function": "fn", "filepath": "f.c", "func_body": "int fn(){}"},
+            target_source="int fn(){}",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=config,
+        )
+        return result, json_repair_stages
+
+    def test_stage06_schema_failure_does_not_crash_pipeline(self):
+        """Pipeline must return a result (not raise) when Stage 06 output fails schema."""
+        result, _ = self._run_pipeline(
+            json.dumps({"completely_wrong_schema": "this is not a FinalDecision"})
+        )
+        assert result is not None, "Pipeline must not raise when Stage 06 schema validation fails"
+        assert result.decision is not None, "Decision must not be None after Stage 06 schema failure"
+
+    def test_stage06_schema_failure_sets_failed_parse_status(self):
+        """decision_status must be 'failed_parse' when Stage 06 schema validation fails."""
+        result, _ = self._run_pipeline(
+            json.dumps({"completely_wrong_schema": True})
+        )
+        assert result.decision.decision_status == "failed_parse", (
+            f"Expected 'failed_parse', got {result.decision.decision_status!r}"
+        )
+
+    def test_stage06_schema_failure_produces_no_json_repair_stage(self):
+        """Valid JSON with schema failure must NOT produce a '06_final_adjudication_json_repair' stage."""
+        result, json_repair_stages = self._run_pipeline(
+            json.dumps({"wrong_schema": "valid json, bad schema"})
+        )
+        assert "06_final_adjudication_json_repair" not in json_repair_stages, (
+            "json_repair must not fire for schema validation failures. "
+            f"Fired stages: {json_repair_stages}"
+        )
+
+    def test_stage06_malformed_json_triggers_json_repair(self):
+        """Malformed JSON in Stage 06 must trigger '06_final_adjudication_json_repair'."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        config = AgenticProofConfig(
+            max_tokens_source_only_hypothesis=512,
+            max_tokens_kg_query_planning=256,
+            max_tokens_hypothesis_verification=512,
+            max_tokens_counter_evidence_review=256,
+            max_tokens_final_decision=512,
+            max_tokens_schema_repair=256,
+            iterative_evidence_loop=False,
+        )
+
+        valid_final_decision = json.dumps({
+            "prediction": "fixed/non-vulnerable",
+            "confidence": 0.8,
+            "local_risk_present": False,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "repaired",
+            "limitations": [],
+        })
+
+        stage_responses = self._base_stage_responses("<answer>{prediction: malformed</answer>")
+        json_repair_stages = []
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            if "_json_repair" in stage:
+                json_repair_stages.append(stage)
+                return f"<answer>{valid_final_decision}</answer>"
+            base = stage.split("_json_repair")[0]
+            resp = stage_responses.get(stage) or stage_responses.get(base)
+            if resp is None:
+                return json.dumps({"findings": [], "overall_notes": ""})
+            return resp
+
+        result = run_agentic_proof_pipeline(
+            sample={"function": "fn", "filepath": "f.c", "func_body": "int fn(){}"},
+            target_source="int fn(){}",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=config,
+        )
+        assert result is not None
+        assert "06_final_adjudication_json_repair" in json_repair_stages, (
+            "Malformed JSON in Stage 06 must trigger json_repair. "
+            f"Got json_repair_stages={json_repair_stages}"
+        )
+
+    def test_stage06_fallback_decision_is_not_counted_as_valid_binary(self):
+        """An emergency fallback decision from a failed Stage 06 must have
+        decision_status='failed_parse' so it is excluded from binary metrics."""
+        result, _ = self._run_pipeline(
+            json.dumps({"garbage": "not a FinalDecision"})
+        )
+        d = result.decision
+        assert d.decision_status == "failed_parse", (
+            f"Emergency fallback must set decision_status='failed_parse', got {d.decision_status!r}"
+        )
+        assert d.confidence == 0.0, (
+            f"Emergency fallback must have confidence=0.0, got {d.confidence!r}"
+        )

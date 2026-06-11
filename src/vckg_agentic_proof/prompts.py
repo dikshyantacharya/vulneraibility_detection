@@ -235,13 +235,16 @@ def final_decision_prompt(
     fn = _target_function_name(sample)
     return [
         {"role": "system", "content": (
-            "Final adjudicator. Decide vulnerable only if at least one hypothesis remains "
-            "confirmed_vulnerability after counter-evidence and has a complete cited minimum proof. "
+            "Final adjudicator. You MUST produce a binary prediction: vulnerable or fixed/non-vulnerable. "
+            "Inconclusive is NOT allowed as a final prediction — the pipeline will force a binary choice "
+            "anyway, so choose the most evidence-supported class explicitly. "
+            "Decide vulnerable only if at least one hypothesis remains confirmed_vulnerability after "
+            "counter-evidence and has a complete cited minimum proof. "
             "Decide fixed/non-vulnerable only when there is positive counter-evidence of safety: "
             "a guard, caller constraint, patched logic, safe invariant, or unreachable dangerous path. "
-            "If local risk exists but the proof is incomplete and there is no positive safety evidence, "
-            "prefer inconclusive. Keep local suspiciousness separate from confirmed vulnerability. "
-            "Lack of proof should produce inconclusive unless positive counter-evidence supports safety."
+            "If proof is incomplete but local risk is present, choose vulnerable with lower confidence. "
+            "If risk is speculative and counter-evidence dominates, choose fixed/non-vulnerable. "
+            "Keep local suspiciousness separate from confirmed vulnerability. Always cite evidence IDs."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -381,8 +384,10 @@ def consistency_repair_prompt(decision: Dict[str, Any], validation_notes: List[s
         {"role": "system", "content": (
             "Repair final-decision consistency only. You may downgrade unsupported vulnerability claims. "
             "You must not upgrade to vulnerable. Do not add new evidence. "
-            "If validator notes say proof is incomplete, choose fixed/non-vulnerable when the existing "
-            "decision/counter-evidence indicates safety; otherwise choose inconclusive."
+            "You MUST produce a binary prediction: vulnerable or fixed/non-vulnerable. "
+            "Inconclusive is NOT allowed. If validator notes say proof is incomplete, choose "
+            "fixed/non-vulnerable when existing counter-evidence indicates safety; otherwise choose "
+            "vulnerable with lower confidence to reflect the unresolved uncertainty."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"

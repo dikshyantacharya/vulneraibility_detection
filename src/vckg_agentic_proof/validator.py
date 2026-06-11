@@ -145,5 +145,35 @@ def validate_final_decision(
         decision.confirmed_security_vulnerability = False
         if decision.confidence > 0.95:
             decision.confidence = 0.95; modified = True
+
+    # Always populate forced binary fields so benchmark scoring always has a
+    # definitive True/False regardless of internal evidence status.
+    if decision.prediction == FinalPrediction.vulnerable:
+        decision.forced_prediction = "vulnerable"
+        decision.forced_prediction_bool = True
+        decision.decision_status = "confirmed_vulnerable"
+        decision.evidence_strength = "confirmed"
+    elif decision.prediction == FinalPrediction.fixed_or_non_vulnerable:
+        decision.forced_prediction = "fixed/non-vulnerable"
+        decision.forced_prediction_bool = False
+        decision.decision_status = "confirmed_non_vulnerable"
+        decision.evidence_strength = "confirmed" if decision.confidence >= 0.80 else "likely"
+    else:  # inconclusive — choose the more evidence-supported class
+        if decision.local_risk_present:
+            decision.forced_prediction = "vulnerable"
+            decision.forced_prediction_bool = True
+            decision.decision_status = "forced_binary_vulnerable"
+        else:
+            decision.forced_prediction = "fixed/non-vulnerable"
+            decision.forced_prediction_bool = False
+            decision.decision_status = "forced_binary_non_vulnerable"
+        decision.evidence_strength = "insufficient_static_evidence"
+        if not decision.why_forced_binary:
+            decision.why_forced_binary = (
+                "Evidence incomplete after bounded loop; forced binary chosen by "
+                "local_risk_present heuristic."
+            )
+        decision.evidence_exhausted = True
+
     decision.normalize_prediction_bool()
     return decision, notes, modified

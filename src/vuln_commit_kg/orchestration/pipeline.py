@@ -534,6 +534,23 @@ class CommitKGPipeline:
                             self.logger.exception("Parallel sample failed: %s %s", sample.sample_id, sample.display_name)
                             with self.write_lock:
                                 append_jsonl(self.run_dir / "failed_samples.jsonl", {"sample_id": sample.sample_id, "display_name": sample.display_name, "error": str(exc)})
+                                try:
+                                    _par_sd = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}"
+                                    _par_fp = _par_sd / "final_prediction.json"
+                                    if not _par_fp.exists():
+                                        _par_sd.mkdir(parents=True, exist_ok=True)
+                                        _par_fp.write_text(json.dumps({
+                                            "sample_id": str(sample.sample_id),
+                                            "is_vulnerable": False,
+                                            "confidence": 0.0,
+                                            "decision_status": "failed_parse",
+                                            "parse_error": f"{type(exc).__name__}: {exc}",
+                                            "error_type": type(exc).__name__,
+                                            "binary_prediction_policy": "sample failed before final prediction",
+                                            "reasoning_summary": f"Sample failed: {type(exc).__name__}: {exc}",
+                                        }, ensure_ascii=False), encoding="utf-8")
+                                except Exception:
+                                    pass
                             if self.live:
                                 self.live.update_sample(sample.sample_id, {"sample_id": sample.sample_id, "project": sample.project, "filepath": sample.filepath, "function": sample.func_name, "status": "failed", "agent_stage": "failed", "error": str(exc)})
                             progress.update(extra=f"sample={sample.sample_id} failed")
@@ -762,6 +779,73 @@ class CommitKGPipeline:
                         self.run_dir / "failed_samples.jsonl",
                         {"sample_id": sample.sample_id, "display_name": sample.display_name, "error": str(exc)},
                     )
+                    # Write partial agent_flow.json so Agentic Flow UI can show
+                    # completed stages and failure reason for failed/partial runs.
+                    try:
+                        _partial_sd = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name}"
+                        _partial_mc_path = _partial_sd / "model_calls.jsonl"
+                        _partial_calls: list[dict] = []
+                        if _partial_mc_path.exists():
+                            for _line in _partial_mc_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                                _line = _line.strip()
+                                if _line:
+                                    try:
+                                        _partial_calls.append(json.loads(_line))
+                                    except Exception:
+                                        pass
+                            # Enrich any unenriched call records so UI shows correct parse badges.
+                            for _pc in _partial_calls:
+                                _enrich_call_parse_result(_pc)
+                            _partial_mc_path.write_text(
+                                "\n".join(json.dumps(c, ensure_ascii=False, default=str) for c in _partial_calls) + "\n",
+                                encoding="utf-8",
+                            )
+                        _partial_flow_path = _partial_sd / "agent_flow.json"
+                        if not _partial_flow_path.exists():
+                            _partial_sd.mkdir(parents=True, exist_ok=True)
+                            _partial_flow_path.write_text(
+                                json.dumps({
+                                    "sample_id": sample.sample_id,
+                                    "loop_stop_reason": "sample_failed",
+                                    "iterations_completed": 0,
+                                    "iterative_loop_enabled": False,
+                                    "partial": True,
+                                    "failure_error": str(exc),
+                                    "stages": [
+                                        {
+                                            "stage": c.get("name"),
+                                            "status": "failed" if c.get("error") else "completed",
+                                            "elapsed_seconds": c.get("elapsed_seconds"),
+                                            "finish_reason": c.get("finish_reason"),
+                                            "was_truncated": c.get("was_truncated", False),
+                                        }
+                                        for c in _partial_calls
+                                        if c.get("name") not in ("final_decision",)
+                                    ],
+                                    "iterations": [],
+                                }, indent=2, ensure_ascii=False, default=str),
+                                encoding="utf-8",
+                            )
+                        # Write a minimal final_prediction.json so the dashboard can
+                        # display failure details rather than "Prediction: not available".
+                        _partial_fp_path = _partial_sd / "final_prediction.json"
+                        if not _partial_fp_path.exists():
+                            _partial_sd.mkdir(parents=True, exist_ok=True)
+                            _partial_fp_path.write_text(
+                                json.dumps({
+                                    "sample_id": str(sample.sample_id),
+                                    "is_vulnerable": False,
+                                    "confidence": 0.0,
+                                    "decision_status": "failed_parse",
+                                    "parse_error": f"{type(exc).__name__}: {exc}",
+                                    "error_type": type(exc).__name__,
+                                    "binary_prediction_policy": "sample failed before final prediction",
+                                    "reasoning_summary": f"Sample failed: {type(exc).__name__}: {exc}",
+                                }, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
+                    except Exception:
+                        pass
                     if self.live:
                         self.live.update_sample(sample.sample_id, {"sample_id": sample.sample_id, "project": sample.project, "filepath": sample.filepath, "function": sample.func_name, "status": "failed", "agent_stage": "failed", "error": str(exc)})
                         self.live.event("sample.failed", {"sample_id": sample.sample_id, "error": str(exc)})
@@ -1250,7 +1334,7 @@ class CommitKGPipeline:
             primary_vulnerability_type=(decision.minimum_vulnerability_proof.dangerous_operation if decision.minimum_vulnerability_proof else None),
             vuln_statements=[],
             evidence_used=list(decision.decisive_evidence_ids or []),
-            decision_status=decision.prediction.value,
+            decision_status=decision.decision_status or decision.prediction.value,
             binary_prediction_policy="agentic_proof: vulnerable requires complete minimum proof after counter-evidence review",
             reasoning_summary=decision.explanation,
             model_backend=self.cfg.model.backend,

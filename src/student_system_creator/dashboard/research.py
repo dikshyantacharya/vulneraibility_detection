@@ -64,6 +64,36 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+_ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.I | re.S)
+
+
+def _infer_parse_status_for_call(c: dict[str, Any]) -> str | None:
+    """Infer parse_status from raw response text when pipeline enrichment didn't run.
+
+    Called by flow() and flow_report() as a fallback for call records that still
+    have json_status='raw_agentic_proof_pending_parse' (i.e., the post-pipeline
+    enrichment pass was skipped because the run failed mid-way).
+    """
+    stored = c.get("parse_status")
+    if stored:
+        return stored
+    # Synthetic final_decision record is always valid.
+    if c.get("name") == "final_decision" or c.get("json_status") == "json_ok":
+        return "valid"
+    if c.get("error") or not (c.get("response") or "").strip():
+        return "failed"
+    response = c.get("response") or ""
+    m = _ANSWER_RE.search(response)
+    if m:
+        try:
+            json.loads(m.group(1))
+            return "valid"
+        except Exception:
+            return "invalid"
+    # No <answer> tag — plain-text or non-JSON response.
+    return "text_only" if response.strip() else None
+
+
 def _mask_secrets(obj: Any) -> Any:
     if isinstance(obj, dict):
         masked = {}
@@ -83,6 +113,10 @@ def _mask_secrets(obj: Any) -> Any:
 _INCOMPLETE_STATUSES = {"running", "in_progress", "in progress", "pending",
                         "agent_loop_start", "started", ""}
 
+# Decision-status substrings that mark a prediction as inconclusive (complete
+# but not definitively classified as vulnerable or safe).
+_INCONCLUSIVE_HINTS = ("inconclusive",)
+
 
 def _prediction_is_available(fp: dict[str, Any] | None) -> bool:
     """True only if final_prediction holds a real decision (not a placeholder).
@@ -98,7 +132,165 @@ def _prediction_is_available(fp: dict[str, Any] | None) -> bool:
     if fp.get("parse_error"):
         # parse failures are completed-but-invalid; still not a usable prediction
         return False
-    return fp.get("is_vulnerable") is not None
+    # is_vulnerable is set for definitive predictions; forced_prediction_bool covers
+    # inconclusive predictions that got a forced binary choice from the validator.
+    return fp.get("is_vulnerable") is not None or fp.get("forced_prediction_bool") is not None
+
+
+def _is_inconclusive_status(status: str) -> bool:
+    s = status.strip().lower()
+    return any(h in s for h in _INCONCLUSIVE_HINTS)
+
+
+def _classify_sample(fp: dict[str, Any], sample: dict[str, Any]) -> tuple[str, str | None, str]:
+    """Return (result, error_type, outcome) for one completed prediction.
+
+    result   : "correct" | "incorrect" | "inconclusive" | "unknown"
+    error_type: "tp" | "tn" | "fp" | "fn" | None
+    outcome  : "TP" | "TN" | "FP" | "FN" | "inconclusive" | "unknown"
+    """
+    decision_status = str(fp.get("decision_status") or "")
+    if _is_inconclusive_status(decision_status):
+        # Use forced_prediction_bool if the validator produced a binary forced choice.
+        forced = fp.get("forced_prediction_bool")
+        if forced is None:
+            return "inconclusive", None, "inconclusive"
+        # Fall through with forced binary prediction for TP/TN/FP/FN scoring.
+        true_is_vuln = sample.get("is_vulnerable")
+        if true_is_vuln is None:
+            return "unknown", None, "unknown"
+        tv, pv = bool(true_is_vuln), bool(forced)
+        if tv and pv:
+            return "correct", "tp", "TP"
+        if tv and not pv:
+            return "incorrect", "fn", "FN"
+        if not tv and pv:
+            return "incorrect", "fp", "FP"
+        return "correct", "tn", "TN"
+    true_is_vuln = sample.get("is_vulnerable")
+    if true_is_vuln is None:
+        return "unknown", None, "unknown"
+    pred_is_vuln = fp.get("is_vulnerable")
+    if pred_is_vuln is None:
+        return "unknown", None, "unknown"
+    tv, pv = bool(true_is_vuln), bool(pred_is_vuln)
+    if tv and pv:
+        return "correct", "tp", "TP"
+    if tv and not pv:
+        return "incorrect", "fn", "FN"
+    if not tv and pv:
+        return "incorrect", "fp", "FP"
+    return "correct", "tn", "TN"
+
+
+def _safe_div(num: float, den: float) -> float | None:
+    return (num / den) if den > 0 else None
+
+
+def _compute_metrics_live(sample_dirs: list[Path]) -> dict[str, Any]:
+    """Compute binary metrics directly from agent_demo sample directories.
+
+    Works without metrics.json by reading sample.json (true label) and
+    final_prediction.json (prediction) from each sample dir.
+    """
+    total = 0
+    completed_count = 0
+    failed_count = 0
+    inconclusive_count = 0
+    tp = tn = fp = fn = correct = incorrect = 0
+    has_any_label = False
+    rows: list[dict[str, Any]] = []
+
+    for sd in sample_dirs:
+        total += 1
+        fp_data = _read_json(sd / "final_prediction.json") or {}
+        sample_data = _read_json(sd / "sample.json") or {}
+
+        parts = sd.name.split("_")
+        sample_id = fp_data.get("sample_id") or (parts[1] if len(parts) >= 2 else sd.name)
+        func = sample_data.get("func_name") or sample_data.get("function_name")
+        confidence = fp_data.get("confidence")
+        decision_status = fp_data.get("decision_status") or ""
+        true_is_vuln = sample_data.get("is_vulnerable")
+        pred_is_vuln = fp_data.get("is_vulnerable")
+
+        avail = _prediction_is_available(fp_data)
+        if not avail:
+            failed_count += 1
+            rows.append({
+                "sample_id": str(sample_id), "function": func,
+                "true_label": ("vulnerable" if true_is_vuln else "safe") if true_is_vuln is not None else None,
+                "prediction": None, "prediction_bool": None,
+                "result": "failed", "error_type": None,
+                "confidence": None, "status": decision_status or "failed", "outcome": "failed",
+            })
+            continue
+
+        completed_count += 1
+        if true_is_vuln is not None:
+            has_any_label = True
+
+        result, error_type, outcome = _classify_sample(fp_data, sample_data)
+
+        if result == "inconclusive":
+            inconclusive_count += 1
+        elif result == "correct":
+            correct += 1
+            if error_type == "tp":
+                tp += 1
+            else:
+                tn += 1
+        elif result == "incorrect":
+            incorrect += 1
+            if error_type == "fn":
+                fn += 1
+            else:
+                fp += 1
+
+        rows.append({
+            "sample_id": str(sample_id), "function": func,
+            "true_label": ("vulnerable" if true_is_vuln else "safe") if true_is_vuln is not None else None,
+            "prediction": ("vulnerable" if pred_is_vuln else "safe") if pred_is_vuln is not None else None,
+            "prediction_bool": bool(pred_is_vuln) if pred_is_vuln is not None else None,
+            "result": result, "error_type": error_type,
+            "confidence": confidence, "status": decision_status, "outcome": outcome,
+        })
+
+    n = tp + fp + tn + fn  # definitive predictions with labels
+    accuracy = _safe_div(tp + tn, n)
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    f1: float | None = None
+    if precision is not None and recall is not None and (precision + recall) > 0:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    if not has_any_label and completed_count > 0:
+        diagnostic: str | None = "true labels missing (no sample.json)"
+    elif inconclusive_count > 0 and inconclusive_count == completed_count:
+        diagnostic = "all predictions inconclusive"
+    elif n == 0 and completed_count > 0:
+        diagnostic = "no definitive predictions for metric computation"
+    else:
+        diagnostic = None
+
+    return {
+        "available": True,
+        "total": total,
+        "completed": completed_count,
+        "failed": failed_count,
+        "inconclusive": inconclusive_count,
+        "correct": correct,
+        "incorrect": incorrect,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "specificity": specificity,
+        "diagnostic": diagnostic,
+        "rows": rows,
+    }
 
 
 # Log line patterns for recovering a partial stage timeline + KG summary when a
@@ -216,26 +408,46 @@ class ResearchInventory:
                 return sd
         return None
 
-    def list_samples(self, run_id: str) -> list[dict[str, Any]]:
+    def list_samples(self, run_id: str, mode: str = "admin") -> list[dict[str, Any]]:
         d = self._resolve_run(run_id)
         if not d:
             return []
         out = []
         for sd in self._sample_dirs(d):
             fp = _read_json(sd / "final_prediction.json") or {}
+            sample_data = _read_json(sd / "sample.json") or {}
             avail = _prediction_is_available(fp)
+            pred_is_vuln = fp.get("is_vulnerable")
+            true_is_vuln = sample_data.get("is_vulnerable")
+
+            result: str | None = None
+            error_type: str | None = None
+            true_label: str | None = None
+            if avail and mode == "admin":
+                r, et, _ = _classify_sample(fp, sample_data)
+                result = r
+                error_type = et
+                if true_is_vuln is not None:
+                    true_label = "vulnerable" if true_is_vuln else "safe"
+
+            parts = sd.name.split("_")
             out.append({
-                "sample_id": fp.get("sample_id") or sd.name.split("_")[1] if "_" in sd.name else sd.name,
+                "sample_id": fp.get("sample_id") or (parts[1] if len(parts) >= 2 else sd.name),
                 "dir": sd.name,
-                "function_name": "_".join(sd.name.split("_")[2:]) or None,
+                "function_name": "_".join(parts[2:]) or None,
                 # Only surface a prediction when one really exists — a failed run's
                 # placeholder (is_vulnerable=false) is NOT "safe".
-                "prediction": (None if not avail else ("vulnerable" if fp.get("is_vulnerable") else "safe")),
+                "prediction": (None if not avail else ("vulnerable" if pred_is_vuln else "safe")),
+                "prediction_bool": bool(pred_is_vuln) if (avail and pred_is_vuln is not None) else None,
                 "prediction_available": avail,
                 "confidence": fp.get("confidence") if avail else None,
                 "decision_status": fp.get("decision_status"),
                 "resolved_commit": fp.get("resolved_commit_id"),
                 "model_backend": fp.get("model_backend"),
+                # Admin-only enriched fields
+                "true_label": true_label,
+                "result": result,
+                "error_type": error_type,
             })
         return out
 
@@ -336,6 +548,10 @@ class ResearchInventory:
             """Merge full content from model_calls into a stage summary dict."""
             name = summary.get("stage") or ""
             c = calls_by_stage.get(name) or {}
+            # Infer parse_status from raw response when enrichment didn't run
+            # (e.g., pipeline failed before the post-parse bulk enrichment pass).
+            stored_parse_status = c.get("parse_status")
+            inferred_parse_status = stored_parse_status or _infer_parse_status_for_call(c)
             return {
                 **summary,
                 "kind": "llm",
@@ -345,11 +561,10 @@ class ResearchInventory:
                 "response": c.get("response") or c.get("raw"),
                 "usage": c.get("usage") or summary.get("usage") or {},
                 "error": c.get("error") or summary.get("error"),
-                # Parse diagnostics — preserve from model_calls even when summary
-                # is compact (agent_flow.json never wrote these fields).
+                # Parse diagnostics — prefer stored; fall back to on-read inference.
                 "parsed_answer": c.get("parsed_answer"),
                 "answer_text": c.get("answer_text"),
-                "parse_status": c.get("parse_status"),
+                "parse_status": inferred_parse_status,
                 "parse_error": c.get("parse_error"),
                 "validation_error": c.get("validation_error"),
                 "repair_status": c.get("repair_status"),
@@ -714,20 +929,38 @@ class ResearchInventory:
             "samples_pending": pending,
             "mtime": run_dir.stat().st_mtime,
         }
-        b = self._binary_metrics(run_dir)
-        n_valid = int(b.get("valid_predictions") if (b and b.get("valid_predictions") is not None) else (b.get("n") if b else 0) or 0)
         if mode != "admin":
             out["metrics"] = None
             out["metrics_available"] = False
             out["metrics_reason"] = "labels not available in this mode"
-        elif not b or n_valid == 0 or completed == 0:
+            return out
+
+        if completed == 0:
             out["metrics"] = None
             out["metrics_available"] = False
-            out["metrics_reason"] = "no completed predictions"
-        else:
+            out["metrics_reason"] = "run has no completed predictions yet"
+            return out
+
+        # Try metrics.json binary section first; fall back to live computation.
+        b = self._binary_metrics(run_dir)
+        n_valid = int(b.get("valid_predictions") if (b and b.get("valid_predictions") is not None) else (b.get("n") if b else 0) or 0)
+        if b and n_valid > 0:
             out["metrics"] = {k: b.get(k) for k in ("n", "tp", "tn", "fp", "fn", "accuracy", "precision", "recall", "f1")}
             out["metrics_available"] = True
             out["metrics_note"] = "single-sample metric" if n_valid <= 1 else (f"{failed} failed excluded" if failed else None)
+        else:
+            # metrics.json absent/stale or valid_predictions==0 — compute live.
+            live = _compute_metrics_live(self._sample_dirs(run_dir))
+            out["metrics"] = {k: live.get(k) for k in (
+                "available", "total", "completed", "failed", "inconclusive",
+                "correct", "incorrect", "tp", "fp", "tn", "fn",
+                "accuracy", "precision", "recall", "f1", "specificity", "diagnostic",
+            )}
+            out["metrics_available"] = True
+            diag = live.get("diagnostic")
+            out["metrics_note"] = diag if diag else (
+                "single-sample metric" if live.get("completed", 0) <= 1 else None
+            )
         return out
 
     def run_live_metrics(self, run_id: str, mode: Mode = "admin") -> dict[str, Any]:
@@ -737,22 +970,62 @@ class ResearchInventory:
             return {"available": False, "reason": "unknown run"}
         if mode != "admin":
             return {"available": False, "reason": "labels not available in student/public mode"}
-        b = self._binary_metrics(run_dir)
-        if not b:
-            return {"available": False, "reason": "Metrics unavailable: labels not available for this run"}
-        # Only count valid completed predictions — never fabricate FN/FP from a
-        # failed sample that has no real prediction.
-        n_valid = int(b.get("valid_predictions") if b.get("valid_predictions") is not None else (b.get("n") or 0))
+
+        sample_dirs = self._sample_dirs(run_dir)
         samples = self.list_samples(run_id)
         completed = sum(1 for s in samples if s.get("prediction_available"))
         failed = len(_read_jsonl(run_dir / "failed_samples.jsonl")) if (run_dir / "failed_samples.jsonl").exists() else 0
         if not failed:
             failed = sum(1 for s in samples if not s.get("prediction_available"))
-        if n_valid == 0 or completed == 0:
+
+        # Try metrics.json binary rows first; fall back to live computation.
+        b = self._binary_metrics(run_dir)
+        n_valid = int(b.get("valid_predictions") if (b and b.get("valid_predictions") is not None) else (b.get("n") if b else 0) or 0)
+        use_live = (not b) or (n_valid == 0 and completed > 0)
+
+        if use_live:
+            live = _compute_metrics_live(sample_dirs)
+            per = [
+                {
+                    "sample_id": r["sample_id"],
+                    "project": None,
+                    "function": r.get("function"),
+                    "true_label": r.get("true_label"),
+                    "prediction": r.get("prediction"),
+                    "correct": r.get("result") == "correct",
+                    "outcome": r.get("outcome"),
+                    "confidence": r.get("confidence"),
+                    "decision_status": r.get("status"),
+                }
+                for r in live.get("rows", [])
+            ]
+            n = live.get("tp", 0) + live.get("fp", 0) + live.get("tn", 0) + live.get("fn", 0)
+            return {
+                "available": True,
+                "processed": n,
+                "completed_predictions": completed,
+                "failed_samples": failed,
+                "pending_samples": max(0, len(samples) - completed - failed),
+                "computed_on": "live from sample artifacts",
+                "single_sample": completed <= 1,
+                "tp": live.get("tp", 0), "tn": live.get("tn", 0),
+                "fp": live.get("fp", 0), "fn": live.get("fn", 0),
+                "inconclusive": live.get("inconclusive", 0),
+                "accuracy": live.get("accuracy"), "precision": live.get("precision"),
+                "recall": live.get("recall"), "f1": live.get("f1"),
+                "specificity": live.get("specificity"),
+                "vulnerable_recall": live.get("recall"),
+                "safe_recall": live.get("specificity"),
+                "diagnostic": live.get("diagnostic"),
+                "per_sample": per,
+            }
+
+        if completed == 0:
             return {"available": False,
-                    "reason": "Metrics unavailable: no completed predictions",
-                    "completed_predictions": completed, "failed_samples": failed,
-                    "pending_samples": max(0, len(samples) - completed - failed)}
+                    "reason": "run has no completed predictions yet",
+                    "completed_predictions": 0, "failed_samples": failed,
+                    "pending_samples": max(0, len(samples) - failed)}
+
         rows = b.get("rows") or []
         per = []
         # Enrich rows with project/function from per-sample correctness if present.
@@ -779,7 +1052,7 @@ class ResearchInventory:
             "completed_predictions": completed,
             "failed_samples": failed,
             "pending_samples": max(0, len(samples) - completed - failed),
-            "computed_on": "completed predictions only",
+            "computed_on": "metrics.json binary section",
             "single_sample": n <= 1,
             "tp": b.get("tp", 0), "tn": b.get("tn", 0), "fp": b.get("fp", 0), "fn": b.get("fn", 0),
             "accuracy": b.get("accuracy"), "precision": b.get("precision"),
@@ -1379,7 +1652,7 @@ class ResearchInventory:
             for i, c in enumerate(calls, start=1):
                 name = c.get("name") or c.get("stage") or f"stage_{i}"
                 status = "failed" if c.get("error") else "completed"
-                parse_status = c.get("parse_status") or "—"
+                parse_status = _infer_parse_status_for_call(c) or "—"
                 repair_status = c.get("repair_status") or "—"
                 elapsed = c.get("elapsed_seconds")
                 usage = c.get("usage") or {}
@@ -1397,7 +1670,7 @@ class ResearchInventory:
             name = c.get("name") or c.get("stage") or f"stage_{i}"
             _subsec(f"Stage {i}: {name}")
             _kv("status", "failed" if c.get("error") else "completed")
-            _kv("parse_status", c.get("parse_status") or "—")
+            _kv("parse_status", _infer_parse_status_for_call(c) or "—")
             _kv("parse_error", c.get("parse_error") or "—")
             _kv("validation_error", c.get("validation_error") or "—")
             _kv("repair_status", c.get("repair_status") or "—")

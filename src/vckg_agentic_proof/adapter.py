@@ -10,8 +10,30 @@ from .prompts import (counter_evidence_prompt, counter_gap_analysis_prompt,
                       hypothesis_verification_prompt, kg_query_planning_prompt,
                       source_only_hypothesis_prompt, consistency_repair_prompt)
 from .schemas import (CounterEvidenceReview, EvidenceGapPlan, FinalDecision,
-                      HypothesisStatus, KGQueryPlan)
+                      FinalPrediction, HypothesisStatus, KGQueryPlan)
 from .validator import validate_final_decision
+
+
+def _make_emergency_fallback_decision(error_msg: str) -> FinalDecision:
+    """Return a minimal FinalDecision that marks the sample as failed_parse.
+
+    Used when Stage 06 JSON cannot be parsed or validated. Excluded from binary
+    metrics by _is_valid_binary_prediction() via decision_status='failed_parse'.
+    """
+    return FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.0,
+        local_risk_present=False,
+        confirmed_security_vulnerability=False,
+        explanation="Stage 06 final adjudication could not be parsed or validated.",
+        limitations=[],
+        forced_prediction="fixed/non-vulnerable",
+        forced_prediction_bool=False,
+        decision_status="failed_parse",
+        evidence_strength="insufficient_static_evidence",
+        evidence_exhausted=True,
+        why_forced_binary=f"Emergency fallback: parse/validate failed. {error_msg}",
+    )
 
 
 _RESOLVED_STATUSES = {
@@ -576,43 +598,70 @@ def run_agentic_proof_pipeline(
         events=events,
     )
     _merge_usage(usage_total, usage)
-    decision, _ = parse_model_object(
-        text, FinalDecision,
-        llm_repair=_repair_llm(llm_generate, config, sample_id, events, "06_final_adjudication"),
-    )
-
-    decision, notes, modified = validate_final_decision(
-        decision, evidence_items=accumulated_evidence, counter_review=counter_review
-    )
-    events.append(AgentEvent(sample_id, "06_final_adjudication", "validated", details={
-        "validator_notes": list(notes), "modified": bool(modified),
-        "prediction": decision.prediction.value, "confidence": decision.confidence,
-    }))
+    # Wrap parse + validate in a single handler so a schema validation failure or a
+    # failed JSON repair does not crash the whole sample.  A failed Stage 06 produces
+    # an emergency fallback decision with decision_status='failed_parse' so the
+    # sample is excluded from binary metrics rather than raising an unhandled exception.
+    notes: List[str] = []
+    modified = False
+    try:
+        decision, _ = parse_model_object(
+            text, FinalDecision,
+            llm_repair=_repair_llm(llm_generate, config, sample_id, events, "06_final_adjudication"),
+        )
+        decision, notes, modified = validate_final_decision(
+            decision, evidence_items=accumulated_evidence, counter_review=counter_review
+        )
+        events.append(AgentEvent(sample_id, "06_final_adjudication", "validated", details={
+            "validator_notes": list(notes), "modified": bool(modified),
+            "prediction": decision.prediction.value, "confidence": decision.confidence,
+        }))
+    except Exception as _stage06_exc:
+        _err_msg = f"{type(_stage06_exc).__name__}: {_stage06_exc}"
+        decision = _make_emergency_fallback_decision(_err_msg)
+        notes = [f"stage06_failed: {_err_msg}"]
+        events.append(AgentEvent(sample_id, "06_final_adjudication", "parse_failed", details={
+            "error_type": type(_stage06_exc).__name__,
+            "error_message": str(_stage06_exc),
+            "recovery": "emergency_fallback",
+            "decision_status": "failed_parse",
+        }))
 
     # ── Stage 07: Schema consistency repair (conditional) ────────────────────
     if modified:
-        text, usage = _call_llm(
-            llm_generate=llm_generate,
-            messages=consistency_repair_prompt(decision.model_dump(mode="json"), notes),
-            sample_id=sample_id,
-            stage="07_schema_consistency_repair",
-            max_tokens=config.max_tokens_schema_repair,
-            config=config,
-            events=events,
-        )
-        _merge_usage(usage_total, usage)
-        repaired_decision, _ = parse_model_object(
-            text, FinalDecision,
-            llm_repair=_repair_llm(llm_generate, config, sample_id, events, "07_schema_consistency_repair"),
-        )
-        decision, notes2, modified2 = validate_final_decision(
-            repaired_decision, evidence_items=accumulated_evidence, counter_review=counter_review
-        )
-        notes.extend(notes2)
-        events.append(AgentEvent(sample_id, "07_schema_consistency_repair", "validated", details={
-            "validator_notes": list(notes2), "modified": bool(modified2),
-            "prediction": decision.prediction.value, "confidence": decision.confidence,
-        }))
+        _fallback_decision = decision  # save stage-06 validated decision before attempting repair
+        try:
+            text, usage = _call_llm(
+                llm_generate=llm_generate,
+                messages=consistency_repair_prompt(decision.model_dump(mode="json"), notes),
+                sample_id=sample_id,
+                stage="07_schema_consistency_repair",
+                max_tokens=config.max_tokens_schema_repair,
+                config=config,
+                events=events,
+            )
+            _merge_usage(usage_total, usage)
+            repaired_decision, _ = parse_model_object(
+                text, FinalDecision,
+                llm_repair=_repair_llm(llm_generate, config, sample_id, events, "07_schema_consistency_repair"),
+            )
+            decision, notes2, modified2 = validate_final_decision(
+                repaired_decision, evidence_items=accumulated_evidence, counter_review=counter_review
+            )
+            notes.extend(notes2)
+            events.append(AgentEvent(sample_id, "07_schema_consistency_repair", "validated", details={
+                "validator_notes": list(notes2), "modified": bool(modified2),
+                "prediction": decision.prediction.value, "confidence": decision.confidence,
+            }))
+        except Exception as _repair_exc:
+            # Fall back to the validated stage-06 decision rather than crashing the sample.
+            decision = _fallback_decision
+            events.append(AgentEvent(sample_id, "07_schema_consistency_repair", "fallback", details={
+                "error": str(_repair_exc),
+                "fallback_reason": "repair_stage_failed_using_stage06_validated_decision",
+                "prediction": decision.prediction.value,
+                "confidence": decision.confidence,
+            }))
 
     events.append(AgentEvent(sample_id, "agentic_proof", "done", details={
         "prediction": decision.prediction.value, "confidence": decision.confidence,

@@ -97,6 +97,17 @@ class FinalDecision(BaseModel):
     decisive_counter_evidence_ids: List[str] = Field(default_factory=list)
     explanation: str
     limitations: List[str] = Field(default_factory=list)
+    # Forced binary fields — always set by the validator so benchmark scoring
+    # always has a definitive True/False even when the evidence status is inconclusive.
+    forced_prediction: Optional[str] = None           # "vulnerable" | "fixed/non-vulnerable"
+    forced_prediction_bool: Optional[bool] = None     # always True/False once validator runs
+    decision_status: Optional[str] = None             # confirmed_vulnerable | confirmed_non_vulnerable | forced_binary_vulnerable | forced_binary_non_vulnerable
+    evidence_strength: Optional[str] = None           # confirmed | likely | weak | insufficient_static_evidence
+    residual_uncertainty: List[str] = Field(default_factory=list)
+    why_forced_binary: Optional[str] = None
+    evidence_exhausted: bool = False
+    loop_stop_reason: Optional[str] = None
+
     def normalize_prediction_bool(self) -> "FinalDecision":
         if self.prediction == FinalPrediction.vulnerable:
             self.prediction_bool = True

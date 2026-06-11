@@ -678,3 +678,415 @@ class TestFrontendTypeStructure:
         assert "flowReport" in content or "flow_report" in content or "flow/report" in content, (
             "research.ts must have a flowReport method calling GET .../flow/report"
         )
+
+
+# ---------------------------------------------------------------------------
+# G. flow() on-read parse inference for unenriched records (failed/partial runs)
+# ---------------------------------------------------------------------------
+
+class TestFlowInfersParseStatusOnRead:
+    """flow() must infer parse_status from raw response when the post-pipeline
+    enrichment pass was skipped (e.g., the run failed before the bulk rewrite).
+    """
+
+    def test_flow_infers_valid_when_answer_tag_has_valid_json(self, tmp_path):
+        """flow() must return parse_status='valid' for a call with valid <answer> JSON
+        even when the stored parse_status is absent (unenriched failed-run record)."""
+        sd = _make_run(tmp_path, "run_inf1", "200")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "01_source_only_hypothesis",
+                "response": '<analysis>brief</analysis><answer>{"hypotheses": []}</answer>',
+                "json_status": "raw_agentic_proof_pending_parse",
+                # No parse_status — simulates a failed run
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        result = inv.flow("run_inf1", "200")
+        assert result is not None
+        stage = result["stages"][0]
+        assert stage.get("parse_status") == "valid", (
+            f"flow() must infer parse_status='valid' from raw response when stored "
+            f"value absent. Got {stage.get('parse_status')!r}"
+        )
+
+    def test_flow_infers_invalid_when_answer_tag_has_bad_json(self, tmp_path):
+        """flow() must return parse_status='invalid' when <answer> has malformed JSON."""
+        sd = _make_run(tmp_path, "run_inf2", "201")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "01_source_only_hypothesis",
+                "response": "<answer>{ BROKEN JSON }</answer>",
+                "json_status": "raw_agentic_proof_pending_parse",
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        result = inv.flow("run_inf2", "201")
+        assert result is not None
+        stage = result["stages"][0]
+        assert stage.get("parse_status") == "invalid", (
+            f"flow() must infer parse_status='invalid' when <answer> contains bad JSON. "
+            f"Got {stage.get('parse_status')!r}"
+        )
+
+    def test_flow_infers_text_only_when_no_answer_tag(self, tmp_path):
+        """flow() must infer parse_status='text_only' when response has no <answer> tag."""
+        sd = _make_run(tmp_path, "run_inf3", "202")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "01_source_only_hypothesis",
+                "response": "Here is my analysis without any answer tag.",
+                "json_status": "raw_agentic_proof_pending_parse",
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        result = inv.flow("run_inf3", "202")
+        stage = result["stages"][0]
+        assert stage.get("parse_status") == "text_only", (
+            f"Expected text_only for no-answer-tag response, got {stage.get('parse_status')!r}"
+        )
+
+    def test_flow_preserves_stored_parse_status_when_present(self, tmp_path):
+        """flow() must not overwrite an existing stored parse_status with an inferred one."""
+        sd = _make_run(tmp_path, "run_inf4", "203")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "01_source_only_hypothesis",
+                "response": "<answer>{}</answer>",
+                "parse_status": "invalid",
+                "parse_error": "Schema validation failed",
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        result = inv.flow("run_inf4", "203")
+        stage = result["stages"][0]
+        assert stage.get("parse_status") == "invalid", (
+            f"Stored parse_status must not be overwritten by inference. "
+            f"Got {stage.get('parse_status')!r}"
+        )
+
+    def test_flow_report_shows_valid_not_dash_for_unenriched_records(self, tmp_path):
+        """flow_report() must show 'valid' not '—' for unenriched records with parseable response."""
+        sd = _make_run(tmp_path, "run_inf5", "204")
+        _write_jsonl(sd / "model_calls.jsonl", [
+            {
+                "name": "06_final_adjudication",
+                "system_prompt": "sys",
+                "user_prompt": "user",
+                "messages": [],
+                "response": '<analysis>a</analysis><answer>{"prediction": "vulnerable", "confidence": 0.8, "explanation": "x", "limitations": []}</answer>',
+                "json_status": "raw_agentic_proof_pending_parse",
+                "elapsed_seconds": 2.1,
+                "usage": {"prompt_tokens": 200, "completion_tokens": 80},
+            }
+        ])
+        inv = _make_inventory(tmp_path)
+        report = inv.flow_report("run_inf5", "204")
+        assert report is not None
+        assert "parse=valid" in report or "parse_status: valid" in report or "valid" in report, (
+            f"flow_report must show parse_status=valid for unenriched but parseable record. "
+            f"Got report excerpt: {report[:400]!r}"
+        )
+        assert "parse=—" not in report and "parse_status: —" not in report, (
+            "flow_report must NOT show '—' for a stage that has a parseable <answer> response."
+        )
+
+
+# ---------------------------------------------------------------------------
+# H. Forced binary prediction schema fields
+# ---------------------------------------------------------------------------
+
+class TestForcedBinaryPredictionSchema:
+    """FinalDecision.forced_prediction, forced_prediction_bool, decision_status,
+    evidence_strength must be set by validate_final_decision() for all outcomes."""
+
+    def _make_minimal_decision(self, prediction: str, local_risk: bool = False) -> dict:
+        return {
+            "prediction": prediction,
+            "confidence": 0.4,
+            "local_risk_present": local_risk,
+            "confirmed_security_vulnerability": False,
+            "final_hypothesis_statuses": [],
+            "minimum_vulnerability_proof": None,
+            "decisive_evidence_ids": [],
+            "decisive_counter_evidence_ids": [],
+            "explanation": "test",
+            "limitations": [],
+        }
+
+    def test_inconclusive_with_local_risk_gets_forced_binary_vulnerable(self):
+        """Inconclusive prediction with local_risk_present=True must yield
+        forced_prediction='vulnerable', forced_prediction_bool=True."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        from vckg_agentic_proof.validator import validate_final_decision
+        decision = FinalDecision(**self._make_minimal_decision("inconclusive", local_risk=True))
+        decision, _, _ = validate_final_decision(decision)
+        assert decision.forced_prediction == "vulnerable", (
+            f"Expected forced_prediction='vulnerable' for inconclusive+local_risk, "
+            f"got {decision.forced_prediction!r}"
+        )
+        assert decision.forced_prediction_bool is True
+        assert decision.decision_status == "forced_binary_vulnerable"
+        assert decision.evidence_strength == "insufficient_static_evidence"
+
+    def test_inconclusive_without_local_risk_gets_forced_binary_non_vulnerable(self):
+        """Inconclusive prediction without local_risk must yield
+        forced_prediction='fixed/non-vulnerable', forced_prediction_bool=False."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        from vckg_agentic_proof.validator import validate_final_decision
+        decision = FinalDecision(**self._make_minimal_decision("inconclusive", local_risk=False))
+        decision, _, _ = validate_final_decision(decision)
+        assert decision.forced_prediction == "fixed/non-vulnerable"
+        assert decision.forced_prediction_bool is False
+        assert decision.decision_status == "forced_binary_non_vulnerable"
+
+    def test_vulnerable_prediction_gets_confirmed_status(self):
+        """Vulnerable prediction with complete proof gets confirmed_vulnerable status."""
+        from vckg_agentic_proof.schemas import FinalDecision, HypothesisVerification, HypothesisStatus, MinimumVulnerabilityProof
+        proof = MinimumVulnerabilityProof(
+            input_control="user input flows to malloc",
+            dangerous_operation="malloc(user_size)",
+            missing_or_failed_guard="no bounds check",
+            unsafe_use="heap overflow via size control",
+            security_impact="arbitrary write",
+            cited_evidence_ids=["EV-1"],
+        )
+        hyp = HypothesisVerification(
+            hypothesis_id="HYP-01",
+            status=HypothesisStatus.confirmed_vulnerability,
+            local_risk_present=True,
+            confirmed_security_vulnerability=True,
+            proof=proof,
+            supporting_evidence_ids=["EV-1"],
+            counter_evidence_ids=[],
+            missing_evidence=[],
+            explanation="confirmed",
+        )
+        decision = FinalDecision(
+            prediction="vulnerable",
+            confidence=0.9,
+            local_risk_present=True,
+            confirmed_security_vulnerability=True,
+            final_hypothesis_statuses=[hyp],
+            minimum_vulnerability_proof=proof,
+            decisive_evidence_ids=["EV-1"],
+            decisive_counter_evidence_ids=[],
+            explanation="confirmed vuln",
+            limitations=[],
+        )
+        from vckg_agentic_proof.validator import validate_final_decision
+        decision, _, _ = validate_final_decision(decision, evidence_items=[{"id": "EV-1"}])
+        assert decision.forced_prediction == "vulnerable"
+        assert decision.forced_prediction_bool is True
+        assert decision.decision_status == "confirmed_vulnerable"
+        assert decision.evidence_strength == "confirmed"
+
+    def test_non_vulnerable_prediction_gets_confirmed_non_vulnerable_status(self):
+        """fixed/non-vulnerable prediction must get confirmed_non_vulnerable status."""
+        from vckg_agentic_proof.schemas import FinalDecision
+        from vckg_agentic_proof.validator import validate_final_decision
+        decision = FinalDecision(
+            prediction="fixed/non-vulnerable",
+            confidence=0.85,
+            local_risk_present=False,
+            confirmed_security_vulnerability=False,
+            final_hypothesis_statuses=[],
+            minimum_vulnerability_proof=None,
+            decisive_evidence_ids=[],
+            decisive_counter_evidence_ids=[],
+            explanation="safe",
+            limitations=[],
+        )
+        decision, _, _ = validate_final_decision(decision)
+        assert decision.forced_prediction == "fixed/non-vulnerable"
+        assert decision.forced_prediction_bool is False
+        assert decision.decision_status == "confirmed_non_vulnerable"
+
+
+class TestParseModelObjectRepairRouting:
+    """parse_model_object must trigger JSON repair ONLY for malformed JSON,
+    not for valid JSON that fails Pydantic schema validation."""
+
+    def test_json_repair_not_triggered_for_schema_validation_failure(self):
+        """When <answer> contains valid JSON that fails schema validation,
+        llm_repair must NOT be called — only TaggedJsonParseError triggers repair."""
+        from vckg_agentic_proof.parser import parse_model_object
+        from pydantic import BaseModel
+
+        class StrictModel(BaseModel):
+            required_str: str
+            required_int: int
+
+        repair_called = {"count": 0}
+
+        def mock_repair(messages):
+            repair_called["count"] += 1
+            return '<answer>{"required_str": "fixed", "required_int": 1}</answer>'
+
+        # Valid JSON but missing required fields → ValidationError should propagate,
+        # NOT trigger llm_repair.
+        raw = '<answer>{"unrelated_field": "value"}</answer>'
+        try:
+            parse_model_object(raw, StrictModel, llm_repair=mock_repair)
+        except Exception:
+            pass  # exception is expected after fix; before fix it succeeds via repair
+
+        assert repair_called["count"] == 0, (
+            "parse_model_object must NOT call llm_repair for Pydantic schema validation "
+            "failures on valid JSON. Got repair_called=%d" % repair_called["count"]
+        )
+
+    def test_json_repair_triggered_for_malformed_json(self):
+        """When <answer> contains malformed JSON, llm_repair IS called."""
+        from vckg_agentic_proof.parser import parse_model_object
+        from pydantic import BaseModel
+
+        class SimpleModel(BaseModel):
+            field: str
+
+        repair_called = {"count": 0}
+
+        def mock_repair(messages):
+            repair_called["count"] += 1
+            return '<answer>{"field": "repaired"}</answer>'
+
+        raw = '<answer>{field: malformed json</answer>'
+        result, _ = parse_model_object(raw, SimpleModel, llm_repair=mock_repair)
+        assert repair_called["count"] == 1, (
+            "parse_model_object must call llm_repair exactly once for malformed JSON"
+        )
+        assert result.field == "repaired"
+
+    def test_schema_failure_propagates_even_with_repair_callback(self):
+        """Valid JSON that fails schema validation must raise even when llm_repair is provided.
+        The repair callback must not be called."""
+        from vckg_agentic_proof.parser import parse_model_object
+        from pydantic import BaseModel, ValidationError
+
+        class StrictModel(BaseModel):
+            required_str: str
+
+        repair_called = {"count": 0}
+
+        def mock_repair(messages):
+            repair_called["count"] += 1
+            return '<answer>{"required_str": "ok"}</answer>'
+
+        raw = '<answer>{"unrelated_field": 123}</answer>'
+        with pytest.raises(Exception):
+            parse_model_object(raw, StrictModel, llm_repair=mock_repair)
+
+        assert repair_called["count"] == 0, (
+            "llm_repair must not be invoked for schema validation failures"
+        )
+
+    def test_no_json_repair_stage_for_valid_json_schema_failure_in_adapter(self):
+        """When Stage 06 returns valid JSON that fails FinalDecision schema,
+        no '06_final_adjudication_json_repair' event must appear."""
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        config = AgenticProofConfig(
+            max_tokens_source_only_hypothesis=512,
+            max_tokens_kg_query_planning=256,
+            max_tokens_hypothesis_verification=512,
+            max_tokens_counter_evidence_review=256,
+            max_tokens_final_decision=512,
+            max_tokens_schema_repair=256,
+            iterative_evidence_loop=False,
+        )
+        json_repair_stages = []
+
+        stage_responses = {
+            "01_source_only_hypothesis": json.dumps({
+                "hypotheses": [{"hypothesis_id": "HYP-01", "title": "t",
+                                "risk_summary": "r", "required_proof_questions": []}]
+            }),
+            "02_kg_query_planning": json.dumps({"queries": []}),
+            "04_hypothesis_verification": json.dumps({"verifications": [
+                {"hypothesis_id": "HYP-01", "status": "insufficient_evidence",
+                 "local_risk_present": False, "confirmed_security_vulnerability": False,
+                 "proof": {"input_control": "", "dangerous_operation": "",
+                           "missing_or_failed_guard": "", "unsafe_use": "",
+                           "security_impact": "", "cited_evidence_ids": []},
+                 "supporting_evidence_ids": [], "counter_evidence_ids": [],
+                 "missing_evidence": [], "explanation": "none"}
+            ]}),
+            "05_counter_evidence_review": json.dumps({"findings": [], "overall_notes": ""}),
+            "06_final_adjudication": json.dumps({"wrong_field": "not a FinalDecision"}),
+        }
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            if "_json_repair" in stage:
+                json_repair_stages.append(stage)
+            base = stage.split("_json_repair")[0]
+            resp = stage_responses.get(stage) or stage_responses.get(base)
+            if resp is None:
+                return json.dumps({"findings": [], "overall_notes": ""})
+            return resp
+
+        result = run_agentic_proof_pipeline(
+            sample={"function": "fn", "filepath": "f.c", "func_body": "int fn(){}"},
+            target_source="int fn(){}",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=config,
+        )
+        assert result is not None, "Pipeline must return a result even when Stage 06 schema-fails"
+        assert "06_final_adjudication_json_repair" not in json_repair_stages, (
+            "JSON repair must NOT fire for valid-JSON schema failures. "
+            f"Got json_repair_stages={json_repair_stages}"
+        )
+
+    def test_stage06_schema_failure_gives_failed_parse_decision_status(self):
+        """When Stage 06 returns schema-invalid JSON, decision_status must be 'failed_parse'."""
+        from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
+
+        config = AgenticProofConfig(
+            max_tokens_source_only_hypothesis=512,
+            max_tokens_kg_query_planning=256,
+            max_tokens_hypothesis_verification=512,
+            max_tokens_schema_repair=256,
+            iterative_evidence_loop=False,
+        )
+
+        stage_responses = {
+            "01_source_only_hypothesis": json.dumps({
+                "hypotheses": [{"hypothesis_id": "HYP-01", "title": "t",
+                                "risk_summary": "r", "required_proof_questions": []}]
+            }),
+            "02_kg_query_planning": json.dumps({"queries": []}),
+            "04_hypothesis_verification": json.dumps({"verifications": [
+                {"hypothesis_id": "HYP-01", "status": "insufficient_evidence",
+                 "local_risk_present": False, "confirmed_security_vulnerability": False,
+                 "proof": {"input_control": "", "dangerous_operation": "",
+                           "missing_or_failed_guard": "", "unsafe_use": "",
+                           "security_impact": "", "cited_evidence_ids": []},
+                 "supporting_evidence_ids": [], "counter_evidence_ids": [],
+                 "missing_evidence": [], "explanation": "none"}
+            ]}),
+            "05_counter_evidence_review": json.dumps({"findings": [], "overall_notes": ""}),
+            "06_final_adjudication": json.dumps({"not_a_final_decision": True}),
+        }
+
+        def mock_llm(messages, *, stage, max_tokens, temperature, extra_body=None):
+            base = stage.split("_json_repair")[0]
+            resp = stage_responses.get(stage) or stage_responses.get(base)
+            if resp is None:
+                return json.dumps({"findings": [], "overall_notes": ""})
+            return resp
+
+        result = run_agentic_proof_pipeline(
+            sample={"function": "fn", "filepath": "f.c", "func_body": "int fn(){}"},
+            target_source="int fn(){}",
+            initial_evidence=[],
+            llm_generate=mock_llm,
+            kg_search=lambda queries, **kw: [],
+            config=config,
+        )
+        assert result is not None
+        assert result.decision is not None
+        assert result.decision.decision_status == "failed_parse", (
+            f"Expected decision_status='failed_parse' for schema-invalid Stage 06, "
+            f"got {result.decision.decision_status!r}"
+        )

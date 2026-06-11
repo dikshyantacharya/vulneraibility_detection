@@ -307,6 +307,16 @@ function PredBadge({ p }: { p?: string | null }) {
   return <span className="badge gray">{p || "—"}</span>;
 }
 
+function DecisionStatusBadge({ ds }: { ds?: string | null }) {
+  if (!ds) return null;
+  if (ds === "confirmed_vulnerable") return <span className="badge red" style={{ fontSize: 10 }}>confirmed</span>;
+  if (ds === "confirmed_non_vulnerable") return <span className="badge green" style={{ fontSize: 10 }}>confirmed</span>;
+  if (ds === "forced_binary_vulnerable" || ds === "forced_binary_non_vulnerable")
+    return <span className="badge amber" style={{ fontSize: 10 }}>forced binary</span>;
+  if (ds.includes("failed")) return <span className="badge red" style={{ fontSize: 10 }}>failed parse</span>;
+  return <span className="badge gray" style={{ fontSize: 10 }}>{ds}</span>;
+}
+
 function AgentFlowLanding() {
   const nav = useNavigate();
   const runs = useAsync<ResearchRun[]>(() => research.runs(), []);
@@ -393,7 +403,8 @@ function AgentFlowLanding() {
                       )}
                     </td>
                     <td style={{ padding: "4px 8px", color: "var(--muted, #64748b)" }}>
-                      {s.decision_status || "—"}
+                      <DecisionStatusBadge ds={s.decision_status} />
+                      {!s.decision_status && "—"}
                     </td>
                     <td style={{ padding: "4px 8px" }}>
                       <div style={{ display: "flex", gap: 4 }}>
