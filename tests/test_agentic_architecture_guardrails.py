@@ -309,3 +309,118 @@ def test_stage06_fallback_from_verifications_forces_safe_when_pointer_guard_cove
     assert decision.decision_status == "forced_binary_non_vulnerable"
     assert decision.forced_prediction_bool is False
     assert "fixed/non-vulnerable" in decision.explanation
+
+
+def test_exact_end_guard_alone_does_not_refute_count_rows_pointer_wraparound():
+    decision = FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.9,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-01",
+                status=HypothesisStatus.refuted_by_guard,
+                local_risk_present=True,
+                confirmed_security_vulnerability=False,
+                explanation="Exact-end guard refutes raw += length * itemsize pointer wraparound.",
+                proof={
+                    "dangerous_operation": "raw += length * itemsize",
+                    "missing_or_failed_guard": "no multiplication overflow check",
+                    "unsafe_use": "raw may wrap below buffer start",
+                    "security_impact": "out-of-bounds read",
+                    "cited_evidence_ids": ["E1", "AUTO-SF-1"],
+                },
+                counter_evidence_ids=["AUTO-SF-1"],
+            )
+        ],
+        explanation="Exact-end guard is enough.",
+    )
+    evidence = [
+        {"id": "E1", "kind": "target_statement", "text": "raw += length * itemsize;"},
+        {"id": "AUTO-SF-1", "kind": "deterministic_source_fact", "text": "Exact-end guard: success requires `raw == end`; otherwise the function reaches an error return `-1`.", "metadata": {"fact_type": "exact_end_success_else_error"}},
+    ]
+
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+
+    assert modified is True
+    assert out.forced_prediction_bool is True
+    assert out.decision_status == "forced_binary_vulnerable"
+    assert any("Forced vulnerable: unguarded raw-buffer pointer advancement" in note for note in notes)
+
+
+def test_fixed_size_buffer_pattern_overrides_overconfident_safe_decision():
+    decision = FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.95,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-01",
+                status=HypothesisStatus.refuted_by_guard,
+                local_risk_present=True,
+                confirmed_security_vulnerability=False,
+                explanation="Kernel-managed environ is bounded, so temp[500] write is safe.",
+                proof={
+                    "dangerous_operation": "temp[i]=fgetc(fp)",
+                    "missing_or_failed_guard": "no i < 500 check",
+                    "unsafe_use": "indexed stack buffer write",
+                    "security_impact": "stack buffer overflow",
+                    "cited_evidence_ids": ["E1", "AUTO-SF-1"],
+                },
+            )
+        ],
+        explanation="Safe due to environment delimiters.",
+    )
+    evidence = [
+        {"id": "E1", "kind": "target_statement", "text": "char temp[500]; temp[i]=fgetc(fp);"},
+        {"id": "AUTO-SF-1", "kind": "deterministic_source_fact", "text": "Fixed-size buffer `temp[500]` is written through an index inside an unbounded loop without an obvious `temp` size guard.", "metadata": {"fact_type": "fixed_size_buffer_unbounded_index_write"}},
+    ]
+
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+
+    assert modified is True
+    assert out.forced_prediction_bool is True
+    assert out.decision_status == "forced_binary_vulnerable"
+    assert any("fixed-size buffer" in note for note in notes)
+
+
+def test_shifted_extra_bounds_guard_suppresses_oldpos_residual_false_positive():
+    decision = FinalDecision(
+        prediction=FinalPrediction.vulnerable,
+        confidence=0.95,
+        local_risk_present=True,
+        confirmed_security_vulnerability=True,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-01",
+                status=HypothesisStatus.confirmed_vulnerability,
+                local_risk_present=True,
+                confirmed_security_vulnerability=True,
+                explanation="oldpos += z advances oldpos without bounds validation",
+                proof={
+                    "input_control": "control tuple z comes from input",
+                    "dangerous_operation": "oldpos += z",
+                    "missing_or_failed_guard": "no explicit z bounds guard",
+                    "unsafe_use": "origData[oldpos + j] may be reached",
+                    "security_impact": "out-of-bounds read",
+                    "cited_evidence_ids": ["E1", "E2"],
+                },
+                supporting_evidence_ids=["E1", "E2"],
+            )
+        ],
+        explanation="Vulnerable due to oldpos residual concern.",
+    )
+    evidence = [
+        {"id": "E1", "kind": "target_statement", "text": "oldpos += z;"},
+        {"id": "E2", "kind": "target_statement", "text": "if ((oldpos + j >= 0) && (oldpos + j < origDataLength))"},
+        {"id": "AUTO-SF-1", "kind": "deterministic_source_fact", "text": "The extra-block bounds check appears after `newpos += x` and before `memcpy(newData + newpos, extraPtr, y)`.", "metadata": {"fact_type": "shifted_extra_bounds_guard"}},
+    ]
+
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+
+    assert modified is True
+    assert out.forced_prediction_bool is False
+    assert out.decision_status == "forced_binary_non_vulnerable"
+    assert any("proof chain contains generic or non-specific" in note or "Forced fixed/non-vulnerable" in note for note in notes)

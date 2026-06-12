@@ -129,8 +129,8 @@ def _is_low_relevance_or_residual_confirmed(h: Any, evidence_items: Iterable[Any
         return True, "GMP arbitrary-precision arithmetic misclassified as C overflow/underflow"
     if "numeric_pid_proc_path_no_slash_traversal" in facts and "path traversal" in t:
         return True, "numeric %d /proc path cannot inject slash traversal by itself"
-    if "shifted_extra_bounds_guard" in facts and any(x in t for x in ("extra", "diff", "patch", "newpos", "memcpy", "control tuple")):
-        return True, "shifted bounds-check guard covers the patch-copy vulnerability class"
+    if "shifted_extra_bounds_guard" in facts and any(x in t for x in ("extra", "diff", "patch", "newpos", "memcpy", "control tuple", "oldpos", "origdata", " z", " z ")):
+        return True, "shifted bounds-check guard covers the patch-copy vulnerability class; remaining tuple/oldpos concerns are residual unless separately proven"
     if "encode_direct_reserved_codepoint_guard" in facts and any(x in t for x in ("encode_direct", "reserved", "mbrtowc", "codepoint", "in_pos", "ascii_prefix")):
         return True, "reserved-codepoint guard covers ENCODE_DIRECT patch class"
     if any(x in t for x in ("possible side-channel", "side-channel", "timing")) and not getattr(getattr(h, "proof", None), "complete", lambda: False)():
@@ -219,20 +219,39 @@ _POSITIVE_SAFETY_STATUSES = {
 }
 
 
-def _unresolved_local_risk_ids(decision: FinalDecision, counter_by_h: dict[str, HypothesisStatus]) -> list[str]:
+def _unresolved_local_risk_ids(
+    decision: FinalDecision,
+    counter_by_h: dict[str, HypothesisStatus],
+    evidence_items: Iterable[Any] | None = None,
+) -> list[str]:
     """Return local-risk hypotheses that lack positive safety/refutation evidence.
 
     A fixed/non-vulnerable *confirmed* decision is unsafe when any local risky
     operation remains only plausible/insufficient. Missing attacker-control
     evidence can justify a low-confidence forced binary choice, but it is not
     positive evidence that the code is safe.
+
+    Important precision/recall guard: an exact-end parser guard (`raw == end` or
+    equivalent) is not by itself a proof that pointer wraparound is impossible.
+    It only refutes wraparound-to-lower-address traversal when paired with a
+    saved-base lower-bound guard such as `raw >= start`.  Otherwise a model can
+    incorrectly mark the vulnerable pre-fix count_rows variant as safe.
     """
+    facts = _source_fact_types(evidence_items)
+    exact_end_only_for_pointer = (
+        "exact_end_success_else_error" in facts
+        and "pointer_wraparound_lower_bound_guard" not in facts
+    )
     unresolved: list[str] = []
     for h in decision.final_hypothesis_statuses or []:
         if not h.local_risk_present:
             continue
         status = counter_by_h.get(h.hypothesis_id, h.status)
-        if status not in _POSITIVE_SAFETY_STATUSES and h.status not in _POSITIVE_SAFETY_STATUSES:
+        has_positive_status = status in _POSITIVE_SAFETY_STATUSES or h.status in _POSITIVE_SAFETY_STATUSES
+        if has_positive_status and exact_end_only_for_pointer and _is_pointer_wraparound_like(h):
+            unresolved.append(h.hypothesis_id)
+            continue
+        if not has_positive_status:
             unresolved.append(h.hypothesis_id)
     return unresolved
 
@@ -353,7 +372,7 @@ def validate_final_decision(
         if decision.confidence > 0.95:
             decision.confidence = 0.95; modified = True
 
-    unresolved_local = _unresolved_local_risk_ids(decision, counter_by_h)
+    unresolved_local = _unresolved_local_risk_ids(decision, counter_by_h, evidence_items)
     pointer_safety_covers_unresolved = _pointer_safety_covers_unresolved(decision, unresolved_local, evidence_items)
     if decision.prediction == FinalPrediction.fixed_or_non_vulnerable and unresolved_local:
         if pointer_safety_covers_unresolved:
@@ -396,6 +415,22 @@ def validate_final_decision(
                 )
             decision.evidence_exhausted = True
             modified = True
+
+    strong_pattern_before_binary, pattern_reason_before_binary = _has_strong_uncovered_vulnerability_pattern(decision, evidence_items)
+    if decision.prediction == FinalPrediction.fixed_or_non_vulnerable and strong_pattern_before_binary:
+        notes.append(
+            "Converted fixed/non-vulnerable decision to evidence-incomplete: "
+            f"deterministic source facts show a high-signal uncovered vulnerability pattern ({pattern_reason_before_binary})."
+        )
+        decision.prediction = FinalPrediction.inconclusive
+        decision.local_risk_present = True
+        decision.confirmed_security_vulnerability = False
+        decision.confidence = min(decision.confidence, 0.65)
+        if not decision.residual_uncertainty:
+            decision.residual_uncertainty = [
+                f"High-signal uncovered vulnerability pattern: {pattern_reason_before_binary}"
+            ]
+        modified = True
 
     # Always populate forced binary fields so benchmark scoring always has a
     # definitive True/False regardless of internal evidence status.
