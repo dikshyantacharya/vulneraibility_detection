@@ -14,6 +14,16 @@ tar -a -c -f %ZIP_NAME% ^
   --exclude="tools" ^
   --exclude="make_project_zip" ^
   --exclude="data" ^
+    --exclude="dist" ^
+    --exclude=".claude" ^
+    --exclude="frontend/dist" ^
+    --exclude="frontend/node_modules" ^
+    --exclude="patches" ^
+    --exclude=".pytest_cache" ^
+    --exclude=".git" ^
+    --exclude=".ruff_cache" ^
+    --exclude=".gitignore" ^
+    --exclude="make_project_zip.bat" ^
   *
 
 echo.

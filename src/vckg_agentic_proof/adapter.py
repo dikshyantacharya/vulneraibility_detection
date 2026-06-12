@@ -10,7 +10,8 @@ from .prompts import (counter_evidence_prompt, counter_gap_analysis_prompt,
                       hypothesis_verification_prompt, kg_query_planning_prompt,
                       source_only_hypothesis_prompt, consistency_repair_prompt)
 from .schemas import (CounterEvidenceReview, EvidenceGapPlan, FinalDecision,
-                      FinalPrediction, HypothesisStatus, KGQueryPlan)
+                      FinalPrediction, HypothesisStatus, KGQuery, KGQueryPlan,
+                      VulnerabilityHypothesis)
 from .validator import validate_final_decision
 
 
@@ -55,6 +56,39 @@ def _all_hypotheses_resolved(verifications: Dict[str, Any]) -> bool:
     if not items:
         return False
     return all(v.get("status") in _RESOLVED_STATUSES for v in items)
+
+
+def _gap_plan_has_queryable_high_value_gaps(gap_plan: EvidenceGapPlan) -> bool:
+    """Return True when the LLM says stop but its own structured gaps are queryable.
+
+    This protects the controller from a common contradiction: the model sets
+    needs_more_evidence=false while still listing high/medium-priority queryable
+    gaps and concrete follow-up queries. In that situation the controller should
+    continue bounded retrieval instead of silently ending the proof loop.
+    """
+    priorities = {"high", "medium"}
+    return any(
+        bool(getattr(g, "queryable", False))
+        and str(getattr(g, "priority", "medium") or "medium").lower() in priorities
+        for g in (gap_plan.gaps or [])
+    )
+
+
+def _effective_follow_up_queries(gap_plan: EvidenceGapPlan) -> List[KGQuery]:
+    """Return follow-up queries only when the plan contains actionable gaps.
+
+    The CodeKG executor is deterministic and bounded; executing a small number of
+    non-duplicate queries is safer than stopping with unresolved proof elements.
+    """
+    if not gap_plan.follow_up_queries:
+        return []
+    if gap_plan.needs_more_evidence or _gap_plan_has_queryable_high_value_gaps(gap_plan):
+        return list(gap_plan.follow_up_queries)
+    return []
+
+
+def _plan_effective_needs_more_evidence(gap_plan: EvidenceGapPlan) -> bool:
+    return bool(gap_plan.needs_more_evidence or _effective_follow_up_queries(gap_plan))
 
 
 @dataclass
@@ -166,7 +200,7 @@ def _merge_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
 def _call_llm(
     *,
     llm_generate: Callable[..., Any],
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     sample_id: Any,
     stage: str,
     max_tokens: int,
@@ -174,12 +208,36 @@ def _call_llm(
     events: List[AgentEvent],
 ) -> tuple[str, Dict[str, Any]]:
     start = time.monotonic()
-    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+    # Prompt builders should produce OpenAI-style messages with string content.
+    # A malformed prompt string can accidentally evaluate to a boolean in Python
+    # (for example, an unescaped `"in"` inside a concatenated string expression).
+    # Normalize here so optional loop stages cannot crash before the failure is
+    # recorded, while preserving a warning event for diagnosis.
+    normalized_messages: List[Dict[str, Any]] = []
+    coerced_fields: List[Dict[str, Any]] = []
+    for idx, msg in enumerate(messages or []):
+        content = msg.get("content", "")
+        if content is None:
+            content_text = ""
+            coerced_fields.append({"index": idx, "from_type": "NoneType"})
+        elif isinstance(content, str):
+            content_text = content
+        else:
+            content_text = str(content)
+            coerced_fields.append({"index": idx, "from_type": type(content).__name__})
+        copied = dict(msg)
+        copied["content"] = content_text
+        normalized_messages.append(copied)
+
+    prompt_chars = sum(len(m.get("content", "")) for m in normalized_messages)
+    if coerced_fields:
+        events.append(AgentEvent(sample_id, stage, "prompt_content_coerced",
+                                  details={"coerced_fields": coerced_fields}))
     events.append(AgentEvent(sample_id, stage, "start",
                               details={"prompt_chars": prompt_chars, "max_tokens": max_tokens}))
     try:
         response = llm_generate(
-            messages,
+            normalized_messages,
             stage=stage,
             max_tokens=max_tokens,
             temperature=config.temperature,
@@ -241,7 +299,7 @@ def _repair_llm(
 
 
 class _HypothesisEnvelope(BaseModel):
-    hypotheses: list
+    hypotheses: List[VulnerabilityHypothesis]
     source_observations: list[str] = []
     non_vulnerability_possibilities: list[str] = []
 
@@ -404,7 +462,13 @@ def run_agentic_proof_pipeline(
         )
 
         # ── Stopping checks on gap plan ───────────────────────────────────
-        if not gap_plan.needs_more_evidence:
+        # Do not blindly trust needs_more_evidence=false when the same response
+        # contains queryable gaps and concrete follow-up queries. That exact
+        # contradiction was responsible for premature loop termination on
+        # pointer-overflow cases where caller/input-source evidence was still
+        # missing.
+        effective_gap_queries = _effective_follow_up_queries(gap_plan)
+        if not _plan_effective_needs_more_evidence(gap_plan):
             _stop = (gap_plan.stop_reason_if_no_queries
                      or gap_plan.stop_reason
                      or "no_more_evidence_needed")
@@ -417,7 +481,7 @@ def run_agentic_proof_pipeline(
             loop_stop_reason = _stop
             break
 
-        if not gap_plan.follow_up_queries and config.stop_when_no_new_queries:
+        if not effective_gap_queries and config.stop_when_no_new_queries:
             if on_iteration_event:
                 on_iteration_event("evidence_iteration_completed", {
                     "sample_id": sample_id, "phase": "verification",
@@ -430,7 +494,7 @@ def run_agentic_proof_pipeline(
         # Deduplicate by query_id AND by normalized query_text (LLM may reuse
         # identical text with a fresh id to bypass id-only dedup).
         new_queries = [
-            q for q in gap_plan.follow_up_queries[:config.max_queries_per_iteration]
+            q for q in effective_gap_queries[:config.max_queries_per_iteration]
             if q.query_id not in executed_query_ids
             and _norm_query(q.query_text) not in executed_query_texts
         ]
@@ -536,7 +600,8 @@ def run_agentic_proof_pipeline(
                 text, EvidenceGapPlan,
                 llm_repair=_repair_llm(llm_generate, config, sample_id, events, c_gap_stage),
             )
-            if not c_gap.needs_more_evidence or not c_gap.follow_up_queries:
+            c_effective_queries = _effective_follow_up_queries(c_gap)
+            if not _plan_effective_needs_more_evidence(c_gap) or not c_effective_queries:
                 if on_iteration_event:
                     on_iteration_event("evidence_iteration_completed", {
                         "sample_id": sample_id, "phase": "counter",
@@ -545,7 +610,7 @@ def run_agentic_proof_pipeline(
                     })
                 break
             c_new_queries = [
-                q for q in c_gap.follow_up_queries[:config.max_queries_per_iteration]
+                q for q in c_effective_queries[:config.max_queries_per_iteration]
                 if q.query_id not in counter_executed_ids
                 and _norm_query(q.query_text) not in counter_executed_texts
             ]
@@ -686,7 +751,9 @@ def run_agentic_proof_pipeline(
             }))
 
     events.append(AgentEvent(sample_id, "agentic_proof", "done", details={
-        "prediction": decision.prediction.value, "confidence": decision.confidence,
+        "prediction": decision.prediction.value, "forced_prediction": decision.forced_prediction,
+        "forced_prediction_bool": decision.forced_prediction_bool,
+        "decision_status": decision.decision_status, "confidence": decision.confidence,
         "validator_notes": notes, "loop_stop_reason": loop_stop_reason,
         "iterations_completed": iterations_completed,
     }))

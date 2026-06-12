@@ -1,6 +1,6 @@
 from __future__ import annotations
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
 class HypothesisStatus(str, Enum):
@@ -47,6 +47,20 @@ class VulnerabilityHypothesis(BaseModel):
     attacker_model: Optional[str] = None
     risk_summary: str
     required_proof_questions: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_hypothesis_id_aliases(cls, data: Any) -> Any:
+        """Accept common LLM key typo without silently dropping the hypothesis.
+
+        Some models occasionally emit ``hypotheses_id`` instead of
+        ``hypothesis_id``. Normalizing here lets downstream query planning and
+        verification keep the hypothesis, while schema-status/reporting can still
+        surface normalization warnings elsewhere.
+        """
+        if isinstance(data, dict) and "hypothesis_id" not in data and "hypotheses_id" in data:
+            data = {**data, "hypothesis_id": data.get("hypotheses_id")}
+        return data
 
 class KGQuery(BaseModel):
     query_id: str

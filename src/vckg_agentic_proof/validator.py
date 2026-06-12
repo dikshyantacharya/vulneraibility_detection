@@ -55,6 +55,33 @@ def _counter_recommendations(counter_review: CounterEvidenceReview | dict[str, A
             continue
     return out
 
+
+_POSITIVE_SAFETY_STATUSES = {
+    HypothesisStatus.refuted_by_guard,
+    HypothesisStatus.refuted_by_caller_constraint,
+    HypothesisStatus.refuted_by_patch_or_changed_logic,
+    HypothesisStatus.irrelevant_to_target_function,
+}
+
+
+def _unresolved_local_risk_ids(decision: FinalDecision, counter_by_h: dict[str, HypothesisStatus]) -> list[str]:
+    """Return local-risk hypotheses that lack positive safety/refutation evidence.
+
+    A fixed/non-vulnerable *confirmed* decision is unsafe when any local risky
+    operation remains only plausible/insufficient. Missing attacker-control
+    evidence can justify a low-confidence forced binary choice, but it is not
+    positive evidence that the code is safe.
+    """
+    unresolved: list[str] = []
+    for h in decision.final_hypothesis_statuses or []:
+        if not h.local_risk_present:
+            continue
+        status = counter_by_h.get(h.hypothesis_id, h.status)
+        if status not in _POSITIVE_SAFETY_STATUSES and h.status not in _POSITIVE_SAFETY_STATUSES:
+            unresolved.append(h.hypothesis_id)
+    return unresolved
+
+
 def validate_final_decision(
     decision: FinalDecision,
     *,
@@ -145,6 +172,29 @@ def validate_final_decision(
         decision.confirmed_security_vulnerability = False
         if decision.confidence > 0.95:
             decision.confidence = 0.95; modified = True
+
+    unresolved_local = _unresolved_local_risk_ids(decision, counter_by_h)
+    if decision.prediction == FinalPrediction.fixed_or_non_vulnerable and unresolved_local:
+        notes.append(
+            "Converted fixed/non-vulnerable decision to evidence-incomplete: "
+            f"unresolved local-risk hypotheses remain: {unresolved_local[:8]}. "
+            "Missing attacker-control evidence is not positive proof of safety."
+        )
+        decision.prediction = FinalPrediction.inconclusive
+        decision.local_risk_present = True
+        decision.confirmed_security_vulnerability = False
+        decision.confidence = min(decision.confidence, 0.65)
+        if not decision.residual_uncertainty:
+            decision.residual_uncertainty = [
+                f"Unresolved local-risk hypothesis: {hid}" for hid in unresolved_local[:8]
+            ]
+        if not decision.why_forced_binary:
+            decision.why_forced_binary = (
+                "Positive safety proof is incomplete; binary benchmark output falls back "
+                "to local-risk-present heuristic after bounded evidence retrieval."
+            )
+        decision.evidence_exhausted = True
+        modified = True
 
     # Always populate forced binary fields so benchmark scoring always has a
     # definitive True/False regardless of internal evidence status.

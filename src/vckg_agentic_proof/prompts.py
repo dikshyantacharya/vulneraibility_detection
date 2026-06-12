@@ -125,7 +125,10 @@ def source_only_hypothesis_prompt(sample: Dict[str, Any], target_source: str) ->
             "Generate candidate vulnerability hypotheses from the target function source. "
             "Do not confirm vulnerabilities. Each hypothesis must identify a concrete risky operation, "
             "a plausible attacker/input-control question, a missing-guard question, and a proof question "
-            "that later KG queries can test."
+            "that later KG queries can test. Pay special attention to parsed length/count fields read "
+            "from raw buffers, integer/pointer wraparound, and missing checks before pointer advancement. "
+            "Do not collapse distinct values: a selector such as length_power is not the same as the "
+            "runtime length value read from input."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -161,6 +164,8 @@ def kg_query_planning_prompt(
         "include_uses=true, include_guards=true, include_callees=true, include_headers=true, "
         "include_globals=true, include_joern=true, max_nodes=450)\n"
         '- variable_flow(target_function="<function>", symbol="<variable>", data_depth=4)\n'
+        '- call_neighborhood(target_function="<function>", direction="in", call_depth=2)\n'
+        '- call_neighborhood(target_function="<function>", direction="out", call_depth=2)\n'
         '- call_neighborhood(target_function="<function>", direction="both", call_depth=2)\n'
         '- semantic_facts(target_function="<function>")\n'
         '- function_context(target_function="<function>", depth=2)\n'
@@ -168,7 +173,7 @@ def kg_query_planning_prompt(
         '- shortest_path(source_node="<node-id>", target_node="<node-id>")\n\n'
         "Prefer security_context for first-pass investigation. "
         "Prefer evidence_slice when a suspicious expression is known. "
-        "Use variable_flow for suspicious symbols, call_neighborhood for caller/callee assumptions, "
+        "Use variable_flow for suspicious symbols, call_neighborhood(direction=\"in\") for caller/input-source assumptions, "
         "and semantic_facts for deterministic risk/guard evidence. "
         "Do not ask for arbitrary free-form graph access. "
         "Do not classify from the query name. "
@@ -180,10 +185,14 @@ def kg_query_planning_prompt(
     return [
         {"role": "system", "content": (
             "Plan source-grounded CodeKG retrieval queries to prove and disprove each hypothesis. "
-            "Generate a compact, non-redundant plan: prefer 4 to 7 total queries. "
+            "Generate a compact, non-redundant plan: prefer 5 to 8 total queries. "
+            "Always include at least one caller/input-source query when attacker control is a required "
+            "proof element, because vulnerable data often enters before the target function. "
             "Prefer one security_context first, then evidence_slice for the most decisive suspicious "
-            "expressions, variable_flow only for variables central to input control or bounds, and "
-            "semantic_facts at most once. Do not classify vulnerability status at this stage."
+            "expressions, variable_flow for variables central to input control or bounds, "
+            "call_neighborhood(direction=\"in\") for caller constraints, and semantic_facts at most once. "
+            "Do not classify vulnerability status at this stage. "
+            "For buffer parsers, prefer queries that test the chain raw/user buffer -> parsed length/count -> size arithmetic -> pointer/index advance."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -219,7 +228,11 @@ def hypothesis_verification_prompt(
             "Distinguish local risky code from exploitability. "
             "Do not treat semantic-fact labels alone as proof of exploitability. "
             "Do not treat absence of evidence as evidence of safety. "
-            "Do not infer attacker control unless caller/input evidence supports it."
+            "Do not infer attacker control unless caller/input evidence supports it. "
+            "For parser code, distinguish the encoded-width selector (for example length_power) from "
+            "the parsed runtime value (for example length = read(raw)); a guard on the selector does "
+            "not by itself bound the parsed value. If caller/input-source evidence is missing, keep the "
+            "hypothesis unresolved and make the missing caller/input evidence explicit."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -248,7 +261,11 @@ def counter_evidence_prompt(
             "Important: 'No evidence of attacker control' weakens confirmation but is not positive "
             "counter-evidence of safety. 'Caller validates parameter X before this function' can be "
             "counter-evidence. 'Guard checks X <= bound before dangerous operation' can be "
-            "counter-evidence. 'Semantic fact says nearby_guard_not_seen' is not counter-evidence."
+            "counter-evidence. 'Semantic fact says nearby_guard_not_seen' is not counter-evidence. "
+            "A guard refutes a hypothesis only if it directly bounds the exact dangerous value or "
+            "dominates the exact dangerous operation. A guard on a related selector (for example "
+            "length_power) does NOT refute overflow of a parsed value (for example length = read(raw)). "
+            "Do not claim a reader-selection guard bounds the attacker-controlled value returned by the reader."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -275,10 +292,12 @@ def final_decision_prompt(
             "anyway, so choose the most evidence-supported class explicitly. "
             "Decide vulnerable only if at least one hypothesis remains confirmed_vulnerability after "
             "counter-evidence and has a complete cited minimum proof. "
-            "Decide fixed/non-vulnerable only when there is positive counter-evidence of safety: "
-            "a guard, caller constraint, patched logic, safe invariant, or unreachable dangerous path. "
-            "If proof is incomplete but local risk is present, choose vulnerable with lower confidence. "
-            "If risk is speculative and counter-evidence dominates, choose fixed/non-vulnerable. "
+            "Decide fixed/non-vulnerable only when every local-risk hypothesis is refuted by positive "
+            "counter-evidence of safety: a guard on the exact dangerous value, caller constraint, patched "
+            "logic, safe invariant, or unreachable dangerous path. "
+            "If proof is incomplete but an unguarded local risk remains, choose vulnerable with lower confidence. "
+            "If risk is speculative and exact counter-evidence dominates, choose fixed/non-vulnerable. "
+            "Never treat missing attacker-control evidence alone as positive safety evidence. "
             "Keep local suspiciousness separate from confirmed vulnerability. Always cite evidence IDs. "
             "For each final_hypothesis_statuses entry, always output a proof object (even if all fields "
             "are empty strings and cited_evidence_ids is empty). Never output \"proof\": null."
@@ -339,10 +358,12 @@ def evidence_gap_analysis_prompt(
         {"role": "system", "content": (
             "You are an evidence-gap analyst for a security audit. "
             "Decide whether more KG evidence is necessary based on the current verification gaps. "
-            "Set needs_more_evidence=false when: evidence is sufficient for classification, "
+            "Set needs_more_evidence=false only when: evidence is sufficient for classification, "
             "all remaining gaps are unqueryable from static CodeKG, all useful queries already executed, "
             "or remaining uncertainty is unavoidable. "
-            "Set needs_more_evidence=true only when missing proof elements are: "
+            "If any high/medium priority gap is queryable and you propose a follow_up_query, "
+            "needs_more_evidence MUST be true. "
+            "Set needs_more_evidence=true when missing proof elements are: "
             "necessary for classification, likely present in static CodeKG, and not already retrieved. "
             "For each gap, set queryable=true only if a deterministic CodeKG query can realistically return "
             "that evidence. Set queryable=false for runtime behavior, external invariants, or gaps that "
@@ -366,7 +387,10 @@ def evidence_gap_analysis_prompt(
             "For each gap: classify proof_element, set queryable=true/false with reasoning, "
             "assign priority (high/medium/low). "
             "Propose follow_up_queries only for queryable=true gaps with non-duplicate query texts. "
-            "Set needs_more_evidence=false with stop_reason_if_no_queries if no useful queries exist."
+            "If follow_up_queries is non-empty, set needs_more_evidence=true. "
+            "Prioritize caller/input-source queries for missing attacker control and exact guard queries "
+            "for missing overflow/bounds checks. Set needs_more_evidence=false with stop_reason_if_no_queries "
+            "only if no useful queries exist."
         )},
     ]
 
@@ -399,6 +423,9 @@ def counter_gap_analysis_prompt(
             "You are a security defense analyst. Generate follow-up CodeKG queries to find "
             "concrete counter-evidence: guards, early returns, range checks, caller constraints, "
             "safe invariants, bounded allocation, or patched logic. "
+            "Only search for counter-evidence that directly applies to the exact dangerous operation/value. "
+            "For example, a bound on length_power does not bound length = read(raw). "
+            "If you propose follow_up_queries, needs_more_evidence must be true. "
             "Do not classify vulnerability status. Avoid duplicating already-executed queries."
         )},
         {"role": "user", "content": (
@@ -411,7 +438,8 @@ def counter_gap_analysis_prompt(
             f"ALREADY EXECUTED QUERY IDs (do not duplicate): {json.dumps(executed_query_ids)}\n\n"
             f"EVIDENCE ID INDEX:\n{compact_json(evidence_index, 4000)}\n\n"
             "Propose follow-up queries that may find positive counter-evidence of safety. "
-            "Return needs_more_evidence=false if none are needed."
+            "Use call_neighborhood(direction=\"in\") for caller preconditions and evidence_slice for exact guards. "
+            "Return needs_more_evidence=false only if no non-duplicate useful queries are needed."
         )},
     ]
 
