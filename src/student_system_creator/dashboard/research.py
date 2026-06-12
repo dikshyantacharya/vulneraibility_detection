@@ -142,6 +142,35 @@ def _is_inconclusive_status(status: str) -> bool:
     return any(h in s for h in _INCONCLUSIVE_HINTS)
 
 
+def _forced_bool_from_status(status: str) -> bool | None:
+    s = (status or "").strip().lower()
+    if s == "forced_binary_vulnerable":
+        return True
+    if s == "forced_binary_non_vulnerable":
+        return False
+    return None
+
+
+def _canonical_prediction_bool(fp: dict[str, Any]) -> bool | None:
+    """Return the benchmarkable binary prediction, including forced-binary decisions.
+
+    Older artifacts sometimes stored decision_status=forced_binary_* but omitted
+    forced_prediction_bool.  Infer it from decision_status so the dashboard
+    result/filter columns cannot display forced-binary samples as inconclusive
+    while metrics count them as TP/FP/TN/FN.
+    """
+    forced = fp.get("forced_prediction_bool")
+    if forced is not None:
+        return bool(forced)
+    inferred = _forced_bool_from_status(str(fp.get("decision_status") or ""))
+    if inferred is not None:
+        return inferred
+    raw = fp.get("is_vulnerable")
+    if raw is not None:
+        return bool(raw)
+    return None
+
+
 def _classify_sample(fp: dict[str, Any], sample: dict[str, Any]) -> tuple[str, str | None, str]:
     """Return (result, error_type, outcome) for one completed prediction.
 
@@ -153,6 +182,8 @@ def _classify_sample(fp: dict[str, Any], sample: dict[str, Any]) -> tuple[str, s
     if _is_inconclusive_status(decision_status):
         # Use forced_prediction_bool if the validator produced a binary forced choice.
         forced = fp.get("forced_prediction_bool")
+        if forced is None:
+            forced = _forced_bool_from_status(decision_status)
         if forced is None:
             return "inconclusive", None, "inconclusive"
         # Fall through with forced binary prediction for TP/TN/FP/FN scoring.
@@ -170,7 +201,7 @@ def _classify_sample(fp: dict[str, Any], sample: dict[str, Any]) -> tuple[str, s
     true_is_vuln = sample.get("is_vulnerable")
     if true_is_vuln is None:
         return "unknown", None, "unknown"
-    pred_is_vuln = fp.get("is_vulnerable")
+    pred_is_vuln = _canonical_prediction_bool(fp)
     if pred_is_vuln is None:
         return "unknown", None, "unknown"
     tv, pv = bool(true_is_vuln), bool(pred_is_vuln)
@@ -212,7 +243,7 @@ def _compute_metrics_live(sample_dirs: list[Path]) -> dict[str, Any]:
         confidence = fp_data.get("confidence")
         decision_status = fp_data.get("decision_status") or ""
         true_is_vuln = sample_data.get("is_vulnerable")
-        pred_is_vuln = fp_data.get("is_vulnerable")
+        pred_is_vuln = _canonical_prediction_bool(fp_data)
 
         avail = _prediction_is_available(fp_data)
         if not avail:
@@ -417,12 +448,7 @@ class ResearchInventory:
             fp = _read_json(sd / "final_prediction.json") or {}
             sample_data = _read_json(sd / "sample.json") or {}
             avail = _prediction_is_available(fp)
-            pred_is_vuln = fp.get("is_vulnerable")
-            _ds = str(fp.get("decision_status") or "")
-            if avail and "forced_binary" in _ds and fp.get("forced_prediction_bool") is not None:
-                pred_is_vuln = fp.get("forced_prediction_bool")
-            elif avail and pred_is_vuln is None:
-                pred_is_vuln = fp.get("forced_prediction_bool")
+            pred_is_vuln = _canonical_prediction_bool(fp) if avail else None
             true_is_vuln = sample_data.get("is_vulnerable")
 
             result: str | None = None
@@ -1303,16 +1329,7 @@ class ResearchInventory:
                 last_completed = s.get("stage")
 
         true_is_vuln = sample.get("is_vulnerable")
-        if pred_available:
-            pred_is_vuln = fp.get("is_vulnerable")
-            if pred_is_vuln is None:
-                pred_is_vuln = fp.get("forced_prediction_bool")
-            # forced_binary_* statuses: prefer forced_prediction_bool over stale is_vulnerable
-            _ds = str(fp.get("decision_status") or "")
-            if "forced_binary" in _ds and fp.get("forced_prediction_bool") is not None:
-                pred_is_vuln = fp.get("forced_prediction_bool")
-        else:
-            pred_is_vuln = None
+        pred_is_vuln = _canonical_prediction_bool(fp) if pred_available else None
         true_label = None if true_is_vuln is None or mode != "admin" else ("vulnerable" if true_is_vuln else "safe")
         prediction = None if pred_is_vuln is None else ("vulnerable" if pred_is_vuln else "safe")
         correct = None

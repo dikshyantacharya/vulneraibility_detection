@@ -814,19 +814,18 @@ class TestForcedBinaryPredictionSchema:
             "limitations": [],
         }
 
-    def test_inconclusive_with_local_risk_gets_forced_binary_vulnerable(self):
-        """Inconclusive prediction with local_risk_present=True must yield
-        forced_prediction='vulnerable', forced_prediction_bool=True."""
+    def test_inconclusive_with_local_risk_without_strong_pattern_gets_forced_binary_non_vulnerable(self):
+        """Inconclusive local risk without a high-signal source pattern should not be forced vulnerable."""
         from vckg_agentic_proof.schemas import FinalDecision
         from vckg_agentic_proof.validator import validate_final_decision
         decision = FinalDecision(**self._make_minimal_decision("inconclusive", local_risk=True))
         decision, _, _ = validate_final_decision(decision)
-        assert decision.forced_prediction == "vulnerable", (
-            f"Expected forced_prediction='vulnerable' for inconclusive+local_risk, "
+        assert decision.forced_prediction == "fixed/non-vulnerable", (
+            f"Expected forced_prediction='fixed/non-vulnerable' for inconclusive+local_risk without strong pattern, "
             f"got {decision.forced_prediction!r}"
         )
-        assert decision.forced_prediction_bool is True
-        assert decision.decision_status == "forced_binary_vulnerable"
+        assert decision.forced_prediction_bool is False
+        assert decision.decision_status == "forced_binary_non_vulnerable"
         assert decision.evidence_strength == "insufficient_static_evidence"
 
     def test_inconclusive_without_local_risk_gets_forced_binary_non_vulnerable(self):
@@ -1272,11 +1271,10 @@ class TestNormalizePredictionBool:
     def test_forced_prediction_bool_survives_normalize_call(self):
         """After validate_final_decision(), prediction_bool must equal forced_prediction_bool."""
         d = self._inconclusive_with_local_risk()
-        assert d.forced_prediction_bool is True, "validator must set forced_prediction_bool=True"
-        assert d.prediction_bool is True, (
-            f"normalize_prediction_bool() must propagate forced_prediction_bool=True to "
-            f"prediction_bool; got prediction_bool={d.prediction_bool!r}. "
-            f"This is the root cause of is_vulnerable=False written to disk."
+        assert d.forced_prediction_bool is False, "validator must set forced_prediction_bool=False for weak local risk"
+        assert d.prediction_bool is False, (
+            f"normalize_prediction_bool() must propagate forced_prediction_bool=False to "
+            f"prediction_bool; got prediction_bool={d.prediction_bool!r}."
         )
 
     def test_prediction_bool_false_for_inconclusive_no_local_risk(self):

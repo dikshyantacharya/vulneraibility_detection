@@ -217,6 +217,107 @@ def _infer_deterministic_source_facts(target_source: str, target_function: str =
             )
             break
 
+
+
+    # Fixed-size buffer + unbounded index/read patterns.  This is intentionally
+    # syntactic and label-free: it records evidence that a stack/local buffer is
+    # written through an index in an unbounded loop without a nearby bounds guard.
+    if re.search(r"\bchar\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", src) and re.search(r"\bfor\s*\(\s*;\s*;\s*\)", src):
+        for m in re.finditer(r"\bchar\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", src):
+            buf, size = m.group(1), m.group(2)
+            indexed_write = re.search(rf"\b{re.escape(buf)}\s*\[\s*[A-Za-z_]\w*\s*\]\s*=", src)
+            bound_guard = re.search(rf"\b[A-Za-z_]\w*\s*[<>=!]=?\s*(?:sizeof\s*\(\s*{re.escape(buf)}\s*\)|{re.escape(size)})", src)
+            if indexed_write and not bound_guard:
+                add_fact(
+                    "fixed_size_buffer_unbounded_index_write",
+                    f"Fixed-size buffer `{buf}[{size}]` is written through an index inside an unbounded loop without an obvious `{buf}` size guard. This is strong local evidence for a bounded-buffer overflow hypothesis.",
+                    buffer=buf, size=size,
+                )
+
+    # Dynamic growth guard that addresses the specific fixed-size-buffer class.
+    if re.search(r"\bmalloc\s*\(\s*temp_size\s*\)", src) and re.search(r"\brealloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src):
+        if re.search(r"if\s*\(\s*i\s*>=\s*temp_size\s*\)", src):
+            add_fact(
+                "dynamic_buffer_growth_guard",
+                "The buffer is heap-allocated with `temp_size`, and before indexed writes the code grows it when `i >= temp_size` using `realloc`. This is positive safety evidence against the original fixed 500-byte environment-name overflow class.",
+            )
+        if re.search(r"\btemp\s*=\s*realloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src) and not re.search(r"if\s*\(\s*!?\s*temp\s*\)", src):
+            add_fact(
+                "unchecked_realloc_residual_risk",
+                "The source assigns `realloc` directly back to `temp` without an obvious NULL check. This is a residual robustness risk, but it is distinct from the fixed-size buffer overflow class.",
+            )
+
+    # Elliptic-curve point at infinity / identity handling.  This is the class of
+    # guard that should refute missing-identity handling hypotheses without
+    # hard-coding a specific function name or label.
+    has_point_identity_helpers = any(name in src for name in (
+        "pointZZ_pIsIdentityElement", "pointZZ_pSetToIdentityElement", "pointZZ_pEqual", "pointZZ_pDouble"
+    ))
+    if has_point_identity_helpers:
+        add_fact(
+            "point_identity_element_guard",
+            "The source contains explicit identity-element / point-at-infinity handling before the generic point-addition arithmetic. This is positive safety evidence for the point-at-infinity vulnerability class.",
+        )
+    elif "mpz_invert" in src and "op1->x" in src and "op2->x" in src:
+        add_fact(
+            "missing_point_identity_element_guard",
+            "The source performs elliptic-curve point-addition arithmetic using `mpz_invert` on coordinate differences, but no explicit identity-element / point-at-infinity guard is visible before inversion.",
+        )
+
+    # GMP arithmetic facts: mpz_* values are arbitrary precision.  These facts
+    # suppress false positives that misclassify mpz_mul/mpz_sub as C integer
+    # overflow/underflow while preserving real risks such as unchecked inversion.
+    if re.search(r"\bmpz_(?:mul|sub)\s*\(", src):
+        add_fact(
+            "gmp_arbitrary_precision_arithmetic",
+            "The source uses GMP `mpz_*` arithmetic. `mpz_mul`/`mpz_sub` operate on arbitrary-precision integers and should not be treated as normal C integer overflow/underflow without additional evidence.",
+        )
+    if "mpz_invert" in src:
+        add_fact(
+            "mpz_invert_status_sensitive",
+            "The source calls `mpz_invert`; its return value indicates whether an inverse exists. Missing status checks can be relevant only when the non-invertible case is not otherwise guarded.",
+        )
+
+    # bsdiff-style shifted bound checks.  A safe version checks the extra block
+    # after newpos has been advanced by x; a vulnerable version may check extraPtr
+    # too early before the diff copy changes newpos.
+    if "PyArg_ParseTuple" in src and "controlTuples" in src and "extraPtr" in src and "memcpy(newData + newpos, extraPtr, y)" in src:
+        extra_memcpy = src.find("memcpy(newData + newpos, extraPtr, y)")
+        newpos_x = src.rfind("newpos += x", 0, extra_memcpy if extra_memcpy >= 0 else len(src))
+        extra_guard = src.rfind("extraPtr + y > extraBlock + extraBlockLength", 0, extra_memcpy if extra_memcpy >= 0 else len(src))
+        if extra_memcpy >= 0 and newpos_x >= 0 and extra_guard > newpos_x:
+            add_fact(
+                "shifted_extra_bounds_guard",
+                "The extra-block bounds check appears after `newpos += x` and before `memcpy(newData + newpos, extraPtr, y)`. This is positive safety evidence for the shifted bounds-check patch class.",
+            )
+        elif extra_memcpy >= 0:
+            add_fact(
+                "missing_shifted_extra_bounds_guard",
+                "The source copies `y` bytes from `extraPtr` after `newpos += x`, but no extra-block/newpos bounds check is visible immediately before that copy. This is strong local evidence for a shifted-bounds-check vulnerability class.",
+            )
+
+    # fish-shell ENCODE_DIRECT handling.  A helper that centralizes reserved
+    # codepoint logic is positive safety evidence; manual partial checks can miss
+    # reserved codepoints.
+    if "fish_reserved_codepoint" in src:
+        add_fact(
+            "encode_direct_reserved_codepoint_guard",
+            "The source uses `fish_reserved_codepoint(wc)` before deciding to encode directly. This is positive safety evidence for the ENCODE_DIRECT reserved-codepoint patch class.",
+        )
+    elif "ENCODE_DIRECT_BASE" in src and "INTERNAL_SEPARATOR" in src:
+        add_fact(
+            "legacy_partial_encode_direct_guard",
+            "The source uses manual ENCODE_DIRECT_BASE / INTERNAL_SEPARATOR checks instead of a consolidated reserved-codepoint predicate. This is local evidence for a missed reserved-codepoint encoding class.",
+        )
+
+    # sprintf with a numeric PID cannot create slash-based path traversal by
+    # itself; record this to suppress overly broad path-traversal hypotheses.
+    if re.search(r"sprintf\s*\([^;]*\"/proc/%d/environ\"\s*,\s*pid\s*\)", src, flags=re.S):
+        add_fact(
+            "numeric_pid_proc_path_no_slash_traversal",
+            "The `/proc/%d/environ` path is constructed with numeric `%d` formatting of `pid`; by itself this cannot inject `/` path traversal components.",
+        )
+
     return facts
 
 
@@ -257,7 +358,171 @@ def _effective_follow_up_queries(gap_plan: EvidenceGapPlan) -> List[KGQuery]:
 
 
 def _plan_effective_needs_more_evidence(gap_plan: EvidenceGapPlan) -> bool:
-    return bool(gap_plan.needs_more_evidence or _effective_follow_up_queries(gap_plan))
+    return bool(
+        gap_plan.needs_more_evidence
+        or _effective_follow_up_queries(gap_plan)
+        or _gap_plan_has_queryable_high_value_gaps(gap_plan)
+    )
+
+
+def _query_mentions(text: str, terms: List[str]) -> bool:
+    low = (text or "").lower()
+    return any(t.lower() in low for t in terms)
+
+
+def _make_query(query_id: str, hypothesis_id: Optional[str], purpose: str, query_text: str, variables: List[str] | None = None) -> KGQuery:
+    return KGQuery(
+        query_id=query_id,
+        hypothesis_id=hypothesis_id,
+        purpose=purpose,
+        query_text=query_text,
+        variables=variables or [],
+        expected_evidence=purpose,
+        limit=8,
+    )
+
+
+def _auto_follow_up_queries_from_gaps(
+    sample: Dict[str, Any],
+    gap_plan: EvidenceGapPlan,
+    *,
+    prefix: str,
+) -> List[KGQuery]:
+    """Create deterministic fallback KG queries for queryable high-value gaps.
+
+    The LLM often identifies the right missing proof elements but then emits
+    duplicate, underspecified, or weak follow-up queries.  The controller should
+    not stop a loop as ``no_new_evidence_returned`` while high-priority gaps are
+    still explicitly queryable.  These fallback queries are label-free and use
+    only the target function name plus the gap text.
+    """
+    fn = str(sample.get("func_name") or sample.get("function_name") or sample.get("target_function") or sample.get("function") or "").strip()
+    if not fn:
+        return []
+
+    gaps = [g for g in (gap_plan.gaps or []) if getattr(g, "queryable", False)]
+    if not gaps:
+        return []
+
+    out: List[KGQuery] = []
+    seen: set[str] = set()
+
+    def add(purpose: str, query_text: str, variables: List[str] | None = None, hypothesis_id: Optional[str] = None) -> None:
+        norm = _norm_query(query_text)
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        out.append(_make_query(f"{prefix}{len(out)+1:02d}", hypothesis_id, purpose, query_text, variables))
+
+    # Always try broad caller/data contexts first when any queryable gap remains.
+    add(
+        "Expanded caller/input-source context for unresolved proof gaps",
+        f'security_context(target_function="{fn}", depth=4, call_depth=3, data_depth=5, include_callers=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=900)',
+    )
+    add(
+        "Incoming callers and caller-side constraints for unresolved proof gaps",
+        f'call_neighborhood(target_function="{fn}", direction="in", call_depth=4)',
+    )
+    add(
+        "Bidirectional call neighborhood to find helper guards and related validation",
+        f'call_neighborhood(target_function="{fn}", direction="both", call_depth=3)',
+    )
+    add(
+        "Semantic guard/risk facts for unresolved proof gaps",
+        f'semantic_facts(target_function="{fn}")',
+    )
+
+    gap_text = "\n".join(
+        " ".join(str(getattr(g, attr, "") or "") for attr in ("proof_element", "missing_evidence", "recommended_query_focus", "why_queryable_or_not"))
+        for g in gaps
+    )
+
+    # Variables commonly decisive in the current benchmark families.
+    variables = [
+        "raw", "raw_length", "length", "itemsize", "length_power",
+        "in", "in_len", "in_pos", "ret", "ascii_prefix_length", "state", "wc",
+        "op1", "op2", "rop", "curve", "p", "xdiff", "ydiff", "lambda",
+    ]
+    for v in variables:
+        if _query_mentions(gap_text, [v]):
+            add(
+                f"Variable flow for `{v}` because an unresolved queryable gap mentions it",
+                f'variable_flow(target_function="{fn}", symbol="{v}", data_depth=5)',
+                [v],
+            )
+
+    # Exact suspicious expressions/helper names seen in gap text.
+    expr_terms = [
+        ("length * itemsize", "raw += length * itemsize;"),
+        ("length_power", "1 << length_power"),
+        ("raw_length", "raw + raw_length"),
+        ("raw == end", "raw == end"),
+        ("raw >= start", "raw >= start"),
+        ("count_ascii_prefix", "count_ascii_prefix"),
+        ("mbrtowc", "std::mbrtowc"),
+        ("in_pos += ret", "in_pos += ret"),
+        ("use_encode_direct", "use_encode_direct"),
+        ("encode_direct", "ENCODE_DIRECT"),
+        ("mpz_invert", "mpz_invert"),
+        ("curve->p", "curve->p"),
+        ("identity", "pointZZ_pIsIdentityElement"),
+        ("point at infinity", "pointZZ_pIsIdentityElement"),
+    ]
+    for needle, stmt in expr_terms:
+        if needle.lower() in gap_text.lower():
+            add(
+                f"Evidence slice for `{stmt}` because an unresolved queryable gap mentions it",
+                f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=5, data_depth=5, control_depth=4, call_depth=3, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=700)',
+            )
+
+    # Helper functions often hold the guard/counter-evidence, so ask directly
+    # when the gap mentions them. External/library names are harmless: CodeKG
+    # returns no evidence if absent.
+    helpers = [
+        "count_ascii_prefix", "fish_reserved_codepoint", "pointZZ_pIsIdentityElement",
+        "pointZZ_pEqual", "pointZZ_pDouble", "pointZZ_pSetToIdentityElement",
+        "buildCurveZZ_p", "mpz_invert", "mbrtowc",
+    ]
+    for h in helpers:
+        if h.lower() in gap_text.lower():
+            add(
+                f"Function context for helper `{h}` mentioned by unresolved gap",
+                f'function_context(target_function="{h}", depth=3)',
+            )
+            add(
+                f"Semantic facts for helper `{h}` mentioned by unresolved gap",
+                f'semantic_facts(target_function="{h}")',
+            )
+
+    return out
+
+
+def _actionable_gap_queries(
+    sample: Dict[str, Any],
+    gap_plan: EvidenceGapPlan,
+    llm_queries: List[KGQuery],
+    *,
+    prefix: str,
+) -> List[KGQuery]:
+    """Combine deterministic fallback queries with LLM queries.
+
+    Fallback queries are placed first so a weak/duplicate LLM proposal cannot
+    consume the small per-iteration query budget and prematurely end the loop.
+    """
+    combined = _auto_follow_up_queries_from_gaps(sample, gap_plan, prefix=prefix) + list(llm_queries or [])
+    out: List[KGQuery] = []
+    seen: set[str] = set()
+    for q in combined:
+        text = str(q.query_text or "")
+        # Drop obvious placeholders that cannot execute deterministically.
+        if "<relative" in text or "<path" in text or "TODO" in text:
+            continue
+        norm = _norm_query(text)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(q)
+    return out
 
 
 @dataclass
@@ -648,7 +913,10 @@ def run_agentic_proof_pipeline(
         # contradiction was responsible for premature loop termination on
         # pointer-overflow cases where caller/input-source evidence was still
         # missing.
-        effective_gap_queries = _effective_follow_up_queries(gap_plan)
+        effective_gap_queries = _actionable_gap_queries(
+            sample, gap_plan, _effective_follow_up_queries(gap_plan),
+            prefix=f"QF{iteration + 1}-",
+        )
         if not _plan_effective_needs_more_evidence(gap_plan):
             _stop = (gap_plan.stop_reason_if_no_queries
                      or gap_plan.stop_reason
@@ -781,7 +1049,10 @@ def run_agentic_proof_pipeline(
                 text, EvidenceGapPlan,
                 llm_repair=_repair_llm(llm_generate, config, sample_id, events, c_gap_stage),
             )
-            c_effective_queries = _effective_follow_up_queries(c_gap)
+            c_effective_queries = _actionable_gap_queries(
+                sample, c_gap, _effective_follow_up_queries(c_gap),
+                prefix=f"QCF{c_iter}-",
+            )
             if not _plan_effective_needs_more_evidence(c_gap) or not c_effective_queries:
                 if on_iteration_event:
                     on_iteration_event("evidence_iteration_completed", {

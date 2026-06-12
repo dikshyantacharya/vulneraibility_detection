@@ -203,7 +203,10 @@ def source_only_hypothesis_prompt(sample: Dict[str, Any], target_source: str) ->
             "that later KG queries can test. Pay special attention to parsed length/count fields read "
             "from raw buffers, integer/pointer wraparound, and missing checks before pointer advancement. "
             "Do not collapse distinct values: a selector such as length_power is not the same as the "
-            "runtime length value read from input."
+            "runtime length value read from input. A vulnerability hypothesis should be target-relevant and "
+            "testable, not merely a generic robustness concern. Do not treat GMP mpz_mul/mpz_sub as C integer "
+            "overflow/underflow; mpz values are arbitrary precision. Do not call sprintf('/proc/%d/environ', pid) "
+            "path traversal by itself because %d cannot inject slash components."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -371,8 +374,9 @@ def final_decision_prompt(
             "Final adjudicator. Output compact valid JSON only inside <answer>. "
             "You MUST choose exactly one binary prediction: vulnerable or fixed/non-vulnerable. "
             "Inconclusive is not allowed in the final answer. "
-            "Decide vulnerable only when a complete cited chain exists or when bounded retrieval leaves an unguarded local risk not covered by deterministic safety evidence. "
-            "Decide fixed/non-vulnerable when positive counter-evidence covers the remaining risk, including deterministic source facts. "
+            "Decide vulnerable only when a complete cited chain exists, or when deterministic source facts show a high-signal uncovered vulnerability pattern. "
+            "Local risk, TODO comments, unchecked realloc, possible side-channel, GMP arithmetic overflow/underflow claims, path traversal via numeric %d formatting, or missing caller proof alone is not enough. "
+            "Decide fixed/non-vulnerable when positive counter-evidence covers the remaining risk, when a suspected issue is unrelated/residual, or when proof remains incomplete after bounded retrieval. "
             "For pointer-overflow parser hypotheses, a deterministic source fact showing a saved-base lower-bound guard on the advanced pointer plus an exact-end error return is exact counter-evidence for wraparound-to-lower-address traversal. "
             "Never treat missing attacker-control evidence alone as safety evidence. "
             "Do not output markdown/code fences. Do not exceed 1800 words. "

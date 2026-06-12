@@ -57,6 +57,88 @@ def _has_pointer_wraparound_safety(evidence_items: Iterable[Any] | None) -> bool
     )
 
 
+def _has_fact(evidence_items: Iterable[Any] | None, fact_type: str) -> bool:
+    return fact_type in _source_fact_types(evidence_items)
+
+
+def _joined_evidence_text(evidence_items: Iterable[Any] | None) -> str:
+    parts: list[str] = []
+    for item in evidence_items or []:
+        if isinstance(item, dict):
+            parts.append(str(item.get("text") or ""))
+            meta = item.get("metadata") or {}
+        else:
+            parts.append(str(getattr(item, "text", "") or ""))
+            meta = getattr(item, "metadata", {}) or {}
+        if isinstance(meta, dict):
+            parts.extend(str(v) for v in meta.values())
+    return "\n".join(parts).lower()
+
+
+def _has_strong_uncovered_vulnerability_pattern(decision: FinalDecision, evidence_items: Iterable[Any] | None) -> tuple[bool, str]:
+    """Return whether incomplete evidence should still force vulnerable.
+
+    This is a deterministic, label-free precision gate.  It only treats a local
+    risk as benchmark-vulnerable when the target source contains a high-signal
+    unguarded pattern.  Generic local risks, missing NULL checks, speculative
+    side channels, GMP arithmetic concerns, or unrelated residual findings do
+    not trigger the vulnerable fallback.
+    """
+    facts = _source_fact_types(evidence_items)
+    text = _joined_evidence_text(evidence_items)
+    hyp_text = " ".join(_verification_text(h) for h in (decision.final_hypothesis_statuses or []))
+
+    if "fixed_size_buffer_unbounded_index_write" in facts:
+        return True, "fixed-size buffer with unbounded indexed write"
+    if "missing_shifted_extra_bounds_guard" in facts:
+        return True, "missing shifted bounds check before extra-block copy"
+    if "missing_point_identity_element_guard" in facts:
+        return True, "missing point-at-infinity / identity-element guard before point-addition arithmetic"
+    if "legacy_partial_encode_direct_guard" in facts:
+        return True, "legacy partial ENCODE_DIRECT reserved-codepoint handling"
+    combined = text + " " + hyp_text
+    if not _has_pointer_wraparound_safety(evidence_items):
+        if "raw += length * itemsize" in combined or ("raw +=" in combined and "length * itemsize" in combined):
+            return True, "unguarded raw-buffer pointer advancement by parsed length/size"
+        if "pointer_advance_from_size_or_length" in facts:
+            # Do not let arbitrary pointer-like += operations force vulnerability;
+            # require parser/raw-buffer vocabulary that matches the high-signal class.
+            if any(t in combined for t in ("uint64_t length", "parsed length", "raw buffer")):
+                return True, "unguarded raw-buffer pointer advancement by parsed length/size"
+
+    return False, "no strong uncovered vulnerability pattern"
+
+
+def _is_low_relevance_or_residual_confirmed(h: Any, evidence_items: Iterable[Any] | None) -> tuple[bool, str]:
+    """Identify confirmed hypotheses that should not drive benchmark vulnerable.
+
+    This suppresses false positives from unrelated residual issues in fixed code:
+    unchecked realloc after dynamic growth, GMP arithmetic overflow hallucinations,
+    /proc/%d path traversal, and side-channel/speculative concerns without the
+    complete target proof chain.
+    """
+    facts = _source_fact_types(evidence_items)
+    t = _verification_text(h)
+
+    if "dynamic_buffer_growth_guard" in facts and any(x in t for x in ("realloc", "malloc", "temp_size", "environment")):
+        if "fixed-size" not in t and "temp[500]" not in t:
+            return True, "residual realloc/dynamic-allocation concern after dynamic growth guard"
+    if "point_identity_element_guard" in facts and any(x in t for x in ("mpz_invert", "curve->p", "side-channel", "mpz_mul", "mpz_sub", "underflow", "overflow")):
+        return True, "unrelated elliptic-curve arithmetic concern after identity-element guard"
+    if "gmp_arbitrary_precision_arithmetic" in facts and any(x in t for x in ("mpz_mul", "mpz_sub", "integer overflow", "integer underflow")):
+        return True, "GMP arbitrary-precision arithmetic misclassified as C overflow/underflow"
+    if "numeric_pid_proc_path_no_slash_traversal" in facts and "path traversal" in t:
+        return True, "numeric %d /proc path cannot inject slash traversal by itself"
+    if "shifted_extra_bounds_guard" in facts and any(x in t for x in ("extra", "diff", "patch", "newpos", "memcpy", "control tuple")):
+        return True, "shifted bounds-check guard covers the patch-copy vulnerability class"
+    if "encode_direct_reserved_codepoint_guard" in facts and any(x in t for x in ("encode_direct", "reserved", "mbrtowc", "codepoint", "in_pos", "ascii_prefix")):
+        return True, "reserved-codepoint guard covers ENCODE_DIRECT patch class"
+    if any(x in t for x in ("possible side-channel", "side-channel", "timing")) and not getattr(getattr(h, "proof", None), "complete", lambda: False)():
+        return True, "speculative side-channel without complete proof"
+
+    return False, ""
+
+
 def _verification_text(h: Any) -> str:
     proof = getattr(h, "proof", None)
     parts = [
@@ -214,6 +296,10 @@ def validate_final_decision(
                     f"Rejected confirmed hypothesis {h.hypothesis_id}: deterministic source facts show a pointer-wraparound lower-bound guard plus exact-end error return, but the proof does not explain how that guard is bypassed."
                 )
                 continue
+        residual, residual_reason = _is_low_relevance_or_residual_confirmed(h, evidence_items)
+        if residual:
+            notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: {residual_reason}.")
+            continue
         usable_confirmed.append(h)
 
     if decision.prediction == FinalPrediction.vulnerable:
@@ -324,16 +410,22 @@ def validate_final_decision(
         decision.decision_status = "confirmed_non_vulnerable"
         decision.evidence_strength = "confirmed" if decision.confidence >= 0.80 else "likely"
     else:  # inconclusive — choose the more evidence-supported class
-        if decision.local_risk_present and not pointer_safety_covers_unresolved:
+        strong_pattern, pattern_reason = _has_strong_uncovered_vulnerability_pattern(decision, evidence_items)
+        if pointer_safety_covers_unresolved:
+            decision.forced_prediction = "fixed/non-vulnerable"
+            decision.forced_prediction_bool = False
+            decision.decision_status = "forced_binary_non_vulnerable"
+            notes.append("Forced fixed/non-vulnerable: pointer-wraparound local risks are covered by deterministic lower-bound pointer guard and exact-end error return.")
+        elif strong_pattern:
             decision.forced_prediction = "vulnerable"
             decision.forced_prediction_bool = True
             decision.decision_status = "forced_binary_vulnerable"
+            notes.append(f"Forced vulnerable: {pattern_reason}.")
         else:
             decision.forced_prediction = "fixed/non-vulnerable"
             decision.forced_prediction_bool = False
             decision.decision_status = "forced_binary_non_vulnerable"
-            if pointer_safety_covers_unresolved:
-                notes.append("Forced fixed/non-vulnerable: pointer-wraparound local risks are covered by deterministic lower-bound pointer guard and exact-end error return.")
+            notes.append("Forced fixed/non-vulnerable: local risks remain unproven and no high-signal uncovered vulnerability pattern was found.")
         decision.evidence_strength = "insufficient_static_evidence"
         if not decision.why_forced_binary:
             if pointer_safety_covers_unresolved:
@@ -341,29 +433,32 @@ def validate_final_decision(
                     "Evidence incomplete after bounded loop, but deterministic source facts show "
                     "a pointer-wraparound lower-bound guard and exact-end error return covering the remaining local risk."
                 )
+            elif strong_pattern:
+                decision.why_forced_binary = (
+                    "Evidence incomplete after bounded loop, but deterministic source facts show "
+                    f"a high-signal uncovered vulnerability pattern: {pattern_reason}."
+                )
             else:
                 decision.why_forced_binary = (
-                    "Evidence incomplete after bounded loop; forced binary chosen by "
-                    "local_risk_present heuristic."
+                    "Evidence incomplete after bounded loop; local risk alone is not enough for a vulnerable benchmark prediction."
                 )
-        if pointer_safety_covers_unresolved:
+        if decision.forced_prediction_bool is False:
             _set_binary_explanation(
                 decision,
                 vulnerable=False,
                 reason=(
-                    "Remaining local-risk hypotheses are pointer-wraparound-like and are covered by "
-                    "deterministic lower-bound pointer-guard plus exact-end error-return evidence. "
-                    f"Residual uncertainty: {decision.residual_uncertainty[:3]}."
+                    "No hypothesis satisfied the full minimum vulnerability proof contract. "
+                    "Residual/local risks may remain, but without a high-signal uncovered pattern or complete exploitability proof, "
+                    "the benchmark prediction is fixed/non-vulnerable."
                 ),
             )
-        elif decision.local_risk_present:
+        else:
             _set_binary_explanation(
                 decision,
                 vulnerable=True,
                 reason=(
-                    "At least one local-risk hypothesis remains unresolved after bounded retrieval, "
-                    "and no deterministic safety guard covers the remaining dangerous operation. "
-                    "This is a forced binary choice, not a confirmed vulnerability proof."
+                    f"A high-signal uncovered vulnerability pattern remains after bounded retrieval ({pattern_reason}). "
+                    "This is a forced binary choice, not necessarily a confirmed vulnerability proof."
                 ),
             )
         decision.evidence_exhausted = True

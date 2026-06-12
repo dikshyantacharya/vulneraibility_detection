@@ -120,6 +120,10 @@ class HypothesisVerification(BaseModel):
     counter_evidence_ids: List[str] = Field(default_factory=list)
     missing_evidence: List[str] = Field(default_factory=list)
     explanation: str
+    # Optional research-audit fields used by later precision gates. Defaults keep
+    # old artifacts backward compatible and do not require the LLM to emit them.
+    target_relevance: str = "unknown"  # high | medium | low | unrelated | unknown
+    relevance_reason: str = ""
 
 class CounterEvidenceFinding(BaseModel):
     hypothesis_id: str

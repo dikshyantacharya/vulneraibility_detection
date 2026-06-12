@@ -41,7 +41,7 @@ def test_gap_plan_does_not_stop_when_queryable_gaps_and_queries_exist():
     assert [q.query_id for q in _effective_follow_up_queries(plan)] == ["Q99"]
 
 
-def test_fixed_prediction_with_unresolved_local_risk_becomes_forced_binary_vulnerable():
+def test_fixed_prediction_with_unresolved_local_risk_defaults_safe_without_strong_pattern():
     decision = FinalDecision(
         prediction=FinalPrediction.fixed_or_non_vulnerable,
         confidence=0.85,
@@ -62,10 +62,11 @@ def test_fixed_prediction_with_unresolved_local_risk_becomes_forced_binary_vulne
 
     assert modified is True
     assert out.prediction == FinalPrediction.inconclusive
-    assert out.forced_prediction_bool is True
-    assert out.forced_prediction == "vulnerable"
-    assert out.decision_status == "forced_binary_vulnerable"
+    assert out.forced_prediction_bool is False
+    assert out.forced_prediction == "fixed/non-vulnerable"
+    assert out.decision_status == "forced_binary_non_vulnerable"
     assert any("unresolved local-risk" in note for note in notes)
+    assert any("local risks remain unproven" in note for note in notes)
 
 
 def test_hypotheses_id_alias_is_normalized():

@@ -1129,3 +1129,81 @@ class TestStage06RecoveryAndRepairRouting:
             f"JSON repair must not fire for null proof (normalizer should handle it). "
             f"Got json_repair_stages={json_repair_stages}"
         )
+
+# ---------------------------------------------------------------------------
+# Queryable-gap fallback query generation — protects loops from weak LLM queries
+# ---------------------------------------------------------------------------
+
+class TestQueryableGapFallbackQueries:
+    def test_actionable_gap_queries_adds_deterministic_fallbacks_before_llm_queries(self):
+        from vckg_agentic_proof.adapter import _actionable_gap_queries
+        from vckg_agentic_proof.schemas import EvidenceGapPlan, KGQuery
+
+        plan = EvidenceGapPlan.model_validate({
+            "needs_more_evidence": True,
+            "gaps": [
+                {
+                    "gap_id": "GAP-01",
+                    "hypothesis_id": "HYP-01",
+                    "proof_element": "Caller/input-source evidence for itemsize and length_power",
+                    "missing_evidence": "Need caller constraints and validation of itemsize and length_power",
+                    "queryable": True,
+                    "priority": "high",
+                    "recommended_query_focus": "callers and validation logic",
+                }
+            ],
+            "follow_up_queries": [
+                {
+                    "query_id": "LLM-01",
+                    "purpose": "weak duplicate",
+                    "query_text": 'call_neighborhood(target_function="count_rows", direction="caller", call_depth=3)',
+                    "expected_evidence": "caller constraints",
+                    "variables": [],
+                }
+            ],
+        })
+        queries = _actionable_gap_queries({"function": "count_rows"}, plan, plan.follow_up_queries, prefix="QF1-")
+        texts = [q.query_text for q in queries]
+        assert texts[0].startswith('security_context(target_function="count_rows"'), texts
+        assert any('variable_flow(target_function="count_rows", symbol="itemsize"' in t for t in texts)
+        assert any('variable_flow(target_function="count_rows", symbol="length_power"' in t for t in texts)
+        assert any('direction="in"' in t for t in texts), texts
+
+    def test_actionable_gap_queries_drops_placeholder_file_context(self):
+        from vckg_agentic_proof.adapter import _actionable_gap_queries
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+
+        plan = EvidenceGapPlan.model_validate({
+            "needs_more_evidence": True,
+            "gaps": [{
+                "gap_id": "GAP-01", "hypothesis_id": "HYP-01",
+                "proof_element": "Validation of curve->p",
+                "missing_evidence": "Need buildCurveZZ_p validation",
+                "queryable": True, "priority": "high",
+            }],
+            "follow_up_queries": [{
+                "query_id": "BAD", "purpose": "placeholder",
+                "query_text": 'file_context(file="<relative/path/to/curve_construction.c>")',
+                "expected_evidence": "x", "variables": [],
+            }],
+        })
+        queries = _actionable_gap_queries({"function": "pointZZ_pAdd"}, plan, plan.follow_up_queries, prefix="QF1-")
+        assert all("<relative" not in q.query_text for q in queries)
+        assert any('evidence_slice(target_function="pointZZ_pAdd", target_statement="curve->p"' in q.query_text for q in queries)
+
+    def test_plan_effective_needs_more_evidence_true_for_queryable_gap_without_llm_query(self):
+        from vckg_agentic_proof.adapter import _plan_effective_needs_more_evidence
+        from vckg_agentic_proof.schemas import EvidenceGapPlan
+
+        plan = EvidenceGapPlan.model_validate({
+            "needs_more_evidence": False,
+            "stop_reason_if_no_queries": "no_new_evidence",
+            "gaps": [{
+                "gap_id": "GAP-01", "hypothesis_id": "HYP-01",
+                "proof_element": "caller_input_source",
+                "missing_evidence": "caller constraints are still missing",
+                "queryable": True, "priority": "high",
+            }],
+            "follow_up_queries": [],
+        })
+        assert _plan_effective_needs_more_evidence(plan) is True

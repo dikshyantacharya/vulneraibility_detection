@@ -1064,3 +1064,22 @@ class TestConsistencyRepairPolicy:
             f"Stage 07 must not run for forced_binary_non_vulnerable downgrade. "
             f"Got: {repair_stages}"
         )
+
+# ---------------------------------------------------------------------------
+# Forced-binary artifacts with missing forced_prediction_bool
+# ---------------------------------------------------------------------------
+
+class TestForcedBinaryStatusInference:
+    def test_classify_sample_infers_forced_bool_from_status_when_field_missing(self):
+        from student_system_creator.dashboard.research import _classify_sample
+        fp = {"is_vulnerable": True, "decision_status": "forced_binary_vulnerable", "confidence": 0.65}
+        sample = {"is_vulnerable": False}
+        result, error_type, outcome = _classify_sample(fp, sample)
+        assert (result, error_type, outcome) == ("incorrect", "fp", "FP")
+
+    def test_classify_sample_infers_forced_non_vulnerable_from_status_when_field_missing(self):
+        from student_system_creator.dashboard.research import _classify_sample
+        fp = {"is_vulnerable": False, "decision_status": "forced_binary_non_vulnerable", "confidence": 0.65}
+        sample = {"is_vulnerable": False}
+        result, error_type, outcome = _classify_sample(fp, sample)
+        assert (result, error_type, outcome) == ("correct", "tn", "TN")
