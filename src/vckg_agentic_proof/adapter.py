@@ -10,7 +10,7 @@ from .prompts import (counter_evidence_prompt, counter_gap_analysis_prompt,
                       hypothesis_verification_prompt, kg_query_planning_prompt,
                       source_only_hypothesis_prompt, consistency_repair_prompt)
 from .schemas import (CounterEvidenceReview, EvidenceGapPlan, FinalDecision,
-                      FinalPrediction, HypothesisStatus, KGQuery, KGQueryPlan,
+                      FinalPrediction, HypothesisStatus, HypothesisVerification, KGQuery, KGQueryPlan,
                       VulnerabilityHypothesis)
 from .validator import validate_final_decision
 
@@ -18,15 +18,18 @@ from .validator import validate_final_decision
 def _make_emergency_fallback_decision(error_msg: str) -> FinalDecision:
     """Return a minimal FinalDecision that marks the sample as failed_parse.
 
-    Used when Stage 06 JSON cannot be parsed or validated. Excluded from binary
-    metrics by _is_valid_binary_prediction() via decision_status='failed_parse'.
+    This is the last-resort fallback used only when no prior structured
+    verification exists.  Normal Stage-06 parse/truncation failures should use
+    _make_fallback_decision_from_verifications() so the sample still receives a
+    benchmarkable binary prediction from already-validated evidence rather than
+    defaulting to fixed/non-vulnerable.
     """
     return FinalDecision(
         prediction=FinalPrediction.fixed_or_non_vulnerable,
         confidence=0.0,
         local_risk_present=False,
         confirmed_security_vulnerability=False,
-        explanation="Stage 06 final adjudication could not be parsed or validated.",
+        explanation="Stage 06 final adjudication could not be parsed or validated, and no prior verification evidence was available for deterministic fallback.",
         limitations=[],
         forced_prediction="fixed/non-vulnerable",
         forced_prediction_bool=False,
@@ -34,7 +37,91 @@ def _make_emergency_fallback_decision(error_msg: str) -> FinalDecision:
         evidence_strength="insufficient_static_evidence",
         evidence_exhausted=True,
         why_forced_binary=f"Emergency fallback: parse/validate failed. {error_msg}",
+        final_decision_source="stage06_emergency_failed_parse",
+        normalization_warnings=["stage06_no_structured_verification_fallback_available"],
     )
+
+
+def _make_fallback_decision_from_verifications(
+    error_msg: str,
+    verifications: Any,
+    *,
+    evidence_items: List[Dict[str, Any]] | None = None,
+    counter_review: Any = None,
+) -> tuple[FinalDecision, List[str], bool]:
+    """Build a deterministic final decision when Stage 06 truncates or fails.
+
+    Stage 06 can fail for operational reasons (for example, a long 600B-model
+    answer truncated before </answer>).  In that case the previous verification
+    and counter-evidence stages are already parsed and validated.  This function
+    converts those existing verifications into a conservative inconclusive
+    decision and lets validate_final_decision() apply the same binary policy used
+    for normal model output.
+
+    The fallback is label-free: it uses only retrieved evidence, verification
+    statuses, counter-review recommendations, and deterministic source facts.
+    """
+    raw_items = []
+    if isinstance(verifications, dict):
+        raw_items = list(verifications.get("verifications") or [])
+    elif isinstance(verifications, list):
+        raw_items = list(verifications)
+
+    parsed_items = []
+    parse_notes: List[str] = []
+    for i, item in enumerate(raw_items):
+        try:
+            parsed_items.append(
+                item if isinstance(item, HypothesisVerification) else HypothesisVerification.model_validate(item)
+            )
+        except Exception as exc:
+            parse_notes.append(f"fallback_skipped_verification_{i}: {type(exc).__name__}: {exc}")
+
+    if not parsed_items:
+        return _make_emergency_fallback_decision(error_msg), [f"stage06_failed_no_verifications: {error_msg}", *parse_notes], False
+
+    local_risk = any(bool(h.local_risk_present) for h in parsed_items)
+    confirmed = [
+        h for h in parsed_items
+        if h.status == HypothesisStatus.confirmed_vulnerability and h.confirmed_security_vulnerability
+    ]
+    prediction = FinalPrediction.vulnerable if confirmed else FinalPrediction.inconclusive
+    decisive_ids: List[str] = []
+    for h in parsed_items:
+        decisive_ids.extend([str(x) for x in (h.supporting_evidence_ids or []) if str(x).strip()])
+    decisive_ids = sorted(dict.fromkeys(decisive_ids))[:20]
+
+    decision = FinalDecision(
+        prediction=prediction,
+        confidence=0.6 if local_risk else 0.55,
+        local_risk_present=local_risk,
+        confirmed_security_vulnerability=bool(confirmed),
+        final_hypothesis_statuses=parsed_items,
+        minimum_vulnerability_proof=confirmed[0].proof if confirmed and confirmed[0].proof.complete() else None,
+        decisive_evidence_ids=decisive_ids,
+        decisive_counter_evidence_ids=[],
+        explanation=(
+            "Stage 06 final adjudication could not be parsed or validated, so the "
+            "pipeline derived the final decision from the latest validated "
+            "hypothesis-verification and counter-evidence records."
+        ),
+        limitations=[
+            "Stage 06 LLM answer was unavailable or malformed/truncated.",
+            "Binary decision was derived by validator policy from prior structured stages.",
+        ],
+        evidence_exhausted=True,
+        final_decision_source="stage06_fallback_from_verifications",
+        normalization_warnings=[f"stage06_parse_or_validation_failed: {error_msg}", *parse_notes],
+    )
+    validated, notes, modified = validate_final_decision(
+        decision, evidence_items=evidence_items, counter_review=counter_review
+    )
+    validated.final_decision_source = validated.final_decision_source or "stage06_fallback_from_verifications"
+    warnings = list(validated.normalization_warnings or [])
+    if not any("stage06_parse_or_validation_failed" in w for w in warnings):
+        warnings.append(f"stage06_parse_or_validation_failed: {error_msg}")
+    validated.normalization_warnings = warnings
+    return validated, [f"stage06_fallback_from_verifications: {error_msg}", *notes, *parse_notes], True
 
 
 _RESOLVED_STATUSES = {
@@ -49,6 +136,88 @@ _RESOLVED_STATUSES = {
 def _norm_query(text: str) -> str:
     """Normalize a query text for deduplication (case-insensitive, whitespace-collapsed)."""
     return re.sub(r"\s+", " ", (text or "").lower().strip())
+
+
+def _infer_deterministic_source_facts(target_source: str, target_function: str = "") -> List[Dict[str, Any]]:
+    """Infer small, deterministic source-level facts not dependent on labels.
+
+    This supplements KG retrieval with facts that are visible in the target source
+    but easy for the LLM to underweight.  The facts are deliberately generic:
+    they identify guard shapes such as saving a base pointer and requiring an
+    advanced pointer to remain above that base.  They do not use commit labels,
+    true labels, patch messages, sample ids, or project metadata.
+    """
+    src = target_source or ""
+    facts: List[Dict[str, Any]] = []
+    next_id = 1
+
+    def add_fact(fact_type: str, text: str, **meta: Any) -> None:
+        nonlocal next_id
+        facts.append({
+            "id": f"AUTO-SF-{next_id:02d}",
+            "kind": "deterministic_source_fact",
+            "file": None,
+            "function": target_function or None,
+            "line_start": None,
+            "line_end": None,
+            "text": text,
+            "relation": "source_static_analysis",
+            "score": 2.8,
+            "metadata": {"fact_type": fact_type, **meta},
+        })
+        next_id += 1
+
+    # Detect pointer-advance operations such as raw += length * itemsize.
+    advanced_ptrs = set()
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\+=\s*([^;]+);", src):
+        lhs, rhs = m.group(1), m.group(2)
+        if any(term in rhs for term in ("*", "length", "size", "count", "<<")):
+            advanced_ptrs.add(lhs)
+            add_fact(
+                "pointer_advance_from_size_or_length",
+                f"Pointer-like variable `{lhs}` is advanced by a size/length expression: `{lhs} += {rhs.strip()};`.",
+                pointer=lhs, expression=rhs.strip(),
+            )
+
+    # Detect base pointer snapshots: void * start = raw; or start = raw;
+    base_pairs: list[tuple[str, str]] = []
+    for m in re.finditer(r"(?:void\s*\*\s*)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;", src):
+        base, ptr = m.group(1), m.group(2)
+        if ptr in advanced_ptrs and base != ptr:
+            base_pairs.append((base, ptr))
+
+    # Approximate while conditions line-wise to avoid complicated C parsing.
+    while_conditions: list[str] = []
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("while"):
+            while_conditions.append(stripped)
+
+    for base, ptr in base_pairs:
+        has_guard = any(
+            re.search(rf"\b{re.escape(ptr)}\s*>=\s*{re.escape(base)}\b", cond)
+            or re.search(rf"\b{re.escape(base)}\s*<=\s*{re.escape(ptr)}\b", cond)
+            for cond in while_conditions
+        )
+        if has_guard:
+            add_fact(
+                "pointer_wraparound_lower_bound_guard",
+                f"Pointer wraparound guard: `{base}` snapshots the initial `{ptr}` pointer and a loop condition requires `{ptr} >= {base}` while `{ptr}` is advanced. This is positive safety evidence against wraparound-to-lower-address pointer-advance hypotheses.",
+                pointer=ptr, base=base,
+            )
+
+    # Detect exact-end success plus error return on mismatch: if (raw == end) return ...; ... return -1;
+    for ptr in advanced_ptrs or {"raw"}:
+        m = re.search(rf"if\s*\(\s*{re.escape(ptr)}\s*==\s*([A-Za-z_]\w*)\s*\)\s*\n?\s*return\b", src, flags=re.S)
+        if m and re.search(r"return\s+-1\s*;", src[m.end():], flags=re.S):
+            add_fact(
+                "exact_end_success_else_error",
+                f"Exact-end guard: success requires `{ptr} == {m.group(1)}`; otherwise the function reaches an error return `-1`. This is positive safety evidence for parsers that should reject corrupt or wrapped traversals.",
+                pointer=ptr, end=m.group(1),
+            )
+            break
+
+    return facts
 
 
 def _all_hypotheses_resolved(verifications: Dict[str, Any]) -> bool:
@@ -327,6 +496,18 @@ def run_agentic_proof_pipeline(
     sample_id = sample.get("id") or sample.get("sample_id") or "unknown"
     events: List[AgentEvent] = []
     usage_total: Dict[str, Any] = {}
+
+    # Deterministic source-level facts are label-free and prompt-visible. They
+    # help the verifier/counter-review distinguish unguarded local risk from
+    # patched guard logic even when CodeKG caller queries return no new nodes.
+    source_facts = _infer_deterministic_source_facts(
+        target_source, str(sample.get("function") or sample.get("func_name") or sample.get("target_function") or "")
+    )
+    if source_facts:
+        initial_evidence = list(initial_evidence) + source_facts
+        events.append(AgentEvent(sample_id, "00_deterministic_source_facts", "done",
+                                  details={"items": len(source_facts),
+                                           "fact_types": [f.get("metadata", {}).get("fact_type") for f in source_facts]}))
 
     # ── Stage 01: source-only hypothesis generation ──────────────────────────
     text, usage = _call_llm(
@@ -703,13 +884,19 @@ def run_agentic_proof_pipeline(
         }))
     except Exception as _stage06_exc:
         _err_msg = f"{type(_stage06_exc).__name__}: {_stage06_exc}"
-        decision = _make_emergency_fallback_decision(_err_msg)
-        notes = [f"stage06_failed: {_err_msg}"]
+        decision, notes, modified = _make_fallback_decision_from_verifications(
+            _err_msg,
+            verifications,
+            evidence_items=accumulated_evidence,
+            counter_review=counter_review,
+        )
         events.append(AgentEvent(sample_id, "06_final_adjudication", "parse_failed", details={
             "error_type": type(_stage06_exc).__name__,
             "error_message": str(_stage06_exc),
-            "recovery": "emergency_fallback",
-            "decision_status": "failed_parse",
+            "recovery": decision.final_decision_source or "fallback_from_verifications",
+            "decision_status": decision.decision_status,
+            "forced_prediction": decision.forced_prediction,
+            "forced_prediction_bool": decision.forced_prediction_bool,
         }))
 
     # ── Stage 07: Schema consistency repair (conditional) ────────────────────

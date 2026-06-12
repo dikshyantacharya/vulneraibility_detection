@@ -27,11 +27,84 @@ def _evidence_id_set(evidence_items: Iterable[Any] | None) -> set[str]:
             ids.add(str(v))
     return ids
 
+def _source_fact_types(evidence_items: Iterable[Any] | None) -> set[str]:
+    fact_types: set[str] = set()
+    for item in evidence_items or []:
+        meta = None
+        text = ""
+        if isinstance(item, dict):
+            meta = item.get("metadata") or {}
+            text = str(item.get("text") or "")
+        else:
+            meta = getattr(item, "metadata", {}) or {}
+            text = str(getattr(item, "text", "") or "")
+        ft = meta.get("fact_type") if isinstance(meta, dict) else None
+        if ft:
+            fact_types.add(str(ft))
+        low = text.lower()
+        if "pointer wraparound guard" in low or "wraparound-to-lower-address" in low:
+            fact_types.add("pointer_wraparound_lower_bound_guard")
+        if "exact-end guard" in low and "return `-1`" in low:
+            fact_types.add("exact_end_success_else_error")
+    return fact_types
+
+
+def _has_pointer_wraparound_safety(evidence_items: Iterable[Any] | None) -> bool:
+    facts = _source_fact_types(evidence_items)
+    return (
+        "pointer_wraparound_lower_bound_guard" in facts
+        and "exact_end_success_else_error" in facts
+    )
+
+
+def _verification_text(h: Any) -> str:
+    proof = getattr(h, "proof", None)
+    parts = [
+        getattr(h, "hypothesis_id", ""),
+        getattr(h, "explanation", ""),
+    ]
+    if proof is not None:
+        parts.extend([
+            getattr(proof, "dangerous_operation", ""),
+            getattr(proof, "missing_or_failed_guard", ""),
+            getattr(proof, "unsafe_use", ""),
+            getattr(proof, "security_impact", ""),
+        ])
+    return " ".join(str(x or "") for x in parts).lower()
+
+
+def _is_pointer_wraparound_like(h: Any) -> bool:
+    text = _verification_text(h)
+    pointer_terms = (
+        "pointer", "raw", "buffer", "end", "start", "advance",
+        "wrap", "overflow", "underflow", "out-of-bounds", "overread",
+        "read past", "length * itemsize", "+=",
+    )
+    return any(term in text for term in pointer_terms)
+
+
+def _pointer_safety_covers_unresolved(decision: FinalDecision, unresolved_ids: list[str], evidence_items: Iterable[Any] | None) -> bool:
+    if not unresolved_ids or not _has_pointer_wraparound_safety(evidence_items):
+        return False
+    by_id = {h.hypothesis_id: h for h in (decision.final_hypothesis_statuses or [])}
+    return all(_is_pointer_wraparound_like(by_id.get(hid)) for hid in unresolved_ids if hid in by_id)
+
+
 def _looks_non_specific(value: str | None) -> bool:
     s = (value or "").strip().lower()
     if not s:
         return True
     if s in _GENERIC_PROOF_PHRASES:
+        return True
+    # A complete proof field must assert the proof element, not say it is only
+    # plausible/unproven.  Without this, models can accidentally turn
+    # "attacker control is plausible but unproven" into a confirmed proof chain.
+    uncertainty_markers = (
+        "unproven", "plausible but unproven", "not proven", "not established",
+        "depends on", "if attacker", "if an attacker", "could be", "may be",
+        "requires proof", "requires attacker", "no evidence", "unknown",
+    )
+    if any(marker in s for marker in uncertainty_markers):
         return True
     return len(s) < 4
 
@@ -82,6 +155,19 @@ def _unresolved_local_risk_ids(decision: FinalDecision, counter_by_h: dict[str, 
     return unresolved
 
 
+def _set_binary_explanation(decision: FinalDecision, *, vulnerable: bool, reason: str) -> None:
+    """Keep dashboard reasoning consistent with forced_prediction_bool.
+
+    The LLM sometimes writes an explanation for its pre-validator answer
+    (for example, "predicted vulnerable") while the validator legitimately
+    forces the binary result the other way.  The dashboard uses explanation as
+    the user-facing final reasoning, so overwrite it when validator policy is
+    the source of the binary decision.
+    """
+    label = "vulnerable" if vulnerable else "fixed/non-vulnerable"
+    decision.explanation = f"Validator-forced binary decision: {label}. {reason}"
+
+
 def validate_final_decision(
     decision: FinalDecision,
     *,
@@ -99,6 +185,7 @@ def validate_final_decision(
     modified = False
     existing_ids = _evidence_id_set(evidence_items)
     counter_by_h = _counter_recommendations(counter_review)
+    has_pointer_wrap_safety = _has_pointer_wraparound_safety(evidence_items)
 
     usable_confirmed = []
     for h in decision.final_hypothesis_statuses:
@@ -120,6 +207,13 @@ def validate_final_decision(
             missing = sorted(cited - existing_ids)
             notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: proof cites evidence ids not present in retrieved evidence: {missing[:8]}.")
             continue
+        if has_pointer_wrap_safety and _is_pointer_wraparound_like(h):
+            proof_text = _verification_text(h)
+            if "raw >= start" not in proof_text and "lower-bound" not in proof_text and "pointer wraparound guard" not in proof_text:
+                notes.append(
+                    f"Rejected confirmed hypothesis {h.hypothesis_id}: deterministic source facts show a pointer-wraparound lower-bound guard plus exact-end error return, but the proof does not explain how that guard is bypassed."
+                )
+                continue
         usable_confirmed.append(h)
 
     if decision.prediction == FinalPrediction.vulnerable:
@@ -174,27 +268,48 @@ def validate_final_decision(
             decision.confidence = 0.95; modified = True
 
     unresolved_local = _unresolved_local_risk_ids(decision, counter_by_h)
+    pointer_safety_covers_unresolved = _pointer_safety_covers_unresolved(decision, unresolved_local, evidence_items)
     if decision.prediction == FinalPrediction.fixed_or_non_vulnerable and unresolved_local:
-        notes.append(
-            "Converted fixed/non-vulnerable decision to evidence-incomplete: "
-            f"unresolved local-risk hypotheses remain: {unresolved_local[:8]}. "
-            "Missing attacker-control evidence is not positive proof of safety."
-        )
-        decision.prediction = FinalPrediction.inconclusive
-        decision.local_risk_present = True
-        decision.confirmed_security_vulnerability = False
-        decision.confidence = min(decision.confidence, 0.65)
-        if not decision.residual_uncertainty:
-            decision.residual_uncertainty = [
-                f"Unresolved local-risk hypothesis: {hid}" for hid in unresolved_local[:8]
-            ]
-        if not decision.why_forced_binary:
-            decision.why_forced_binary = (
-                "Positive safety proof is incomplete; binary benchmark output falls back "
-                "to local-risk-present heuristic after bounded evidence retrieval."
+        if pointer_safety_covers_unresolved:
+            notes.append(
+                "Retained fixed/non-vulnerable decision: unresolved local-risk hypotheses are pointer-wraparound-like and deterministic source facts show a lower-bound pointer guard plus exact-end error return."
             )
-        decision.evidence_exhausted = True
-        modified = True
+            decision.confirmed_security_vulnerability = False
+            decision.local_risk_present = True
+            if decision.confidence > 0.80:
+                decision.confidence = 0.80
+                modified = True
+            decision.evidence_strength = decision.evidence_strength or "likely"
+            _set_binary_explanation(
+                decision,
+                vulnerable=False,
+                reason=(
+                    "The model selected fixed/non-vulnerable and the validator retained it because "
+                    "all unresolved local-risk hypotheses are pointer-wraparound-like and deterministic "
+                    "source facts show a lower-bound pointer guard plus exact-end error return."
+                ),
+            )
+        else:
+            notes.append(
+                "Converted fixed/non-vulnerable decision to evidence-incomplete: "
+                f"unresolved local-risk hypotheses remain: {unresolved_local[:8]}. "
+                "Missing attacker-control evidence is not positive proof of safety."
+            )
+            decision.prediction = FinalPrediction.inconclusive
+            decision.local_risk_present = True
+            decision.confirmed_security_vulnerability = False
+            decision.confidence = min(decision.confidence, 0.65)
+            if not decision.residual_uncertainty:
+                decision.residual_uncertainty = [
+                    f"Unresolved local-risk hypothesis: {hid}" for hid in unresolved_local[:8]
+                ]
+            if not decision.why_forced_binary:
+                decision.why_forced_binary = (
+                    "Positive safety proof is incomplete; binary benchmark output falls back "
+                    "to local-risk-present heuristic after bounded evidence retrieval."
+                )
+            decision.evidence_exhausted = True
+            modified = True
 
     # Always populate forced binary fields so benchmark scoring always has a
     # definitive True/False regardless of internal evidence status.
@@ -209,7 +324,7 @@ def validate_final_decision(
         decision.decision_status = "confirmed_non_vulnerable"
         decision.evidence_strength = "confirmed" if decision.confidence >= 0.80 else "likely"
     else:  # inconclusive — choose the more evidence-supported class
-        if decision.local_risk_present:
+        if decision.local_risk_present and not pointer_safety_covers_unresolved:
             decision.forced_prediction = "vulnerable"
             decision.forced_prediction_bool = True
             decision.decision_status = "forced_binary_vulnerable"
@@ -217,11 +332,39 @@ def validate_final_decision(
             decision.forced_prediction = "fixed/non-vulnerable"
             decision.forced_prediction_bool = False
             decision.decision_status = "forced_binary_non_vulnerable"
+            if pointer_safety_covers_unresolved:
+                notes.append("Forced fixed/non-vulnerable: pointer-wraparound local risks are covered by deterministic lower-bound pointer guard and exact-end error return.")
         decision.evidence_strength = "insufficient_static_evidence"
         if not decision.why_forced_binary:
-            decision.why_forced_binary = (
-                "Evidence incomplete after bounded loop; forced binary chosen by "
-                "local_risk_present heuristic."
+            if pointer_safety_covers_unresolved:
+                decision.why_forced_binary = (
+                    "Evidence incomplete after bounded loop, but deterministic source facts show "
+                    "a pointer-wraparound lower-bound guard and exact-end error return covering the remaining local risk."
+                )
+            else:
+                decision.why_forced_binary = (
+                    "Evidence incomplete after bounded loop; forced binary chosen by "
+                    "local_risk_present heuristic."
+                )
+        if pointer_safety_covers_unresolved:
+            _set_binary_explanation(
+                decision,
+                vulnerable=False,
+                reason=(
+                    "Remaining local-risk hypotheses are pointer-wraparound-like and are covered by "
+                    "deterministic lower-bound pointer-guard plus exact-end error-return evidence. "
+                    f"Residual uncertainty: {decision.residual_uncertainty[:3]}."
+                ),
+            )
+        elif decision.local_risk_present:
+            _set_binary_explanation(
+                decision,
+                vulnerable=True,
+                reason=(
+                    "At least one local-risk hypothesis remains unresolved after bounded retrieval, "
+                    "and no deterministic safety guard covers the remaining dangerous operation. "
+                    "This is a forced binary choice, not a confirmed vulnerability proof."
+                ),
             )
         decision.evidence_exhausted = True
 

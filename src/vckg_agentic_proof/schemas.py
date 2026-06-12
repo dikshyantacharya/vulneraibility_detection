@@ -1,5 +1,6 @@
 from __future__ import annotations
 from enum import Enum
+import re
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
@@ -62,6 +63,31 @@ class VulnerabilityHypothesis(BaseModel):
             data = {**data, "hypothesis_id": data.get("hypotheses_id")}
         return data
 
+def normalize_codekg_query_text(text: str) -> str:
+    """Normalize common LLM aliases in CodeKG function-call query text.
+
+    The deterministic CodeKG engine accepts direction="in"/"out"/"both".
+    LLMs often emit readable aliases such as "incoming" or "callers";
+    normalizing at the schema boundary prevents valid follow-up queries from
+    returning zero evidence only because of a spelling variant.
+    """
+    out = str(text or "")
+    replacements = {
+        "incoming": "in",
+        "caller": "in",
+        "callers": "in",
+        "callee": "out",
+        "callees": "out",
+        "outgoing": "out",
+    }
+    def repl(match: re.Match[str]) -> str:
+        quote = match.group(1)
+        value = match.group(2).lower()
+        return f"direction={quote}{replacements.get(value, value)}{quote}"
+    out = re.sub(r"direction\s*=\s*(['\"])(incoming|caller|callers|callee|callees|outgoing)\1", repl, out, flags=re.I)
+    return out
+
+
 class KGQuery(BaseModel):
     query_id: str
     hypothesis_id: Optional[str] = None
@@ -73,6 +99,13 @@ class KGQuery(BaseModel):
     variables: List[str] = Field(default_factory=list)
     expected_evidence: str
     limit: int = 8
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_query_text(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "query_text" in data:
+            data = {**data, "query_text": normalize_codekg_query_text(str(data.get("query_text") or ""))}
+        return data
 
 class KGQueryPlan(BaseModel):
     queries: List[KGQuery] = Field(default_factory=list)

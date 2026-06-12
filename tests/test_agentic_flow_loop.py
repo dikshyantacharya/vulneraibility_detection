@@ -1001,14 +1001,13 @@ class TestStage06RecoveryAndRepairRouting:
         assert result is not None, "Pipeline must not raise when Stage 06 schema validation fails"
         assert result.decision is not None, "Decision must not be None after Stage 06 schema failure"
 
-    def test_stage06_schema_failure_sets_failed_parse_status(self):
-        """decision_status must be 'failed_parse' when Stage 06 schema validation fails."""
+    def test_stage06_schema_failure_uses_prior_verification_fallback(self):
+        """Stage 06 schema failure should derive a decision from prior structured stages."""
         result, _ = self._run_pipeline(
             json.dumps({"completely_wrong_schema": True})
         )
-        assert result.decision.decision_status == "failed_parse", (
-            f"Expected 'failed_parse', got {result.decision.decision_status!r}"
-        )
+        assert result.decision.decision_status in {"confirmed_non_vulnerable", "forced_binary_non_vulnerable"}
+        assert result.decision.final_decision_source == "stage06_fallback_from_verifications"
 
     def test_stage06_schema_failure_produces_no_json_repair_stage(self):
         """Valid JSON with schema failure must NOT produce a '06_final_adjudication_json_repair' stage."""
@@ -1076,19 +1075,15 @@ class TestStage06RecoveryAndRepairRouting:
             f"Got json_repair_stages={json_repair_stages}"
         )
 
-    def test_stage06_fallback_decision_is_not_counted_as_valid_binary(self):
-        """An emergency fallback decision from a failed Stage 06 must have
-        decision_status='failed_parse' so it is excluded from binary metrics."""
+    def test_stage06_fallback_decision_is_counted_when_prior_verifications_exist(self):
+        """A failed Stage 06 should still be benchmarkable when prior structured verification exists."""
         result, _ = self._run_pipeline(
             json.dumps({"garbage": "not a FinalDecision"})
         )
         d = result.decision
-        assert d.decision_status == "failed_parse", (
-            f"Emergency fallback must set decision_status='failed_parse', got {d.decision_status!r}"
-        )
-        assert d.confidence == 0.0, (
-            f"Emergency fallback must have confidence=0.0, got {d.confidence!r}"
-        )
+        assert d.decision_status != "failed_parse"
+        assert d.forced_prediction_bool in {True, False}
+        assert d.final_decision_source == "stage06_fallback_from_verifications"
 
     def _make_null_proof_stage06_json(self) -> str:
         return json.dumps({

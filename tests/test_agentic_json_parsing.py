@@ -1038,8 +1038,8 @@ class TestParseModelObjectRepairRouting:
             f"Got json_repair_stages={json_repair_stages}"
         )
 
-    def test_stage06_schema_failure_gives_failed_parse_decision_status(self):
-        """When Stage 06 returns schema-invalid JSON, decision_status must be 'failed_parse'."""
+    def test_stage06_schema_failure_uses_structured_fallback_decision_status(self):
+        """When Stage 06 schema-fails, prior verification should provide a benchmarkable fallback."""
         from vckg_agentic_proof.adapter import run_agentic_proof_pipeline, AgenticProofConfig
 
         config = AgenticProofConfig(
@@ -1086,10 +1086,11 @@ class TestParseModelObjectRepairRouting:
         )
         assert result is not None
         assert result.decision is not None
-        assert result.decision.decision_status == "failed_parse", (
-            f"Expected decision_status='failed_parse' for schema-invalid Stage 06, "
-            f"got {result.decision.decision_status!r}"
+        assert result.decision.decision_status != "failed_parse", (
+            f"Expected structured fallback decision, got failed_parse"
         )
+        assert result.decision.final_decision_source == "stage06_fallback_from_verifications"
+        assert result.decision.forced_prediction_bool in {True, False}
 
 
 # ---------------------------------------------------------------------------

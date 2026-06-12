@@ -31,6 +31,81 @@ def _binary_final_decision_schema() -> str:
 
 # Compact binary-only output contract for consistency_repair_prompt.
 # Much smaller than the full Pydantic schema (~14KB) so it fits in repair token budgets.
+
+
+_FINAL_DECISION_COMPACT_CONTRACT = json.dumps({
+    "prediction": "vulnerable | fixed/non-vulnerable",
+    "prediction_bool": True,
+    "confidence": "number 0.0..1.0",
+    "local_risk_present": True,
+    "confirmed_security_vulnerability": False,
+    "final_hypothesis_statuses": [
+        {
+            "hypothesis_id": "HYP-01",
+            "status": "confirmed_vulnerability | plausible_but_unproven | refuted_by_guard | refuted_by_caller_constraint | refuted_by_patch_or_changed_logic | irrelevant_to_target_function | insufficient_evidence",
+            "local_risk_present": True,
+            "confirmed_security_vulnerability": False,
+            "proof": {
+                "input_control": "short string; empty if unproven",
+                "dangerous_operation": "short string",
+                "missing_or_failed_guard": "short string",
+                "unsafe_use": "short string",
+                "security_impact": "short string",
+                "cited_evidence_ids": []
+            },
+            "supporting_evidence_ids": [],
+            "counter_evidence_ids": [],
+            "missing_evidence": [],
+            "explanation": "one concise sentence"
+        }
+    ],
+    "minimum_vulnerability_proof": "object with same proof fields, or null",
+    "decisive_evidence_ids": [],
+    "decisive_counter_evidence_ids": [],
+    "explanation": "2-4 concise sentences; must match prediction",
+    "limitations": [],
+    "forced_prediction": "same as prediction",
+    "forced_prediction_bool": True,
+    "decision_status": "confirmed_vulnerable | confirmed_non_vulnerable | forced_binary_vulnerable | forced_binary_non_vulnerable",
+    "evidence_strength": "confirmed | likely | weak | insufficient_static_evidence",
+    "residual_uncertainty": [],
+    "why_forced_binary": "string or null",
+    "evidence_exhausted": True
+}, indent=2)
+
+
+def _short_evidence_digest(evidence: List[Dict[str, Any]], max_items: int = 90, max_text: int = 360) -> List[Dict[str, Any]]:
+    """Compact evidence for final adjudication.
+
+    Stage 06 should decide, not re-read the entire graph dump.  Long evidence
+    blocks cause verbose/truncated answers, so pass only the id, kind, relation,
+    metadata, and short text needed for citation.
+    """
+    out: List[Dict[str, Any]] = []
+    priority_kinds = {"target_statement", "deterministic_source_fact", "callee_function", "codekg_semanticfact"}
+    ordered = sorted(
+        list(evidence or []),
+        key=lambda e: (0 if (e.get("kind") in priority_kinds or str(e.get("id", "")).startswith("AUTO-SF")) else 1, str(e.get("id") or e.get("evidence_id") or "")),
+    )
+    for e in ordered[:max_items]:
+        text = str(e.get("text") or "")
+        if len(text) > max_text:
+            text = text[:max_text] + " ..."
+        item = {
+            "id": e.get("id") or e.get("evidence_id"),
+            "kind": e.get("kind"),
+            "relation": e.get("relation"),
+            "text": text,
+        }
+        if e.get("metadata"):
+            item["metadata"] = e.get("metadata")
+        if e.get("file"):
+            item["file"] = e.get("file")
+        if e.get("line_start") is not None:
+            item["line_start"] = e.get("line_start")
+        out.append(item)
+    return out
+
 _BINARY_REPAIR_CONTRACT = json.dumps({
     "prediction": "vulnerable | fixed/non-vulnerable  (ONLY these two — no inconclusive)",
     "confidence": 0.0,
@@ -232,7 +307,10 @@ def hypothesis_verification_prompt(
             "For parser code, distinguish the encoded-width selector (for example length_power) from "
             "the parsed runtime value (for example length = read(raw)); a guard on the selector does "
             "not by itself bound the parsed value. If caller/input-source evidence is missing, keep the "
-            "hypothesis unresolved and make the missing caller/input evidence explicit."
+            "hypothesis unresolved and make the missing caller/input evidence explicit. "
+            "Treat deterministic_source_fact items as source-grounded evidence. A pointer-wraparound "
+            "lower-bound guard (for example start = raw and raw >= start after raw advances) plus an "
+            "exact-end error return can be positive safety evidence for wraparound-to-lower-address parser traversal risks."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -265,7 +343,10 @@ def counter_evidence_prompt(
             "A guard refutes a hypothesis only if it directly bounds the exact dangerous value or "
             "dominates the exact dangerous operation. A guard on a related selector (for example "
             "length_power) does NOT refute overflow of a parsed value (for example length = read(raw)). "
-            "Do not claim a reader-selection guard bounds the attacker-controlled value returned by the reader."
+            "Do not claim a reader-selection guard bounds the attacker-controlled value returned by the reader. "
+            "A saved-base lower-bound guard on the advanced pointer (for example start = raw and raw >= start) "
+            "combined with an exact-end error return may directly refute pointer-wraparound traversal hypotheses, "
+            "but only for that pointer-wraparound class of risk."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -287,28 +368,24 @@ def final_decision_prompt(
     fn = _target_function_name(sample)
     return [
         {"role": "system", "content": (
-            "Final adjudicator. You MUST produce a binary prediction: vulnerable or fixed/non-vulnerable. "
-            "Inconclusive is NOT allowed as a final prediction — the pipeline will force a binary choice "
-            "anyway, so choose the most evidence-supported class explicitly. "
-            "Decide vulnerable only if at least one hypothesis remains confirmed_vulnerability after "
-            "counter-evidence and has a complete cited minimum proof. "
-            "Decide fixed/non-vulnerable only when every local-risk hypothesis is refuted by positive "
-            "counter-evidence of safety: a guard on the exact dangerous value, caller constraint, patched "
-            "logic, safe invariant, or unreachable dangerous path. "
-            "If proof is incomplete but an unguarded local risk remains, choose vulnerable with lower confidence. "
-            "If risk is speculative and exact counter-evidence dominates, choose fixed/non-vulnerable. "
-            "Never treat missing attacker-control evidence alone as positive safety evidence. "
-            "Keep local suspiciousness separate from confirmed vulnerability. Always cite evidence IDs. "
-            "For each final_hypothesis_statuses entry, always output a proof object (even if all fields "
-            "are empty strings and cited_evidence_ids is empty). Never output \"proof\": null."
+            "Final adjudicator. Output compact valid JSON only inside <answer>. "
+            "You MUST choose exactly one binary prediction: vulnerable or fixed/non-vulnerable. "
+            "Inconclusive is not allowed in the final answer. "
+            "Decide vulnerable only when a complete cited chain exists or when bounded retrieval leaves an unguarded local risk not covered by deterministic safety evidence. "
+            "Decide fixed/non-vulnerable when positive counter-evidence covers the remaining risk, including deterministic source facts. "
+            "For pointer-overflow parser hypotheses, a deterministic source fact showing a saved-base lower-bound guard on the advanced pointer plus an exact-end error return is exact counter-evidence for wraparound-to-lower-address traversal. "
+            "Never treat missing attacker-control evidence alone as safety evidence. "
+            "Do not output markdown/code fences. Do not exceed 1800 words. "
+            "For each final_hypothesis_statuses entry, always output a proof object; never output proof:null. "
+            "Keep every string concise and cite evidence IDs only, not long copied snippets."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
-            f"ANSWER JSON SCHEMA:\n{_binary_final_decision_schema()}\n\n"
+            f"COMPACT ANSWER CONTRACT (must validate against FinalDecision):\n{_FINAL_DECISION_COMPACT_CONTRACT}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
-            f"VERIFICATIONS:\n{compact_json(verifications, 18000)}\n\n"
-            f"COUNTER REVIEW:\n{compact_json(counter_review, 14000)}\n\n"
-            f"EVIDENCE:\n{compact_json(evidence, 18000)}"
+            f"VERIFICATIONS:\n{compact_json(verifications, 12000)}\n\n"
+            f"COUNTER REVIEW:\n{compact_json(counter_review, 9000)}\n\n"
+            f"EVIDENCE DIGEST:\n{compact_json(_short_evidence_digest(evidence), 12000)}"
         )},
     ]
 
