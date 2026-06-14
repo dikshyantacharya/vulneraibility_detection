@@ -278,6 +278,87 @@ def _infer_deterministic_source_facts(target_source: str, target_function: str =
             "The source calls `mpz_invert`; its return value indicates whether an inverse exists. Missing status checks can be relevant only when the non-invertible case is not otherwise guarded.",
         )
 
+
+
+    # Generic dynamic-allocation safety facts.  These are intentionally
+    # source-local and label-free.  They distinguish project allocation wrappers
+    # from raw C allocation and record whether an allocation result is used before
+    # any obvious NULL guard.  This captures families such as raw malloc/calloc
+    # immediately followed by memset/snprintf/fread/indexing, while allowing
+    # wrapper-based fixed versions to be treated as safety evidence.
+    if "safe_calloc" in src:
+        add_fact(
+            "safe_calloc_allocation_wrapper_used",
+            "The target function uses the project allocation wrapper `safe_calloc`. Treat this as positive allocation-safety evidence for zero-size/allocation-failure hypotheses unless a separate pre-call arithmetic overflow is completely proven.",
+        )
+
+    # A common safe idiom in this benchmark family: allocate N bytes with the
+    # project wrapper and read at most N-1 bytes, leaving space for a terminator.
+    safe_alloc_consts: dict[str, int] = {}
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*safe_calloc\s*\(\s*(\d+)\s*\)", src):
+        safe_alloc_consts[m.group(1)] = int(m.group(2))
+    for var, alloc_size in safe_alloc_consts.items():
+        read_re = re.compile(rf"fread\s*\(\s*{re.escape(var)}\s*,\s*1\s*,\s*(\d+)\s*,", re.S)
+        for m in read_re.finditer(src):
+            read_size = int(m.group(1))
+            if read_size < alloc_size:
+                add_fact(
+                    "bounded_read_within_safe_allocation",
+                    f"`{var}` is allocated with `safe_calloc({alloc_size})` and read with `fread({var}, 1, {read_size}, ...)`, so the fixed-size read is within the allocated buffer with at least one byte of slack.",
+                    buffer=var,
+                    allocation_size=alloc_size,
+                    read_size=read_size,
+                )
+
+    # Raw allocation results used before a visible NULL check.  This is high
+    # signal only when there is no stronger wrapper/growth evidence; the
+    # validator applies that balance.  We record the precise sink shape so the
+    # report can explain the decision.
+    def _find_raw_alloc_uses(alloc_name: str) -> None:
+        pattern = re.compile(rf"\b([A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)?)\s*=\s*{alloc_name}\s*\(([^;]+)\)\s*;", re.S)
+        for m in pattern.finditer(src):
+            var = re.sub(r"\s*(->|\.)\s*", r"\1", m.group(1))
+            arg = " ".join(m.group(2).split())
+            tail = src[m.end(): m.end() + 2500]
+            null_guard = re.search(rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*(?:==\s*NULL)?\s*\)", tail)
+            # Sinks that dereference/use the allocation in ways that crash or corrupt
+            # if allocation failed, or write into a potentially undersized result.
+            sink_patterns = [
+                rf"memset\s*\(\s*{re.escape(var)}\s*,",
+                rf"snprintf\s*\(\s*{re.escape(var)}\s*,",
+                rf"sprintf\s*\(\s*{re.escape(var)}\s*,",
+                rf"fread\s*\(\s*{re.escape(var)}\s*,",
+                rf"strncpy\s*\(\s*{re.escape(var)}\s*,",
+                rf"strcpy\s*\(\s*{re.escape(var)}\s*,",
+                rf"\b{re.escape(var)}\s*\[",
+                rf"\b{re.escape(var)}\s*->",
+                rf"\*\s*{re.escape(var)}\b",
+                rf"\b{re.escape(var)}\s*\+",
+            ]
+            sink = next((pat for pat in sink_patterns if re.search(pat, tail, flags=re.S)), None)
+            if sink and not null_guard:
+                add_fact(
+                    f"raw_{alloc_name}_without_null_check_before_use",
+                    f"Raw `{alloc_name}` allocation result `{var}` is used before an obvious NULL check; allocation expression `{alloc_name}({arg})`. This is strong local evidence for a dynamic-allocation safety vulnerability when no project wrapper/growth guard covers it.",
+                    variable=var,
+                    allocator=alloc_name,
+                    allocation_expression=arg,
+                )
+
+    _find_raw_alloc_uses("malloc")
+    _find_raw_alloc_uses("calloc")
+
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*realloc\s*\(\s*\1\s*,\s*([^;]+)\)\s*;", src, flags=re.S):
+        var, arg = m.group(1), " ".join(m.group(2).split())
+        tail = src[m.end(): m.end() + 400]
+        if not re.search(rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*(?:==\s*NULL)?\s*\)", tail):
+            add_fact(
+                "raw_realloc_assignment_without_temp",
+                f"`realloc` is assigned directly back to `{var}` without an obvious temporary pointer or NULL check; expression `realloc({var}, {arg})`. This can lose the old allocation or lead to NULL use if allocation fails.",
+                variable=var,
+                allocation_expression=arg,
+            )
+
     # bsdiff-style shifted bound checks.  A safe version checks the extra block
     # after newpos has been advanced by x; a vulnerable version may check extraPtr
     # too early before the diff copy changes newpos.

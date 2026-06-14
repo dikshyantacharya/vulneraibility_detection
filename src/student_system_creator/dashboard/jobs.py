@@ -312,6 +312,15 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
         for secret_key in ("api_key", "api_secret", "authorization", "token"):
             model_block.pop(secret_key, None)
 
+    # Dashboard Research Audit: large sweeps should not abort because one row
+    # only matched by function name or has an empty/stale dataset body.  The
+    # pipeline will record those rows as skipped_target_validation and exclude
+    # them from metrics.  Preserve an explicit opt-out for strict debugging.
+    snap = base.setdefault("snapshot", {})
+    if bool(params.get("skip_target_validation_failures", True)):
+        snap["skip_target_validation_failures"] = True
+        snap["on_validation_failure"] = "skip"
+
     # Dashboard Research Audit: enable iterative evidence loop by default.
     # The base config default is False (backward-compatible), but dashboard runs
     # should seek evidence iteratively unless the caller explicitly disables it.

@@ -179,6 +179,7 @@ export interface RunSummary {
   samples_requested: number;
   samples_completed: number;
   samples_failed: number;
+  samples_skipped?: number;
   samples_pending?: number;
   metrics?: RunMetrics | null;
   metrics_available: boolean;

@@ -3408,25 +3408,19 @@ class CommitKGPipeline:
                         validation.token_sequence_similarity,
                         validation.artifact_dir,
                     )
-                    bad = validation.status in {"file_missing", "function_missing", "validation_error", "no_snapshot"}
-                    low = validation.body_similarity < self.cfg.snapshot.body_match_threshold
-                    if bad or low:
+                    should_skip = self._should_skip_target_validation(validation)
+                    if should_skip:
                         msg = f"Target validation failed sample={sample.sample_id}: {validation}"
-                        if self.cfg.snapshot.on_validation_failure == "fail":
-                            raise RuntimeError(msg)
-                        if self.cfg.snapshot.on_validation_failure == "skip":
-                            self.skipped_sample_ids.add(sample.sample_id)
-                            append_jsonl(self.run_dir / "skipped_samples.jsonl", {
-                                "sample_id": sample.sample_id,
-                                "project": sample.project,
-                                "filepath": sample.filepath,
-                                "func_name": sample.func_name,
-                                "selected_commit_id": resolved_commit,
-                                "selected_status": validation.status,
-                                "selected_similarity": validation.body_similarity,
-                                "reason": "final_selected_snapshot_validation_failed",
-                            })
+                        if self.cfg.snapshot.skip_target_validation_failures or self.cfg.snapshot.on_validation_failure == "skip":
+                            self._record_target_validation_skip(
+                                sample=sample,
+                                validation=validation,
+                                resolved_commit=resolved_commit,
+                                reason="final_selected_snapshot_validation_failed",
+                            )
                             self.logger.warning("target_validation.skip | %s", msg)
+                        elif self.cfg.snapshot.on_validation_failure == "fail":
+                            raise RuntimeError(msg)
                         else:
                             self.logger.warning(msg)
                 validation_progress.update(extra=f"sample={sample.sample_id}")
@@ -3524,6 +3518,112 @@ class CommitKGPipeline:
         if item:
             return item.get("graph")
         return None
+
+    _TARGET_VALIDATION_SKIP_STATUSES = {
+        "file_missing",
+        "function_missing",
+        "function_name_only",
+        "missing_filepath",
+        "no_snapshot",
+        "validation_error",
+    }
+
+    def _should_skip_target_validation(self, validation: Any) -> bool:
+        """Return True when the resolved function is too unreliable to classify.
+
+        This gate is intentionally stricter than the target validator itself:
+        exact/near-exact matches proceed, but name-only matches, empty dataset
+        bodies, and low body similarity are skipped for large research sweeps.
+        """
+        if validation is None:
+            return False
+        status = str(getattr(validation, "status", "") or "").strip()
+        if status in {"match_exact", "match_near_exact", "match_approximate", "match"}:
+            return False
+        if status in self._TARGET_VALIDATION_SKIP_STATUSES:
+            return True
+        if int(getattr(validation, "dataset_chars", 0) or 0) == 0 or int(getattr(validation, "dataset_tokens", 0) or 0) == 0:
+            return True
+        similarity = float(getattr(validation, "body_similarity", 0.0) or 0.0)
+        return similarity < float(self.cfg.snapshot.body_match_threshold)
+
+    def _record_target_validation_skip(
+        self,
+        *,
+        sample: SecVulEvalSample,
+        validation: Any,
+        resolved_commit: str | None,
+        reason: str = "target_validation_failed",
+    ) -> None:
+        """Persist a skipped sample so dashboard/reporting can show it cleanly.
+
+        Skipped samples are not LLM failures. They are excluded from binary
+        metrics and marked separately as skipped_target_validation.
+        """
+        self.skipped_sample_ids.add(sample.sample_id)
+        validation_dict = {
+            k: getattr(validation, k)
+            for k in getattr(validation, "__dataclass_fields__", {})
+        } if validation is not None else {}
+        row = {
+            "sample_id": sample.sample_id,
+            "project": sample.project,
+            "filepath": sample.filepath,
+            "func_name": sample.func_name,
+            "selected_commit_id": resolved_commit,
+            "selected_status": validation_dict.get("status"),
+            "selected_similarity": validation_dict.get("body_similarity"),
+            "reason": reason,
+            "target_validation": validation_dict,
+        }
+        append_jsonl(self.run_dir / "skipped_samples.jsonl", row)
+        sample_dir = self.run_dir / "agent_demos" / f"sample_{sample.sample_id}_{sample.func_name or 'target'}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        write_json(sample_dir / "sample.json", sample)
+        write_json(sample_dir / "final_prediction.json", {
+            "sample_id": str(sample.sample_id),
+            "project": sample.project,
+            "filepath": sample.filepath,
+            "function": sample.func_name,
+            "is_vulnerable": None,
+            "forced_prediction_bool": None,
+            "confidence": None,
+            "decision_status": "skipped_target_validation",
+            "prediction": None,
+            "prediction_bool": None,
+            "skip_reason": reason,
+            "reasoning_summary": (
+                f"Skipped before LLM classification: target validation status={validation_dict.get('status')} "
+                f"similarity={validation_dict.get('body_similarity')}."
+            ),
+            "target_validation_status": validation_dict.get("status"),
+            "target_validation_similarity": validation_dict.get("body_similarity"),
+            "target_validation": validation_dict,
+        })
+        write_json(sample_dir / "agent_flow.json", {
+            "sample_id": str(sample.sample_id),
+            "status": "skipped_target_validation",
+            "partial": True,
+            "loop_enabled": False,
+            "loop_stop_reason": "skipped_target_validation",
+            "stages": [],
+            "target_validation": validation_dict,
+            "message": "No LLM stages were run because strict target validation failed.",
+        })
+        write_json(sample_dir / "skip_report.json", row)
+        if self.live:
+            self.live.update_sample(sample.sample_id, {
+                "sample_id": sample.sample_id,
+                "project": sample.project,
+                "filepath": sample.filepath,
+                "function": sample.func_name,
+                "status": "skipped",
+                "agent_stage": "skipped_target_validation",
+                "skip_reason": reason,
+                "target_validation_status": validation_dict.get("status"),
+                "target_validation_similarity": validation_dict.get("body_similarity"),
+            })
+            self.live.event("sample.skipped_target_validation", row)
 
     def _function_only_graph(self, sample: SecVulEvalSample) -> ProjectGraph:
         # Fallback/baseline for smoke and failed clone cases; clearly marked as function-only.

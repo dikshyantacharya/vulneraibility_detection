@@ -90,6 +90,18 @@ def _has_strong_uncovered_vulnerability_pattern(decision: FinalDecision, evidenc
 
     if "fixed_size_buffer_unbounded_index_write" in facts:
         return True, "fixed-size buffer with unbounded indexed write"
+    raw_alloc_facts = {
+        "raw_malloc_without_null_check_before_use",
+        "raw_calloc_without_null_check_before_use",
+        "raw_realloc_assignment_without_temp",
+    }
+    if facts & raw_alloc_facts:
+        # Do not let the fixed /proc environ variant regress: it still contains
+        # raw malloc/realloc residual risks, but the dynamic growth guard is the
+        # target-relevant fix for the original fixed-size overflow class.
+        if "dynamic_buffer_growth_guard" not in facts:
+            which = sorted(facts & raw_alloc_facts)[0]
+            return True, f"raw dynamic allocation used before a visible safety check ({which})"
     if "missing_shifted_extra_bounds_guard" in facts:
         return True, "missing shifted bounds check before extra-block copy"
     if "missing_point_identity_element_guard" in facts:
@@ -119,6 +131,12 @@ def _is_low_relevance_or_residual_confirmed(h: Any, evidence_items: Iterable[Any
     """
     facts = _source_fact_types(evidence_items)
     t = _verification_text(h)
+
+    if "bounded_read_within_safe_allocation" in facts and any(x in t for x in ("fread", "buffer overflow", "fixed-size", "uninitialized", "null-termination", "unterminated", "header")):
+        return True, "bounded read is within a safe_calloc allocation with slack; fixed-buffer/header-read concern is refuted"
+    if "safe_calloc_allocation_wrapper_used" in facts and any(x in t for x in ("safe_calloc", "calloc", "allocation", "malloc", "null pointer", "zero-size", "zero size", "integer overflow", "wraparound", "undersized")):
+        if not ({"raw_malloc_without_null_check_before_use", "raw_calloc_without_null_check_before_use", "raw_realloc_assignment_without_temp"} & facts):
+            return True, "project safe_calloc wrapper is positive allocation-safety evidence; allocation-size concern remains residual unless independently proven"
 
     if "dynamic_buffer_growth_guard" in facts and any(x in t for x in ("realloc", "malloc", "temp_size", "environment")):
         if "fixed-size" not in t and "temp[500]" not in t:

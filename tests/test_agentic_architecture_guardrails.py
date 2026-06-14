@@ -424,3 +424,202 @@ def test_shifted_extra_bounds_guard_suppresses_oldpos_residual_false_positive():
     assert out.forced_prediction_bool is False
     assert out.decision_status == "forced_binary_non_vulnerable"
     assert any("proof chain contains generic or non-specific" in note or "Forced fixed/non-vulnerable" in note for note in notes)
+
+
+def test_raw_malloc_immediate_use_forces_vulnerable_when_no_growth_guard():
+    from vckg_agentic_proof.adapter import _infer_deterministic_source_facts
+
+    src = '''
+    void f(const char *name, const char *dirname) {
+        char *new_fname = malloc(strlen(name) + strlen(dirname) + 16);
+        snprintf(new_fname, strlen(name) + strlen(dirname) + 16, "%s/%s", dirname, name);
+    }
+    '''
+    evidence = _infer_deterministic_source_facts(src, "f")
+    assert any(e["metadata"]["fact_type"] == "raw_malloc_without_null_check_before_use" for e in evidence)
+
+    decision = FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.9,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-ALLOC",
+                status=HypothesisStatus.plausible_but_unproven,
+                local_risk_present=True,
+                explanation="malloc result is used by snprintf before a visible NULL check",
+            )
+        ],
+        explanation="model thought local risk was unproven",
+    )
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.forced_prediction_bool is True
+    assert out.decision_status == "forced_binary_vulnerable"
+    assert any("raw dynamic allocation" in note for note in notes)
+
+
+def test_raw_calloc_then_fread_forces_vulnerable_when_no_wrapper_guard():
+    from vckg_agentic_proof.adapter import _infer_deterministic_source_facts
+
+    src = '''
+    static char *get_header(FILE *fp) {
+        char *header;
+        header = calloc(1, 1024);
+        SAFE_E(fread(header, 1, 1023, fp), 1023, "fail");
+        return header;
+    }
+    '''
+    evidence = _infer_deterministic_source_facts(src, "get_header")
+    assert any(e["metadata"]["fact_type"] == "raw_calloc_without_null_check_before_use" for e in evidence)
+
+    decision = FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.8,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-CALLOC",
+                status=HypothesisStatus.plausible_but_unproven,
+                local_risk_present=True,
+                explanation="calloc result may be NULL before fread uses it",
+            )
+        ],
+        explanation="unproven",
+    )
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.forced_prediction_bool is True
+    assert out.decision_status == "forced_binary_vulnerable"
+
+
+def test_safe_calloc_bounded_fread_refutes_header_false_positive():
+    from vckg_agentic_proof.adapter import _infer_deterministic_source_facts
+
+    src = '''
+    static char *get_header(FILE *fp) {
+        char *header = safe_calloc(1024);
+        SAFE_E(fread(header, 1, 1023, fp), 1023, "fail");
+        return header;
+    }
+    '''
+    evidence = _infer_deterministic_source_facts(src, "get_header")
+    fact_types = {e["metadata"]["fact_type"] for e in evidence}
+    assert "safe_calloc_allocation_wrapper_used" in fact_types
+    assert "bounded_read_within_safe_allocation" in fact_types
+
+    decision = FinalDecision(
+        prediction=FinalPrediction.vulnerable,
+        confidence=0.95,
+        local_risk_present=True,
+        confirmed_security_vulnerability=True,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-FREAD",
+                status=HypothesisStatus.confirmed_vulnerability,
+                local_risk_present=True,
+                confirmed_security_vulnerability=True,
+                explanation="fread may overflow header buffer",
+                proof={
+                    "input_control": "file contents are attacker supplied",
+                    "dangerous_operation": "fread(header, 1, 1023, fp)",
+                    "missing_or_failed_guard": "no explicit file size check",
+                    "unsafe_use": "header buffer may be overrun or unterminated",
+                    "security_impact": "memory corruption",
+                    "cited_evidence_ids": ["AUTO-SF-01"],
+                },
+            )
+        ],
+        explanation="confirmed vulnerable",
+    )
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.forced_prediction_bool is False
+    assert out.decision_status == "forced_binary_non_vulnerable"
+    assert any("Downgraded vulnerable decision" in note or "bounded read" in note or "safe_calloc" in note for note in notes)
+
+
+def test_safe_calloc_wrapper_suppresses_allocation_overflow_false_positive():
+    from vckg_agentic_proof.adapter import _infer_deterministic_source_facts
+
+    src = '''
+    static void load_xref_from_plaintext(xref_t *xref) {
+        xref->n_entries = atoi(buf + strlen("ize "));
+        xref->entries = safe_calloc(xref->n_entries * sizeof(struct _xref_entry));
+        xref->entries[0].obj_id = 1;
+    }
+    '''
+    evidence = _infer_deterministic_source_facts(src, "load_xref_from_plaintext")
+    assert any(e["metadata"]["fact_type"] == "safe_calloc_allocation_wrapper_used" for e in evidence)
+
+    decision = FinalDecision(
+        prediction=FinalPrediction.vulnerable,
+        confidence=0.95,
+        local_risk_present=True,
+        confirmed_security_vulnerability=True,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-SAFE-CALLOC",
+                status=HypothesisStatus.confirmed_vulnerability,
+                local_risk_present=True,
+                confirmed_security_vulnerability=True,
+                explanation="safe_calloc allocation may wrap around",
+                proof={
+                    "input_control": "xref n_entries is parsed from PDF input",
+                    "dangerous_operation": "safe_calloc(xref->n_entries * sizeof(struct _xref_entry))",
+                    "missing_or_failed_guard": "no explicit multiplication overflow check",
+                    "unsafe_use": "xref entries are written after allocation",
+                    "security_impact": "heap overflow",
+                    "cited_evidence_ids": ["AUTO-SF-01"],
+                },
+            )
+        ],
+        explanation="confirmed vulnerable",
+    )
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.forced_prediction_bool is False
+    assert out.decision_status == "forced_binary_non_vulnerable"
+    assert any("safe_calloc" in note for note in notes)
+
+
+def test_dynamic_growth_guard_prevents_raw_malloc_residual_from_forcing_vulnerable():
+    from vckg_agentic_proof.adapter import _infer_deterministic_source_facts
+
+    src = '''
+    static char *get_pid_environ_val(pid_t pid,char *val){
+      int temp_size = 500;
+      char *temp = malloc(temp_size);
+      int i = 0;
+      sprintf(temp,"/proc/%d/environ",pid);
+      for(;;){
+        if (i >= temp_size) {
+          temp_size *= 2;
+          temp = realloc(temp, temp_size);
+        }
+        temp[i]=fgetc(fp);
+        i++;
+      }
+    }
+    '''
+    evidence = _infer_deterministic_source_facts(src, "get_pid_environ_val")
+    fact_types = {e["metadata"]["fact_type"] for e in evidence}
+    assert "dynamic_buffer_growth_guard" in fact_types
+    assert "raw_malloc_without_null_check_before_use" in fact_types
+
+    decision = FinalDecision(
+        prediction=FinalPrediction.fixed_or_non_vulnerable,
+        confidence=0.8,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-REALLOC",
+                status=HypothesisStatus.plausible_but_unproven,
+                local_risk_present=True,
+                explanation="realloc result is unchecked residual risk",
+            )
+        ],
+        explanation="local residual risk only",
+    )
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.forced_prediction_bool is False
+    assert out.decision_status == "forced_binary_non_vulnerable"

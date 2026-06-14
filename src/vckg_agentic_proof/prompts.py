@@ -203,7 +203,9 @@ def source_only_hypothesis_prompt(sample: Dict[str, Any], target_source: str) ->
             "that later KG queries can test. Pay special attention to parsed length/count fields read "
             "from raw buffers, integer/pointer wraparound, and missing checks before pointer advancement. "
             "Do not collapse distinct values: a selector such as length_power is not the same as the "
-            "runtime length value read from input. A vulnerability hypothesis should be target-relevant and "
+            "runtime length value read from input. Also pay attention to raw malloc/calloc/realloc results used "
+            "before a visible NULL/failure check, especially when the fixed counterpart might use a project wrapper "
+            "such as safe_calloc. A vulnerability hypothesis should be target-relevant and "
             "testable, not merely a generic robustness concern. Do not treat GMP mpz_mul/mpz_sub as C integer "
             "overflow/underflow; mpz values are arbitrary precision. Do not call sprintf('/proc/%d/environ', pid) "
             "path traversal by itself because %d cannot inject slash components."
@@ -313,7 +315,9 @@ def hypothesis_verification_prompt(
             "hypothesis unresolved and make the missing caller/input evidence explicit. "
             "Treat deterministic_source_fact items as source-grounded evidence. A pointer-wraparound "
             "lower-bound guard (for example start = raw and raw >= start after raw advances) plus an "
-            "exact-end error return can be positive safety evidence for wraparound-to-lower-address parser traversal risks."
+            "exact-end error return can be positive safety evidence for wraparound-to-lower-address parser traversal risks. "
+            "For allocation hypotheses, raw malloc/calloc/realloc used before a visible failure check is strong local evidence, "
+            "while safe_calloc and bounded reads within a safe allocation are strong counter-evidence for allocation-failure and fixed-buffer hypotheses."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"

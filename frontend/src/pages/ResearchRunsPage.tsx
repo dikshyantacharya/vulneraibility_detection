@@ -198,6 +198,7 @@ export default function ResearchRunsPage() {
               <dd>
                 {s ? `${s.samples_completed}/${s.samples_requested} completed` : `${r.samples} samples`}
                 {s?.samples_failed ? ` · ${s.samples_failed} failed` : ""}
+                {s?.samples_skipped ? ` · ${s.samples_skipped} skipped` : ""}
                 {s?.samples_pending ? ` · ${s.samples_pending} pending` : ""}
                 {s?.selection?.exact_sample_ids_only ? " · exact mode" : ""}
               </dd>

@@ -112,6 +112,7 @@ def _mask_secrets(obj: Any) -> Any:
 # placeholders written at agent_loop_start that survive a failed/interrupted run.
 _INCOMPLETE_STATUSES = {"running", "in_progress", "in progress", "pending",
                         "agent_loop_start", "started", ""}
+_SKIPPED_STATUSES = {"skipped", "skipped_target_validation"}
 
 # Decision-status substrings that mark a prediction as inconclusive (complete
 # but not definitively classified as vulnerable or safe).
@@ -127,6 +128,8 @@ def _prediction_is_available(fp: dict[str, Any] | None) -> bool:
     if not fp:
         return False
     status = str(fp.get("decision_status") or "").strip().lower()
+    if status in _SKIPPED_STATUSES:
+        return False
     if status in _INCOMPLETE_STATUSES or "running" in status or "progress" in status:
         return False
     if fp.get("parse_error"):
@@ -227,6 +230,7 @@ def _compute_metrics_live(sample_dirs: list[Path]) -> dict[str, Any]:
     total = 0
     completed_count = 0
     failed_count = 0
+    skipped_count = 0
     inconclusive_count = 0
     tp = tn = fp = fn = correct = incorrect = 0
     has_any_label = False
@@ -244,6 +248,18 @@ def _compute_metrics_live(sample_dirs: list[Path]) -> dict[str, Any]:
         decision_status = fp_data.get("decision_status") or ""
         true_is_vuln = sample_data.get("is_vulnerable")
         pred_is_vuln = _canonical_prediction_bool(fp_data)
+
+        if str(decision_status).lower() in _SKIPPED_STATUSES:
+            skipped_count += 1
+            rows.append({
+                "sample_id": str(sample_id), "function": func,
+                "true_label": ("vulnerable" if true_is_vuln else "safe") if true_is_vuln is not None else None,
+                "prediction": None, "prediction_bool": None,
+                "result": "skipped", "error_type": None,
+                "confidence": None, "status": decision_status or "skipped_target_validation",
+                "outcome": "skipped", "skip_reason": fp_data.get("skip_reason"),
+            })
+            continue
 
         avail = _prediction_is_available(fp_data)
         if not avail:
@@ -310,6 +326,7 @@ def _compute_metrics_live(sample_dirs: list[Path]) -> dict[str, Any]:
         "total": total,
         "completed": completed_count,
         "failed": failed_count,
+        "skipped": skipped_count,
         "inconclusive": inconclusive_count,
         "correct": correct,
         "incorrect": incorrect,
@@ -462,22 +479,28 @@ class ResearchInventory:
                     true_label = "vulnerable" if true_is_vuln else "safe"
 
             parts = sd.name.split("_")
+            decision_status = fp.get("decision_status")
+            skipped = str(decision_status or "").lower() in _SKIPPED_STATUSES
             out.append({
                 "sample_id": fp.get("sample_id") or (parts[1] if len(parts) >= 2 else sd.name),
                 "dir": sd.name,
                 "function_name": "_".join(parts[2:]) or None,
-                # Only surface a prediction when one really exists — a failed run's
-                # placeholder (is_vulnerable=false) is NOT "safe".
+                # Only surface a prediction when one really exists — a failed or
+                # skipped run's placeholder is NOT "safe".
                 "prediction": (None if not avail else ("vulnerable" if pred_is_vuln else "safe")),
                 "prediction_bool": bool(pred_is_vuln) if (avail and pred_is_vuln is not None) else None,
                 "prediction_available": avail,
                 "confidence": fp.get("confidence") if avail else None,
-                "decision_status": fp.get("decision_status"),
+                "decision_status": decision_status,
+                "skipped": skipped,
+                "skip_reason": fp.get("skip_reason") if skipped else None,
+                "target_validation_status": fp.get("target_validation_status"),
+                "target_validation_similarity": fp.get("target_validation_similarity"),
                 "resolved_commit": fp.get("resolved_commit_id"),
                 "model_backend": fp.get("model_backend"),
                 # Admin-only enriched fields
                 "true_label": true_label,
-                "result": result,
+                "result": "skipped" if skipped else result,
                 "error_type": error_type,
             })
         return out
@@ -946,17 +969,19 @@ class ResearchInventory:
         samples = self.list_samples(run_id)
         # "completed" = a real, valid prediction exists (not a placeholder).
         completed = sum(1 for s in samples if s.get("prediction_available"))
+        skipped = sum(1 for s in samples if str(s.get("decision_status") or "").lower() in _SKIPPED_STATUSES)
         failed_path = run_dir / "failed_samples.jsonl"
         failed = len(_read_jsonl(failed_path)) if failed_path.exists() else 0
         if not failed:
-            failed = sum(1 for s in samples if not s.get("prediction_available"))
+            failed = sum(1 for s in samples if not s.get("prediction_available") and str(s.get("decision_status") or "").lower() not in _SKIPPED_STATUSES)
         requested = len(meta.get("selection", {}).get("sample_ids") or []) or len(samples)
-        pending = max(0, requested - completed - failed)
+        pending = max(0, requested - completed - failed - skipped)
         out = {
             **meta,
             "samples_requested": requested,
             "samples_completed": completed,
             "samples_failed": failed,
+            "samples_skipped": skipped,
             "samples_pending": pending,
             "mtime": run_dir.stat().st_mtime,
         }
@@ -1005,9 +1030,10 @@ class ResearchInventory:
         sample_dirs = self._sample_dirs(run_dir)
         samples = self.list_samples(run_id)
         completed = sum(1 for s in samples if s.get("prediction_available"))
+        skipped = sum(1 for s in samples if str(s.get("decision_status") or "").lower() in _SKIPPED_STATUSES)
         failed = len(_read_jsonl(run_dir / "failed_samples.jsonl")) if (run_dir / "failed_samples.jsonl").exists() else 0
         if not failed:
-            failed = sum(1 for s in samples if not s.get("prediction_available"))
+            failed = sum(1 for s in samples if not s.get("prediction_available") and str(s.get("decision_status") or "").lower() not in _SKIPPED_STATUSES)
 
         # Try metrics.json binary rows first; fall back to live computation.
         b = self._binary_metrics(run_dir)
@@ -1036,7 +1062,8 @@ class ResearchInventory:
                 "processed": n,
                 "completed_predictions": completed,
                 "failed_samples": failed,
-                "pending_samples": max(0, len(samples) - completed - failed),
+                "skipped_samples": skipped,
+                "pending_samples": max(0, len(samples) - completed - failed - skipped),
                 "computed_on": "live from sample artifacts",
                 "single_sample": completed <= 1,
                 "tp": live.get("tp", 0), "tn": live.get("tn", 0),
@@ -1055,7 +1082,8 @@ class ResearchInventory:
             return {"available": False,
                     "reason": "run has no completed predictions yet",
                     "completed_predictions": 0, "failed_samples": failed,
-                    "pending_samples": max(0, len(samples) - failed)}
+                    "skipped_samples": skipped,
+                    "pending_samples": max(0, len(samples) - failed - skipped)}
 
         rows = b.get("rows") or []
         per = []
@@ -1082,7 +1110,8 @@ class ResearchInventory:
             "processed": n,
             "completed_predictions": completed,
             "failed_samples": failed,
-            "pending_samples": max(0, len(samples) - completed - failed),
+            "skipped_samples": skipped,
+            "pending_samples": max(0, len(samples) - completed - failed - skipped),
             "computed_on": "metrics.json binary section",
             "single_sample": n <= 1,
             "tp": b.get("tp", 0), "tn": b.get("tn", 0), "fp": b.get("fp", 0), "fn": b.get("fn", 0),
@@ -1307,10 +1336,13 @@ class ResearchInventory:
         kg_queries = self.kg_queries(run_id, sample_id)
 
         pred_available = _prediction_is_available(fp)
-        # Status: prefer log failure, then job status, then prediction availability.
+        skipped = str(fp.get("decision_status") or "").lower() in _SKIPPED_STATUSES
+        # Status: explicit skip, then log failure, then job status, then prediction availability.
         job_status = meta.get("status")
         failed = bool(log_summary.get("failed")) or job_status in ("failed", "cancelled")
-        if failed and not pred_available:
+        if skipped:
+            status = "skipped_target_validation"
+        elif failed and not pred_available:
             status = "failed"
         elif pred_available:
             status = "completed"
@@ -1358,7 +1390,10 @@ class ResearchInventory:
             "failed_stage": failed_stage,
             "last_completed_stage": last_completed,
             "error_type": fp.get("error_type"),
-            "error_message": log_summary.get("error_message") or fp.get("parse_error"),
+            "skip_reason": fp.get("skip_reason") if skipped else None,
+            "target_validation_status": fp.get("target_validation_status"),
+            "target_validation_similarity": fp.get("target_validation_similarity"),
+            "error_message": log_summary.get("error_message") or fp.get("parse_error") or (fp.get("reasoning_summary") if skipped else None),
             "provider_error": log_summary.get("error_message"),
             "true_label": true_label,
             "prediction": prediction,
@@ -1617,6 +1652,18 @@ class ResearchInventory:
         commit_msg = sample_json.get("commit_message")
         _kv("commit_message", commit_msg if commit_msg else "unavailable")
         lines.append("")
+
+        if str(fp.get("decision_status") or "").lower() in _SKIPPED_STATUSES:
+            _sec("SKIPPED TARGET VALIDATION")
+            _kv("skip_reason", fp.get("skip_reason") or "target_validation_failed")
+            _kv("target_validation_status", fp.get("target_validation_status") or "—")
+            _kv("target_validation_similarity", fp.get("target_validation_similarity") if fp.get("target_validation_similarity") is not None else "—")
+            tv = fp.get("target_validation") or {}
+            for key in ("resolved_file", "resolved_function", "body_similarity", "raw_similarity", "whitespace_insensitive_similarity", "token_sequence_similarity", "dataset_chars", "repo_chars", "dataset_tokens", "repo_tokens"):
+                if key in tv:
+                    _kv(key, tv.get(key))
+            lines.append("  No LLM stages were run for this sample. It is excluded from TP/FP/TN/FN metrics.")
+            lines.append("")
 
         # ── Target function source ────────────────────────────────────────────
         func_body = sample_json.get("func_body")

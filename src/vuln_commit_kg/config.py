@@ -187,6 +187,11 @@ class SnapshotConfig(BaseModel):
     require_function_found: bool = False
     body_match_threshold: float = 0.82
     on_validation_failure: Literal["warn_and_continue", "skip", "fail"] = "warn_and_continue"
+    # Large dashboard/research sweeps should be able to continue when a dataset
+    # row resolves only by function name or otherwise fails strict body matching.
+    # When enabled, such samples are recorded as skipped_target_validation and
+    # excluded from classification/metrics instead of aborting the whole run.
+    skip_target_validation_failures: bool = False
     save_validation_artifacts: bool = True
     validation_artifact_dirname: str = "target_validation_artifacts"
 
