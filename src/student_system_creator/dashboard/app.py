@@ -815,6 +815,26 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
+
+    @app.get("/api/research/runs/{run_id}/flow/reports.zip")
+    def research_flow_reports_zip(run_id: str, scope: str = Query("completed")):
+        """Return a ZIP containing full-flow text reports for a run.
+
+        scope=completed includes only samples with completed binary predictions.
+        scope=all includes every sample directory that exists for the run,
+        including skipped, failed, running, and partial reports.
+        """
+        from fastapi.responses import Response as FastAPIResponse
+        bundle = research.flow_reports_zip(run_id, scope=scope)
+        if bundle is None:
+            raise HTTPException(status_code=404, detail="unknown run")
+        data, filename = bundle
+        return FastAPIResponse(
+            content=data,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @app.get("/api/research/runs/{run_id}/samples/{sample_id}/kg-dashboard")
     def research_kg_dashboard(run_id: str, sample_id: str) -> dict[str, Any]:
         """Discover the old static CodeKG dashboard/index.html for a sample and

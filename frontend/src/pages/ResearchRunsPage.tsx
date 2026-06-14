@@ -113,6 +113,31 @@ const tdS: React.CSSProperties = {
   border: "1px solid var(--border)", padding: "3px 8px", textAlign: "center", fontSize: 12,
 };
 
+function RunReportDownloadButtons({ runId }: { runId: string }) {
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <a
+        className="btn"
+        href={research.runReportsZipUrl(runId, "completed")}
+        target="_blank"
+        rel="noreferrer"
+        title="Download reports only for samples with completed binary predictions. Running, failed, skipped, and pending samples are excluded."
+      >
+        Download completed reports ZIP
+      </a>
+      <a
+        className="btn"
+        href={research.runReportsZipUrl(runId, "all")}
+        target="_blank"
+        rel="noreferrer"
+        title="Download every available report artifact for this run, including completed, skipped, failed, running, and partial samples."
+      >
+        Download all reports ZIP
+      </a>
+    </div>
+  );
+}
+
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "correct", label: "Correct" },
@@ -185,6 +210,7 @@ export default function ResearchRunsPage() {
               <strong className="mono">{r.run_id}</strong>
               {s?.status && <span className={`badge ${s.status === "completed" ? "green" : s.status === "failed" ? "red" : s.status === "running" ? "blue" : "gray"}`}>{s.status}</span>}
               {r.is_job_run && <span className="badge blue">dashboard job</span>}
+              <RunReportDownloadButtons runId={r.run_id} />
               <span style={{ flex: 1 }} />
               <span className="muted">{new Date(r.mtime * 1000).toLocaleString()}</span>
             </div>

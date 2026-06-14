@@ -118,6 +118,8 @@ export const research = {
     http<AgentFlow>(`/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/flow`),
   flowReportUrl: (run: string, s: string) =>
     `${BASE}/runs/${encodeURIComponent(run)}/samples/${encodeURIComponent(s)}/flow/report`,
+  runReportsZipUrl: (run: string, scope: "completed" | "all" = "completed") =>
+    `${BASE}/runs/${encodeURIComponent(run)}/flow/reports.zip?scope=${encodeURIComponent(scope)}`,
 };
 
 export interface RunLLM {

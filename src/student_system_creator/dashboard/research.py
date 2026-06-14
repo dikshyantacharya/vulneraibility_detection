@@ -16,8 +16,10 @@ does NOT re-implement the pipeline. Per run, the pipeline produces:
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -1581,6 +1583,118 @@ class ResearchInventory:
                     "tree_total_bytes": r.get("tree_total_bytes"),
                 })
         return out
+
+
+    # ---- run-level report bundle -------------------------------------------
+
+    @staticmethod
+    def _safe_report_name(value: Any, fallback: str = "sample") -> str:
+        text = str(value or fallback).strip() or fallback
+        text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+        text = re.sub(r"_+", "_", text).strip("._")
+        return text[:140] or fallback
+
+    def flow_reports_zip(self, run_id: str, scope: str = "completed") -> tuple[bytes, str] | None:
+        """Build a ZIP containing full-flow text reports for one run.
+
+        scope="completed" includes only samples that produced a usable binary
+        benchmark prediction.  scope="all" includes every sample directory that
+        exists for the run, including skipped, failed, running/partial samples.
+        The ZIP always contains a manifest.json and README.txt.
+        """
+        run_dir = self._resolve_run(run_id)
+        if not run_dir:
+            return None
+        scope_norm = str(scope or "completed").strip().lower()
+        if scope_norm not in {"completed", "all"}:
+            scope_norm = "completed"
+
+        sample_dirs = self._sample_dirs(run_dir)
+        manifest: dict[str, Any] = {
+            "run_id": run_id,
+            "scope": scope_norm,
+            "total_sample_dirs": len(sample_dirs),
+            "included_reports": 0,
+            "excluded_reports": 0,
+            "samples": [],
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            readme = [
+                "VCKG Research Audit full-flow report bundle",
+                "",
+                f"run_id: {run_id}",
+                f"scope: {scope_norm}",
+                "",
+                "scope=completed includes only samples with a completed binary prediction.",
+                "scope=all includes completed, skipped, failed, running, and partial sample reports when artifacts exist.",
+                "",
+            ]
+            zf.writestr("README.txt", "\n".join(readme))
+
+            for sd in sample_dirs:
+                parts = sd.name.split("_")
+                sid = parts[1] if len(parts) >= 2 else sd.name
+                func = "_".join(parts[2:]) if len(parts) >= 3 else "function"
+                fp = _read_json(sd / "final_prediction.json") or {}
+                sample = _read_json(sd / "sample.json") or {}
+                status = str(fp.get("decision_status") or "").strip() or "unknown"
+                pred_bool = _canonical_prediction_bool(fp) if fp else None
+                prediction_available = _prediction_is_available(fp)
+                binary_available = prediction_available and pred_bool is not None
+                skipped = status.lower() in _SKIPPED_STATUSES
+                include = scope_norm == "all" or binary_available
+                entry = {
+                    "sample_id": str(fp.get("sample_id") or sid),
+                    "function": sample.get("func_name") or sample.get("function_name") or func,
+                    "dir": sd.name,
+                    "decision_status": status,
+                    "prediction_available": bool(prediction_available),
+                    "binary_prediction_available": bool(binary_available),
+                    "prediction_bool": bool(pred_bool) if pred_bool is not None else None,
+                    "prediction": ("vulnerable" if pred_bool else "safe") if pred_bool is not None else None,
+                    "skipped": bool(skipped),
+                    "skip_reason": fp.get("skip_reason") if skipped else None,
+                    "included": bool(include),
+                    "included_reason": "included_by_scope" if include else "no_completed_binary_prediction",
+                }
+                if not include:
+                    manifest["excluded_reports"] += 1
+                    manifest["samples"].append(entry)
+                    continue
+
+                report = self.flow_report(run_id, str(entry["sample_id"]))
+                if report is None:
+                    # Fall back to a compact diagnostic so the all-scope bundle is
+                    # still useful for partial/odd artifacts.
+                    report = (
+                        "FULL AGENTIC FLOW REPORT\n"
+                        f"run_id: {run_id}\n"
+                        f"sample_id: {entry['sample_id']}\n"
+                        f"function: {entry['function']}\n"
+                        f"decision_status: {status}\n"
+                        "report_status: flow_report_unavailable\n"
+                    )
+                safe_sid = self._safe_report_name(entry["sample_id"], "sample")
+                safe_func = self._safe_report_name(entry["function"], "function")
+                if binary_available:
+                    prefix = "completed"
+                elif skipped:
+                    prefix = "skipped"
+                elif "running" in status.lower() or status.lower() in _INCOMPLETE_STATUSES:
+                    prefix = "running"
+                else:
+                    prefix = "partial_or_failed"
+                arcname = f"reports/{prefix}/sample_{safe_sid}_{safe_func}.txt"
+                zf.writestr(arcname, report)
+                entry["zip_path"] = arcname
+                manifest["included_reports"] += 1
+                manifest["samples"].append(entry)
+
+            zf.writestr("manifest.json", json.dumps(_mask_secrets(manifest), indent=2, sort_keys=True))
+
+        filename = f"agent_flow_reports_{self._safe_report_name(run_id, 'run')}_{scope_norm}.zip"
+        return buf.getvalue(), filename
 
     # ---- full-flow text report ----------------------------------------------
 
