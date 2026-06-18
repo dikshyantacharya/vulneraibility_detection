@@ -12,6 +12,7 @@ import json
 import re
 import shutil
 import time
+import zipfile
 import requests
 from collections import Counter
 from pathlib import Path
@@ -199,6 +200,60 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         env_loader=llm_env_loader
     )
 
+    def _truthy_env_value(value: object, default: bool = False) -> bool:
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _student_llm_defaults_payload() -> dict[str, Any]:
+        env = llm_env_loader.load_env_files()
+        active_profile_id = str(settings.extra.get("active_student_llm_profile") or settings.extra.get("active_llm_profile") or "academiccloud")
+        prof = llm_profiles.get_profile(active_profile_id) or llm_profiles.get_profile("academiccloud")
+        profile_id = getattr(prof, "profile_id", active_profile_id) if prof else active_profile_id
+        display_name = getattr(prof, "display_name", profile_id) if prof else profile_id
+        api_base = (
+            env.get("STUDENT_LLM_API_BASE")
+            or env.get("ACADEMIC_CLOUD_API_BASE")
+            or env.get("ACADEMIC_CLOUD_BASE_URL")
+            or env.get("SAIA_API_BASE")
+            or getattr(prof, "base_url", "")
+            or "https://chat-ai.academiccloud.de/v1"
+        )
+        model_env = getattr(prof, "default_model_env", "") if prof else ""
+        model = (
+            env.get("STUDENT_LLM_MODEL")
+            or (env.get(model_env) if model_env else None)
+            or env.get("ACADEMIC_CLOUD_MODEL")
+            or env.get("SAIA_MODEL")
+            or getattr(prof, "default_model", "")
+            or "mistral-large-3-675b-instruct-2512"
+        )
+        explicit_key_env = env.get("STUDENT_LLM_API_KEY_ENV")
+        if explicit_key_env:
+            key_env = explicit_key_env
+        else:
+            candidates = [
+                "STUDENT_LLM_API_KEY",
+                getattr(prof, "api_key_env", "") if prof else "",
+                "ACADEMIC_CLOUD_API_KEY",
+                "SAIA_API_KEY",
+                "LLM_API_KEY",
+                "OPENAI_API_KEY",
+            ]
+            key_env = next((c for c in candidates if c and env.get(c)), "STUDENT_LLM_API_KEY")
+        enabled = _truthy_env_value(env.get("STUDENT_AGENT_LLM"), False) or _truthy_env_value(env.get("STUDENT_LLM_ENABLED"), False)
+        return {
+            "llm_enabled": enabled,
+            "profile_id": profile_id,
+            "display_name": display_name,
+            "llm_api_base": api_base,
+            "llm_model": model,
+            "llm_api_key_env": key_env,
+            "llm_api_key_present": bool(env.get(key_env)),
+            "env_files_hint": str(settings.external_env_path),
+            "safe_note": "Secrets are loaded from env files and are never sent to the browser.",
+        }
+
     def _polling_fallback_enabled() -> bool:
         import os
 
@@ -270,6 +325,14 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
             if vr is not None:
                 out["validation_ok"] = vr.get("ok")
         return out
+
+    @app.get("/api/dashboard/student-llm-defaults")
+    def student_llm_defaults() -> dict[str, Any]:
+        """Safe student-solution LLM defaults for the Evaluate Solution UI.
+
+        Returns only env var names and boolean secret presence, never the key value.
+        """
+        return _student_llm_defaults_payload()
 
     @app.get("/api/dashboard/config")
     def get_config() -> dict[str, Any]:
@@ -634,6 +697,56 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
         vr = inv_for(None).validation_report()
         return vr or {"ok": None, "message": "no validation report found"}
 
+    def _evaluation_out_dir(job_dict: dict[str, Any]) -> Path:
+        params = job_dict.get("params") or {}
+        raw = params.get("out") or (Path(job_dict.get("dir") or jobs.root / job_dict.get("job_id", "")) / "eval_out")
+        return Path(raw)
+
+    def _evaluation_payload(job_id: str) -> dict[str, Any]:
+        job = jobs.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "unknown evaluation job")
+        jd = job.to_dict()
+        if jd.get("type") != "evaluate_solution":
+            raise HTTPException(400, "job is not evaluate_solution")
+        out_dir = _evaluation_out_dir(jd)
+        traces_path = out_dir / "traces.json"
+        preds_path = out_dir / "predictions.csv"
+        metrics_path = out_dir / "metrics.json"
+        if not metrics_path.exists():
+            metrics_path = out_dir / "score.json"
+        traces = json.loads(traces_path.read_text(encoding="utf-8")) if traces_path.exists() else []
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+        samples = []
+        for t in traces:
+            ans = t.get("answer") or {}
+            sid = str(t.get("sample_id") or "")
+            report_name = f"sample_{''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in sid)[:120]}.report.txt"
+            samples.append({
+                "sample_id": sid,
+                "function_name": t.get("function_name"),
+                "kg_id": t.get("kg_id"),
+                "prediction": ans.get("prediction"),
+                "confidence": ans.get("confidence"),
+                "decision_status": ans.get("decision_status"),
+                "reason": ans.get("reason"),
+                "query_count": t.get("query_count"),
+                "rounds_observed": t.get("rounds_observed"),
+                "stop_reason": t.get("stop_reason"),
+                "elapsed_seconds": t.get("elapsed_seconds"),
+                "agentic_stage_count": len(t.get("agentic_trace") or []),
+                "report_available": (out_dir / report_name).exists(),
+            })
+        return {
+            "job": jd,
+            "job_id": job_id,
+            "out_dir": str(out_dir),
+            "metrics": metrics,
+            "predictions_csv_exists": preds_path.exists(),
+            "traces": traces,
+            "samples": samples,
+        }
+
     @app.get("/api/dashboard/reports/evaluation")
     def evaluation_report() -> dict[str, Any]:
         # Find the most recent evaluate job result + metrics.
@@ -641,9 +754,55 @@ def create_app(settings: DashboardSettings, settings_path: str | Path | None = N
             if j["type"] == "evaluate_solution" and j["status"] == "completed":
                 out_dir = Path(j["params"].get("out") or (Path(j["dir"]) / "eval_out"))
                 metrics = out_dir / "metrics.json"
+                if not metrics.exists():
+                    metrics = out_dir / "score.json"
                 if metrics.exists():
                     return {"job_id": j["job_id"], "metrics": json.loads(metrics.read_text(encoding="utf-8"))}
         return {"message": "no completed evaluation found"}
+
+    @app.get("/api/dashboard/evaluations/{job_id}")
+    def evaluation_detail(job_id: str) -> dict[str, Any]:
+        return _evaluation_payload(job_id)
+
+    @app.get("/api/dashboard/evaluations/{job_id}/traces")
+    def evaluation_traces(job_id: str) -> dict[str, Any]:
+        return _evaluation_payload(job_id)
+
+    @app.get("/api/dashboard/evaluations/{job_id}/samples/{sample_id}/report")
+    def evaluation_sample_report(job_id: str, sample_id: str):
+        payload = _evaluation_payload(job_id)
+        out_dir = Path(payload["out_dir"])
+        safe = ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in str(sample_id))[:120]
+        path = out_dir / f"sample_{safe}.report.txt"
+        if not path.exists():
+            raise HTTPException(404, "sample report not found")
+        return FileResponse(path, media_type="text/plain", filename=path.name)
+
+    @app.get("/api/dashboard/evaluations/{job_id}/reports.zip")
+    def evaluation_reports_zip(job_id: str):
+        payload = _evaluation_payload(job_id)
+        out_dir = Path(payload["out_dir"])
+        zip_path = out_dir / "student_agent_reports.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            readme = [
+                "Student agent evaluation report bundle",
+                f"job_id: {job_id}",
+                f"out_dir: {out_dir}",
+                "",
+                "Contains per-sample .report.txt and .trace.json files produced by the evaluator.",
+            ]
+            zf.writestr("README.txt", "\n".join(readme))
+            manifest = {"job_id": job_id, "metrics": payload.get("metrics"), "samples": payload.get("samples")}
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            for path in sorted(out_dir.glob("sample_*.report.txt")):
+                zf.write(path, f"reports/{path.name}")
+            for path in sorted(out_dir.glob("sample_*.trace.json")):
+                zf.write(path, f"traces/{path.name}")
+            for name in ("predictions.csv", "traces.json", "score.json", "metrics.json"):
+                pth = out_dir / name
+                if pth.exists():
+                    zf.write(pth, name)
+        return FileResponse(zip_path, media_type="application/zip", filename=f"student_agent_reports_{job_id}.zip")
 
     # ---- disk -------------------------------------------------------
     @app.get("/api/dashboard/disk")

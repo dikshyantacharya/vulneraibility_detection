@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--registry", default="outputs/student_challenge/vckg_codekg_student_challenge/private/kg_registry_private.json")
     parser.add_argument("--host", default=os.getenv("KG_API_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("KG_API_PORT", "8000")))
-    parser.add_argument("--api-key", default=os.getenv("KG_API_KEY", "dev-key"))
+    parser.add_argument("--api-key", default=os.getenv("KG_API_KEY", "dev-key-KG"))
     parser.add_argument("--require-api-key", action="store_true")
     parser.add_argument("--max-nodes", type=int, default=int(os.getenv("MAX_NODES_PER_QUERY", "500")))
     parser.add_argument("--engine-cache-size", type=int, default=int(os.getenv("KG_ENGINE_CACHE_SIZE", "8")))

@@ -70,7 +70,7 @@ class KGBuildConfig(BaseModel):
 class APIConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
-    api_key: str = "dev-key"
+    api_key: str = "dev-key-KG"
     require_api_key: bool = False
     max_nodes_per_query: int = 500
     max_queries_per_sample: int = 8

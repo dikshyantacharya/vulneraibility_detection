@@ -1,19 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import { useAsync } from "../state";
-import type { DashboardEvent, Job } from "../api/types";
-
-interface QueryRow {
-  index: number;
-  kind?: string;
-  reason?: string;
-  nodes?: number;
-  edges?: number;
-  cacheHit?: boolean;
-  time?: number;
-  raw: DashboardEvent;
-}
+import type { Job } from "../api/types";
 
 export default function AgentAuditPage() {
   const jobsRes = useAsync(() => api.jobs(), []);
@@ -22,9 +10,9 @@ export default function AgentAuditPage() {
     [jobsRes.data]
   );
   const [jobId, setJobId] = useState<string>("");
-  const [events, setEvents] = useState<DashboardEvent[]>([]);
+  const [detail, setDetail] = useState<Record<string, any> | null>(null);
   const [sample, setSample] = useState<string>("");
-  const [queryFilter, setQueryFilter] = useState<number | "all">("all");
+  const [tab, setTab] = useState<"stages" | "queries" | "final" | "raw">("stages");
 
   useEffect(() => {
     if (!jobId && evalJobs.length) setJobId(evalJobs[0].job_id);
@@ -32,48 +20,27 @@ export default function AgentAuditPage() {
 
   useEffect(() => {
     if (!jobId) return;
-    api.jobEvents(jobId).then((evs) => setEvents(evs as DashboardEvent[])).catch(() => setEvents([]));
+    api.evaluationDetail(jobId).then((d) => {
+      setDetail(d);
+      const first = (d.samples || [])[0]?.sample_id || "";
+      setSample((s) => s || first);
+    }).catch(() => setDetail(null));
   }, [jobId]);
 
-  const bySample = useMemo(() => {
-    const m = new Map<string, QueryRow[]>();
-    events
-      .filter((e) => e.type === "agent_query")
-      .forEach((e) => {
-        const d = e.data || {};
-        const sid = String(d.sample ?? d.sample_id ?? "unknown");
-        const arr = m.get(sid) || [];
-        arr.push({
-          index: arr.length + 1,
-          kind: d.kind || d.query_kind,
-          reason: d.reason,
-          nodes: d.nodes ?? d.retrieved_node_count,
-          edges: d.edges ?? d.retrieved_edge_count,
-          cacheHit: d.engine_cache_hit,
-          time: d.time_seconds,
-          raw: e,
-        });
-        m.set(sid, arr);
-      });
-    return m;
-  }, [events]);
-
-  const samples = Array.from(bySample.keys());
-  useEffect(() => {
-    if (!sample && samples.length) setSample(samples[0]);
-  }, [samples, sample]);
-
-  const queries = sample ? bySample.get(sample) || [] : [];
-  const shownQueries = queryFilter === "all" ? queries : queries.filter((q) => q.index === queryFilter);
+  const samples = detail?.samples || [];
+  const trace = (detail?.traces || []).find((t: any) => String(t.sample_id) === String(sample));
+  const agenticTrace = trace?.agentic_trace || [];
+  const queries = trace?.query_history || [];
+  const answer = trace?.answer || {};
 
   return (
     <div>
-      <h1 className="page-title">Agent Audit</h1>
-      <p className="page-sub">Agentic query flow (q1, q2, q3 …) reconstructed from evaluation event logs.</p>
+      <h1 className="page-title">Student Agent Audit</h1>
+      <p className="page-sub">Inspect the submitted <code>solution.py</code> loop: internal agentic stages, KG queries, final decision, and downloadable reports.</p>
 
       {evalJobs.length === 0 && (
         <div className="banner warn">
-          No <code>evaluate_solution</code> jobs found. Run an evaluation first (Evaluation page) to populate the audit.
+          No <code>evaluate_solution</code> jobs found. Run an evaluation first.
         </div>
       )}
 
@@ -84,50 +51,105 @@ export default function AgentAuditPage() {
             <option key={j.job_id} value={j.job_id}>{j.job_id} · {j.status}</option>
           ))}
         </select>
-        {samples.length > 0 && (
-          <select value={sample} onChange={(e) => { setSample(e.target.value); setQueryFilter("all"); }}>
-            {samples.map((s) => (
-              <option key={s} value={s}>sample {s} ({bySample.get(s)?.length} queries)</option>
-            ))}
-          </select>
-        )}
-        {queries.length > 0 && (
-          <select value={String(queryFilter)} onChange={(e) => setQueryFilter(e.target.value === "all" ? "all" : Number(e.target.value))}>
-            <option value="all">All queries</option>
-            {queries.map((q) => (
-              <option key={q.index} value={q.index}>q{q.index} {q.kind || ""}</option>
-            ))}
-          </select>
+        {jobId && (
+          <a className="btn" href={api.evaluationReportsZipUrl(jobId)}>Download all student reports ZIP</a>
         )}
       </div>
 
-      {sample && queries.length === 0 && <div className="empty">No agent_query events for this sample.</div>}
-
-      {shownQueries.map((q) => (
-        <div className="card" key={q.index} style={{ marginBottom: 12 }}>
-          <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
-            <span className="badge blue">q{q.index}</span>
-            <strong>{q.kind || "query"}</strong>
-            {q.cacheHit != null && <span className={`badge ${q.cacheHit ? "green" : "gray"}`}>{q.cacheHit ? "cache hit" : "cache miss"}</span>}
-            <span style={{ flex: 1 }} />
-            <span className="muted">{q.time != null ? `${q.time.toFixed(2)}s` : ""}</span>
-          </div>
-          {q.reason && <p style={{ marginTop: 0 }}>{q.reason}</p>}
-          <dl className="kv">
-            <dt>Retrieved nodes</dt><dd>{q.nodes ?? "—"}</dd>
-            <dt>Retrieved edges</dt><dd>{q.edges ?? "—"}</dd>
+      {detail?.metrics && Object.keys(detail.metrics).length > 0 && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <strong>Metrics</strong>
+          <dl className="kv" style={{ marginTop: 8 }}>
+            <dt>Accuracy / F1</dt><dd>{fmtPct(detail.metrics.accuracy)} / {fmtPct(detail.metrics.f1)}</dd>
+            <dt>Precision / Recall</dt><dd>{fmtPct(detail.metrics.precision)} / {fmtPct(detail.metrics.recall)}</dd>
+            <dt>TP / FP / FN / TN</dt><dd>{detail.metrics.tp ?? "—"} / {detail.metrics.fp ?? "—"} / {detail.metrics.fn ?? "—"} / {detail.metrics.tn ?? "—"}</dd>
           </dl>
-          <pre className="log-viewer" style={{ height: 90, marginTop: 8 }}>{q.raw.message}</pre>
         </div>
-      ))}
+      )}
 
-      {sample && (
-        <div className="banner ok" style={{ marginTop: 8 }}>
-          Tip: open the <Link to="/kg">KG Explorer</Link> for this sample's graph. Per-query node highlighting on the
-          live graph requires the bounded retrieval API (<code>serve</code>) to be running so retrieved node ids are
-          available.
+      {samples.length > 0 && (
+        <div className="grid cols-2">
+          <div className="card">
+            <h3 className="section-title" style={{ marginTop: 0 }}>Samples</h3>
+            <div style={{ maxHeight: 520, overflow: "auto" }}>
+              <table className="data-table">
+                <thead><tr><th>Sample</th><th>Fn</th><th>Pred</th><th>Stages</th><th>Queries</th></tr></thead>
+                <tbody>
+                {samples.map((s: any) => (
+                  <tr key={s.sample_id} onClick={() => setSample(String(s.sample_id))} style={{ cursor: "pointer", background: String(sample) === String(s.sample_id) ? "#eef2ff" : undefined }}>
+                    <td>{s.sample_id}</td>
+                    <td>{s.function_name || "—"}</td>
+                    <td>{s.prediction == null ? "—" : s.prediction ? "vuln" : "safe"}</td>
+                    <td>{s.agentic_stage_count ?? 0}</td>
+                    <td>{s.query_count ?? 0}</td>
+                  </tr>
+                ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="card">
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <h3 className="section-title" style={{ margin: 0, flex: 1 }}>Sample {sample || "—"}</h3>
+              {jobId && sample && <a className="btn" href={api.evaluationSampleReportUrl(jobId, sample)}>Download report</a>}
+            </div>
+            {!trace ? <div className="empty">No trace selected.</div> : (
+              <>
+                <dl className="kv" style={{ marginTop: 10 }}>
+                  <dt>Prediction</dt><dd>{answer.prediction == null ? "—" : answer.prediction ? "vulnerable" : "safe/non-vulnerable"}</dd>
+                  <dt>Confidence</dt><dd>{typeof answer.confidence === "number" ? `${(answer.confidence * 100).toFixed(1)}%` : "—"}</dd>
+                  <dt>Decision status</dt><dd>{answer.decision_status || "—"}</dd>
+                  <dt>Stop reason</dt><dd>{trace.stop_reason || "—"}</dd>
+                </dl>
+                <div className="btn-row" style={{ marginTop: 10 }}>
+                  <button className={`btn ${tab === "stages" ? "primary" : ""}`} onClick={() => setTab("stages")}>Stages</button>
+                  <button className={`btn ${tab === "queries" ? "primary" : ""}`} onClick={() => setTab("queries")}>KG Queries</button>
+                  <button className={`btn ${tab === "final" ? "primary" : ""}`} onClick={() => setTab("final")}>Final</button>
+                  <button className={`btn ${tab === "raw" ? "primary" : ""}`} onClick={() => setTab("raw")}>Raw trace</button>
+                </div>
+                {tab === "stages" && <StageList stages={agenticTrace} />}
+                {tab === "queries" && <QueryList queries={queries} />}
+                {tab === "final" && <pre className="log-viewer" style={{ height: 360 }}>{JSON.stringify(answer.final_adjudication || trace.final_adjudication || answer, null, 2)}</pre>}
+                {tab === "raw" && <pre className="log-viewer" style={{ height: 420 }}>{JSON.stringify(trace, null, 2)}</pre>}
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
   );
+}
+
+function StageList({ stages }: { stages: any[] }) {
+  if (!stages?.length) return <div className="empty">No internal agentic_trace metadata was stored. Use the full-stage solution.py.</div>;
+  return <div style={{ marginTop: 12 }}>{stages.map((s, i) => (
+    <div className="card" key={i} style={{ marginBottom: 8, padding: 12 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <span className="badge blue">{i + 1}</span>
+        <strong>{s.stage || s.name || "stage"}</strong>
+      </div>
+      <pre className="log-viewer" style={{ height: 130, marginTop: 8 }}>{JSON.stringify(s.output ?? s, null, 2)}</pre>
+    </div>
+  ))}</div>;
+}
+
+function QueryList({ queries }: { queries: any[] }) {
+  if (!queries?.length) return <div className="empty">No KG queries recorded.</div>;
+  return <div style={{ marginTop: 12 }}>{queries.map((q, i) => (
+    <div className="card" key={i} style={{ marginBottom: 8, padding: 12 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <span className="badge green">q{i + 1}</span>
+        <strong>{q.query?.kind || "query"}</strong>
+        <span className="muted">round {q.round ?? "—"}</span>
+      </div>
+      {q.reason && <p>{q.reason}</p>}
+      <pre className="log-viewer" style={{ height: 110 }}>{JSON.stringify(q.query, null, 2)}</pre>
+    </div>
+  ))}</div>;
+}
+
+function fmtPct(v: any): string {
+  if (typeof v !== "number") return "—";
+  return v <= 1 ? `${(v * 100).toFixed(1)}%` : v.toFixed(3);
 }

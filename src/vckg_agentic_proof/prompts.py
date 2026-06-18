@@ -317,7 +317,7 @@ def hypothesis_verification_prompt(
             "lower-bound guard (for example start = raw and raw >= start after raw advances) plus an "
             "exact-end error return can be positive safety evidence for wraparound-to-lower-address parser traversal risks. "
             "For allocation hypotheses, raw malloc/calloc/realloc used before a visible failure check is strong local evidence, "
-            "while safe_calloc and bounded reads within a safe allocation are strong counter-evidence for allocation-failure and fixed-buffer hypotheses."
+            "while safe_calloc and bounded reads within a safe allocation are strong counter-evidence for allocation-failure and fixed-buffer hypotheses. Use vulnerability-family-specific proof obligations: memory/allocation proofs require allocation-size origin, overflow/NULL guard, and use-before-check; parser/state proofs require input field, state/offset update, guard dominance, and later access; protocol/access-control proofs require trust boundary, required validation, missing check, and accept/use path; crypto/algorithmic proofs require attacker capability, deterministic weakness, missing diversification/validation, and security consequence."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -354,6 +354,7 @@ def counter_evidence_prompt(
             "A saved-base lower-bound guard on the advanced pointer (for example start = raw and raw >= start) "
             "combined with an exact-end error return may directly refute pointer-wraparound traversal hypotheses, "
             "but only for that pointer-wraparound class of risk."
+            " Reject counter-evidence unless it protects the same variable/value, dominates the dangerous operation, and applies on all relevant paths."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -386,6 +387,7 @@ def final_decision_prompt(
             "Do not output markdown/code fences. Do not exceed 1800 words. "
             "For each final_hypothesis_statuses entry, always output a proof object; never output proof:null. "
             "Keep every string concise and cite evidence IDs only, not long copied snippets."
+            " Use family-specific proof obligations: protocol validation, access-control, parser state, crypto/algorithmic, integer/bounds, allocation, path/file, and lifecycle bugs may each require different proof elements."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -473,8 +475,8 @@ def evidence_gap_analysis_prompt(
             "assign priority (high/medium/low). "
             "Propose follow_up_queries only for queryable=true gaps with non-duplicate query texts. "
             "If follow_up_queries is non-empty, set needs_more_evidence=true. "
-            "Prioritize caller/input-source queries for missing attacker control and exact guard queries "
-            "for missing overflow/bounds checks. Set needs_more_evidence=false with stop_reason_if_no_queries "
+            "Prioritize caller/input-source queries for missing attacker control, exact guard queries "
+            "for missing overflow/bounds checks, and family-specific queries for protocol validation, access-control, parser-state, allocation, crypto/algorithmic, and path/file vulnerabilities. Set needs_more_evidence=false with stop_reason_if_no_queries "
             "only if no useful queries exist."
         )},
     ]

@@ -82,6 +82,11 @@ export const api = {
 
   validationReport: () => http<Record<string, any>>("/reports/validation"),
   evaluationReport: () => http<Record<string, any>>("/reports/evaluation"),
+  studentLlmDefaults: () => http<Record<string, any>>("/student-llm-defaults"),
+  evaluationDetail: (jobId: string) => http<Record<string, any>>(`/evaluations/${encodeURIComponent(jobId)}`),
+  evaluationTraces: (jobId: string) => http<Record<string, any>>(`/evaluations/${encodeURIComponent(jobId)}/traces`),
+  evaluationSampleReportUrl: (jobId: string, sampleId: string) => `${BASE}/evaluations/${encodeURIComponent(jobId)}/samples/${encodeURIComponent(sampleId)}/report`,
+  evaluationReportsZipUrl: (jobId: string) => `${BASE}/evaluations/${encodeURIComponent(jobId)}/reports.zip`,
   disk: () => http<DiskInfo>("/disk"),
   leakage: () => http<{ ok: boolean; flagged: any[]; checked: number }>("/leakage"),
   challenges: () => http<{ challenge_root: string; name: string }[]>("/challenges"),

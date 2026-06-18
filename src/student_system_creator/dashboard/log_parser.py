@@ -72,6 +72,8 @@ _PHASE_MAP = {
     "eval.progress": ("progress", "evaluation"),
     "eval.query.done": ("agent_query", "evaluation"),
     "eval.query.start": ("agent_query", "evaluation"),
+    "eval.agent.stage": ("agent_stage", "evaluation"),
+    "eval.round.action": ("agent_action", "evaluation"),
     "api.query.done": ("agent_query", "serve"),
     "validate.progress": ("progress", "validation"),
     "package.progress": ("progress", "packaging"),

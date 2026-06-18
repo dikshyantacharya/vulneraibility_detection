@@ -108,6 +108,16 @@ def _has_strong_uncovered_vulnerability_pattern(decision: FinalDecision, evidenc
         return True, "missing point-at-infinity / identity-element guard before point-addition arithmetic"
     if "legacy_partial_encode_direct_guard" in facts:
         return True, "legacy partial ENCODE_DIRECT reserved-codepoint handling"
+    if "missing_protocol_trust_boundary_guard" in facts:
+        return True, "network/protocol boundary without an obvious trust-boundary validation guard"
+    if "possible_deterministic_transform_without_diversification" in facts:
+        return True, "deterministic security transform without obvious diversification/randomization guard"
+    if "length_offset_sensitive_operation" in facts and "parser_state_machine_surface" in facts:
+        # Parser/state bugs often lack one obvious dangerous call.  Treat an
+        # unresolved parser length/offset proof as vulnerable only when the final
+        # statuses are not already refuted by a relevant guard/safe wrapper.
+        if any(getattr(h, "local_risk_present", False) for h in (decision.final_hypothesis_statuses or [])):
+            return True, "parser/state-machine length or offset operation remains unresolved"
     combined = text + " " + hyp_text
     if not _has_pointer_wraparound_safety(evidence_items):
         if "raw += length * itemsize" in combined or ("raw +=" in combined and "length * itemsize" in combined):
@@ -155,6 +165,25 @@ def _is_low_relevance_or_residual_confirmed(h: Any, evidence_items: Iterable[Any
         return True, "speculative side-channel without complete proof"
 
     return False, ""
+
+
+def _is_guard_claim_relevant(h: Any, evidence_items: Iterable[Any] | None) -> bool:
+    """Conservative check for whether a counter-evidence claim can refute a hypothesis.
+
+    The large-run reports showed false safety when a guard on one value was
+    treated as protecting another value.  This helper is intentionally simple:
+    it prevents generic guard/caller claims from refuting high-signal source
+    facts unless the corresponding safety fact is present.
+    """
+    facts = _source_fact_types(evidence_items)
+    text = _verification_text(h)
+    if any(x in text for x in ("pointer", "raw", "length * itemsize", "wraparound")):
+        return _has_pointer_wraparound_safety(evidence_items)
+    if any(x in text for x in ("malloc", "calloc", "realloc", "allocation")):
+        return bool(facts & {"safe_calloc_allocation_wrapper_used", "bounded_read_within_safe_allocation", "dynamic_buffer_growth_guard"})
+    if any(x in text for x in ("hop", "link-local", "localhost", "protocol", "socket", "network")):
+        return not _has_fact(evidence_items, "missing_protocol_trust_boundary_guard")
+    return True
 
 
 def _verification_text(h: Any) -> str:

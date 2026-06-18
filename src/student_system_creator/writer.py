@@ -735,7 +735,7 @@ def main():
     parser.add_argument("--labels", default="private/test_labels.csv")
     parser.add_argument("--output", default="predictions.csv")
     parser.add_argument("--api-base", default=os.getenv("KG_API_BASE", "http://kg_api:8000"))
-    parser.add_argument("--api-key", default=os.getenv("KG_API_KEY", "dev-key"))
+    parser.add_argument("--api-key", default=os.getenv("KG_API_KEY", "dev-key-KG"))
     args = parser.parse_args()
 
     build_agent = load_solution(args.solution)
@@ -791,7 +791,7 @@ DOCKER_COMPOSE = '''services:
       dockerfile: Dockerfile
     environment:
       KG_API_BASE: ${KG_API_BASE:-http://host.docker.internal:8000}
-      KG_API_KEY: ${KG_API_KEY:-dev-key}
+      KG_API_KEY: ${KG_API_KEY:-dev-key-KG}
       MAX_ROUNDS: ${MAX_ROUNDS:-5}
       MAX_QUERIES_PER_ROUND: ${MAX_QUERIES_PER_ROUND:-2}
       MAX_QUERIES_PER_SAMPLE: ${MAX_QUERIES_PER_SAMPLE:-8}

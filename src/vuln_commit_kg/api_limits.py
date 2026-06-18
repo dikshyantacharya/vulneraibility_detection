@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import time
+import json
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
 
@@ -159,6 +161,8 @@ class RateLimiter:
         self._request_times: list[float] = []
         self._inflight = 0
         self._event_sink: Callable[[str, dict[str, Any]], None] | None = None
+        self._state_path = Path(str(getattr(cfg, "state_dir", "cache/api_rate_limits") or "cache/api_rate_limits")) / "local_request_times.json"
+        self._load_state_locked()
 
     def set_event_sink(self, sink: Callable[[str, dict[str, Any]], None] | None) -> None:
         self._event_sink = sink
@@ -168,6 +172,25 @@ class RateLimiter:
             return
         try:
             self._event_sink(kind, data)
+        except Exception:
+            pass
+
+    def _load_state_locked(self) -> None:
+        try:
+            if self._state_path.exists():
+                data = json.loads(self._state_path.read_text(encoding="utf-8"))
+                vals = data.get("request_times", []) if isinstance(data, dict) else []
+                now = time.time()
+                self._request_times = [float(x) for x in vals if float(x) >= now - 30 * 86400]
+        except Exception:
+            self._request_times = []
+
+    def _save_state_locked(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"request_times": self._request_times[-10000:]}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._state_path)
         except Exception:
             pass
 
@@ -233,6 +256,7 @@ class RateLimiter:
                 wait, detail = self._required_wait_locked()
                 if wait <= 0:
                     self._request_times.append(time.time())
+                    self._save_state_locked()
                     self._inflight += 1
                     usage = self._usage_locked()
                     break

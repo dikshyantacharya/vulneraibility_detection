@@ -28,7 +28,7 @@ from vuln_commit_kg.evaluation.usage import usage_summary
 from vuln_commit_kg.evaluation.visualize import make_visualizations, save_metric_tables
 from vuln_commit_kg.analysis_outputs.scaling import dir_size_bytes, write_scaling_analysis
 from vuln_commit_kg.analysis_outputs.live_dashboard import LiveDashboard
-from vuln_commit_kg.api_limits import fetch_provider_quota_headers, parse_rate_limit_headers
+from vuln_commit_kg.api_limits import RateLimiter, fetch_provider_quota_headers, parse_rate_limit_headers
 from vuln_commit_kg.kg.graph_cache import GraphCache
 from vuln_commit_kg.kg.graph_store import ProjectGraph
 from vuln_commit_kg.kg.project_graph_builder import ProjectGraphBuilder
@@ -141,6 +141,9 @@ class CommitKGPipeline:
         self._dashboard_inventory_loaded = False
         self.write_lock = threading.Lock()
         self.live = LiveDashboard(self.run_dir, cfg.live_dashboard) if cfg.live_dashboard.enabled else None
+        self.api_rate_limiter = RateLimiter(cfg.api_quota) if bool(getattr(cfg.api_quota, "enabled", False)) else None
+        if self.api_rate_limiter is not None and self.live is not None:
+            self.api_rate_limiter.set_event_sink(lambda kind, data: self.live.event(kind, data))
         self.logger.info(f"Run directory: {self.run_dir}")
         if config_path:
             self.logger.info(f"Config: {config_path}")
@@ -996,6 +999,29 @@ class CommitKGPipeline:
                 self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "requesting", "last_prompt_chars": prompt_chars, "current_model_stage": stage})
                 self.live.event("model_call.prompt_ready", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars})
                 self.live.event("model_call.start", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars})
+            def _provider_wait_seconds_from_error(exc: Exception) -> float:
+                resp = getattr(exc, "response", None)
+                if resp is not None:
+                    try:
+                        parsed = parse_rate_limit_headers(getattr(resp, "headers", {}))
+                        reset = parsed.get("reset_seconds")
+                        if reset is not None:
+                            return max(1.0, float(reset) + 2.0)
+                    except Exception:
+                        pass
+                msg = str(exc).lower()
+                if "429" in msg or "rate limit" in msg or "ratelimit" in msg or "too many requests" in msg:
+                    return 65.0
+                return 0.0
+
+            def _is_retryable_provider_error(exc: Exception) -> bool:
+                msg = f"{type(exc).__name__}: {exc}".lower()
+                return (
+                    "429" in msg or "rate limit" in msg or "ratelimit" in msg or "too many requests" in msg
+                    or "timeout" in msg or "readtimeout" in msg
+                    or "502" in msg or "503" in msg or "504" in msg
+                )
+
             old_max_tokens = getattr(model.cfg, "max_tokens", None) if hasattr(model, "cfg") else None
             old_temperature = getattr(model.cfg, "temperature", None) if hasattr(model, "cfg") else None
             old_extra_body = dict(getattr(model.cfg, "api_extra_body", {}) or {}) if hasattr(model, "cfg") else {}
@@ -1015,24 +1041,56 @@ class CommitKGPipeline:
                     model.set_request_context({"sample_id": sample.sample_id, "stage": stage, "attempt": "primary"})
                 start = time.perf_counter()
                 # Run the blocking provider call in a tiny worker so the main
-                # orchestration thread can emit periodic waiting events.  This
-                # makes long provider queues/read timeouts visible in the live
-                # dashboard instead of appearing as a silent hang.
-                with ThreadPoolExecutor(max_workers=1) as _model_exec:
-                    _future = _model_exec.submit(model.generate, prompt, system=system)
-                    while True:
-                        try:
-                            resp = _future.result(timeout=15.0)
-                            break
-                        except FutureTimeout:
-                            elapsed_wait = time.perf_counter() - start
-                            self.logger.info(
-                                "model.generate_waiting | sample=%s | stage=%s | attempt=primary | elapsed=%.1fs | prompt_chars=%s",
-                                sample.sample_id, stage, elapsed_wait, prompt_chars,
-                            )
-                            if self.live:
-                                self.live.event("model_call.waiting", {"sample_id": sample.sample_id, "stage": stage, "elapsed_seconds": elapsed_wait, "prompt_chars": prompt_chars})
-                                self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "waiting", "last_model_elapsed_seconds": elapsed_wait})
+                # orchestration thread can emit periodic waiting events. Wrap it
+                # with the local API scheduler so 50+ function batches respect
+                # SAIA/GWDG request ceilings without extra quota probes.
+                max_attempts = max(1, int(getattr(self.cfg.api_quota, "retry_max_attempts", 1) or 1))
+                attempt_no = 0
+                while True:
+                    attempt_no += 1
+                    rate_token = None
+                    if self.api_rate_limiter is not None and self.cfg.model.backend == "openai_compatible":
+                        rate_token = self.api_rate_limiter.acquire({
+                            "sample_id": sample.sample_id,
+                            "stage": stage,
+                            "attempt": attempt_no,
+                            "model": getattr(self.cfg.model, "model_name", None),
+                        })
+                    try:
+                        with ThreadPoolExecutor(max_workers=1) as _model_exec:
+                            _future = _model_exec.submit(model.generate, prompt, system=system)
+                            while True:
+                                try:
+                                    resp = _future.result(timeout=15.0)
+                                    break
+                                except FutureTimeout:
+                                    elapsed_wait = time.perf_counter() - start
+                                    self.logger.info(
+                                        "model.generate_waiting | sample=%s | stage=%s | attempt=%s | elapsed=%.1fs | prompt_chars=%s",
+                                        sample.sample_id, stage, attempt_no, elapsed_wait, prompt_chars,
+                                    )
+                                    if self.live:
+                                        self.live.event("model_call.waiting", {"sample_id": sample.sample_id, "stage": stage, "attempt": attempt_no, "elapsed_seconds": elapsed_wait, "prompt_chars": prompt_chars})
+                                        self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "waiting", "last_model_elapsed_seconds": elapsed_wait})
+                        if self.api_rate_limiter is not None and rate_token is not None:
+                            self.api_rate_limiter.release(rate_token, success=True, response_chars=len(getattr(resp, "text", "") or ""))
+                        break
+                    except Exception as provider_exc:
+                        wait_seconds = _provider_wait_seconds_from_error(provider_exc)
+                        retryable = _is_retryable_provider_error(provider_exc) and attempt_no < max_attempts
+                        if self.api_rate_limiter is not None and rate_token is not None:
+                            self.api_rate_limiter.release(rate_token, success=False, error=f"{type(provider_exc).__name__}: {provider_exc}", will_retry=retryable)
+                        if not retryable:
+                            raise
+                        delay = wait_seconds or min(float(getattr(self.cfg.api_quota, "retry_max_delay_seconds", 120.0) or 120.0), float(getattr(self.cfg.api_quota, "retry_initial_delay_seconds", 4.0) or 4.0) * (2 ** (attempt_no - 1)))
+                        self.logger.warning(
+                            "model.generate_retry_wait | sample=%s | stage=%s | attempt=%s/%s | wait=%.1fs | error=%s",
+                            sample.sample_id, stage, attempt_no, max_attempts, delay, provider_exc,
+                        )
+                        if self.live:
+                            self.live.event("api.rate_limit_retry_waiting", {"sample_id": sample.sample_id, "stage": stage, "attempt": attempt_no, "max_attempts": max_attempts, "wait_seconds": delay, "error": f"{type(provider_exc).__name__}: {provider_exc}"})
+                            self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "rate_limit_waiting", "last_model_error": f"{type(provider_exc).__name__}: {provider_exc}"})
+                        time.sleep(delay)
                 elapsed = time.perf_counter() - start
                 text = resp.text or ""
                 usage = usage_to_dict(getattr(resp, "usage", None))

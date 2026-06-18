@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     p_validate = sub.add_parser("validate-challenge", help="Validate public/private challenge consistency and KG/API retrievability")
     p_validate.add_argument("--challenge", default="outputs/student_challenge/vckg_codekg_student_challenge")
     p_validate.add_argument("--api-base", default=None)
-    p_validate.add_argument("--api-key", default="dev-key")
+    p_validate.add_argument("--api-key", default="dev-key-KG")
     p_validate.add_argument("--api-timeout", type=float, default=30.0)
     p_validate.add_argument("--limit", type=int, default=None)
     p_validate.add_argument("--repo-worktrees", default=None)
@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--registry", default="outputs/student_challenge/vckg_codekg_student_challenge/private/kg_registry_private.json")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
-    p_serve.add_argument("--api-key", default="dev-key")
+    p_serve.add_argument("--api-key", default="dev-key-KG")
     p_serve.add_argument("--require-api-key", action="store_true")
     p_serve.add_argument("--max-nodes", type=int, default=500)
     p_serve.add_argument("--engine-cache-size", type=int, default=8)
@@ -79,9 +79,10 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--solution", required=True)
     p_eval.add_argument("--input", required=True)
     p_eval.add_argument("--train", default=None)
+    p_eval.add_argument("--train-limit", type=int, default=None, help="Load only the first N train rows for student agent fitting/context")
     p_eval.add_argument("--labels", default=None)
     p_eval.add_argument("--api-base", default="http://127.0.0.1:8000")
-    p_eval.add_argument("--api-key", default="dev-key")
+    p_eval.add_argument("--api-key", default="dev-key-KG")
     p_eval.add_argument("--out", default="outputs/student_eval")
     p_eval.add_argument("--limit", type=int, default=None)
     p_eval.add_argument("--max-rounds", type=int, default=5)
@@ -185,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if args.train:
             eval_args += ["--train", args.train]
+        if args.train_limit is not None:
+            eval_args += ["--train-limit", str(args.train_limit)]
         if args.labels:
             eval_args += ["--labels", args.labels]
         if args.limit is not None:

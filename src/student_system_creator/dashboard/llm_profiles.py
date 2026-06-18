@@ -118,12 +118,22 @@ class EnvironmentLoader:
         """
         env = {}
 
-        # Try external env folder (priority 1)
-        for fname in [".env", "env", "env.txt"]:
+        # Try external env folder (priority 1).
+        # Load all known env-file names instead of stopping at the first one so
+        # student-specific LLM settings can live beside the normal research key.
+        # Later files override earlier files. Secret values are never logged.
+        for fname in [
+            ".env",
+            "env",
+            "env.txt",
+            "student_agent.env",
+            "student_llm.env",
+            "academiccloud.env",
+            "saia.env",
+        ]:
             fpath = self.external_env_path / fname
             if fpath.exists():
                 env.update(self._parse_env_file(fpath))
-                break
 
         # Try project root .env.local (priority 2, overrides external)
         local_env = self.project_root / ".env.local"

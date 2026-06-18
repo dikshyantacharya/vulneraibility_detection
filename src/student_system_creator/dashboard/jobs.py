@@ -176,12 +176,33 @@ def _evaluate_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
             "--input", str(params["input"]),
             "--api-base", str(params.get("api_base", "http://127.0.0.1:8000")),
             "--out", str(params.get("out") or (job_dir / "eval_out"))]
+    if params.get("api_key"):
+        argv += ["--api-key", str(params["api_key"])]
     if params.get("labels"):
         argv += ["--labels", str(params["labels"])]
     if params.get("train"):
         argv += ["--train", str(params["train"])]
     if params.get("limit") is not None:
         argv += ["--limit", str(params["limit"])]
+    for key, flag in [
+        ("train_limit", "--train-limit"),
+        ("max_rounds", "--max-rounds"),
+        ("max_queries_per_round", "--max-queries-per-round"),
+        ("max_queries_per_sample", "--max-queries-per-sample"),
+        ("max_nodes_per_query", "--max-nodes-per-query"),
+        ("timeout_per_sample_seconds", "--timeout-per-sample-seconds"),
+        ("query_timeout_seconds", "--query-timeout-seconds"),
+    ]:
+        if params.get(key) is not None:
+            argv += [flag, str(params[key])]
+    if params.get("llm_enabled"):
+        argv += ["--llm-enabled"]
+    if params.get("llm_api_base"):
+        argv += ["--llm-api-base", str(params["llm_api_base"])]
+    if params.get("llm_model"):
+        argv += ["--llm-model", str(params["llm_model"])]
+    if params.get("llm_api_key_env"):
+        argv += ["--llm-api-key-env", str(params["llm_api_key_env"])]
     return argv
 
 
@@ -340,6 +361,23 @@ def _research_argv(params: dict[str, Any], job_dir: Path, ctx: JobContext) -> li
     ap["stop_when_no_new_evidence"] = True
     ap["stop_when_no_new_queries"] = True
     ap["stop_when_all_hypotheses_resolved"] = True
+
+    # Provider quota defaults for SAIA/GWDG AcademicCloud.  These are local
+    # scheduling limits only; we intentionally do not probe the provider on
+    # every run because probes themselves consume quota.  Values are slightly
+    # below the observed headers (10/min, 200/hour, 400/day, 3000/month) to
+    # leave a safety margin for manual checks and failed/retried requests.
+    aq = base.setdefault("api_quota", {})
+    aq["enabled"] = True
+    aq["max_concurrent_requests"] = int(aq.get("max_concurrent_requests") or 1)
+    aq["requests_per_minute"] = int(aq.get("requests_per_minute") or 9)
+    aq["requests_per_hour"] = int(aq.get("requests_per_hour") or 190)
+    aq["requests_per_day"] = int(aq.get("requests_per_day") or 390)
+    aq["requests_per_month"] = int(aq.get("requests_per_month") or 2900)
+    aq["retry_max_attempts"] = max(int(aq.get("retry_max_attempts") or 1), 8)
+    aq["retry_initial_delay_seconds"] = max(float(aq.get("retry_initial_delay_seconds") or 0), 10.0)
+    aq["retry_max_delay_seconds"] = max(float(aq.get("retry_max_delay_seconds") or 0), 600.0)
+    aq["provider_header_probe"] = "off"
 
     exp_block = base.setdefault("experiment", {})
     exp_block["output_root"] = str((job_dir / "runs").as_posix())

@@ -178,7 +178,7 @@ def validate_challenge(
     challenge: str | Path,
     *,
     api_base: str | None = None,
-    api_key: str | None = "dev-key",
+    api_key: str | None = "dev-key-KG",
     api_timeout: float = 30.0,
     limit: int | None = None,
     repo_worktrees: str | Path | None = None,
@@ -381,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate public/private challenge consistency and KG retrievability.")
     parser.add_argument("--challenge", default="outputs/student_challenge/vckg_codekg_student_challenge")
     parser.add_argument("--api-base", default=None, help="Optional running KG API base URL, e.g. http://127.0.0.1:8000")
-    parser.add_argument("--api-key", default="dev-key")
+    parser.add_argument("--api-key", default="dev-key-KG")
     parser.add_argument("--api-timeout", type=float, default=30.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--repo-worktrees", default=None, help="Optional admin worktree cache, e.g. cache/worktrees, for source snapshot checks")

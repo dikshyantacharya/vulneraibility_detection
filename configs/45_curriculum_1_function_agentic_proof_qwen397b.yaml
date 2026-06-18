@@ -159,16 +159,16 @@ model:
   api_disable_thinking: true
 api_quota:
   enabled: true
-  requests_per_minute: 6
-  requests_per_hour: 120
-  requests_per_day: 240
-  requests_per_month: 3000
+  requests_per_minute: 9
+  requests_per_hour: 190
+  requests_per_day: 390
+  requests_per_month: 2900
   max_concurrent_requests: 1
-  retry_max_attempts: 2
+  retry_max_attempts: 8
   retry_timeout_max_attempts: 1
-  retry_initial_delay_seconds: 4
+  retry_initial_delay_seconds: 10
   retry_empty_response_max_attempts: 1
-  retry_max_delay_seconds: 120
+  retry_max_delay_seconds: 600
   provider_headers_enabled: true
   provider_header_probe: 'off'
   provider_header_update_from_responses: true

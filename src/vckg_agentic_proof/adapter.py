@@ -359,6 +359,53 @@ def _infer_deterministic_source_facts(target_source: str, target_function: str =
                 allocation_expression=arg,
             )
 
+
+    # Generic vulnerability-family facts.  These do not decide labels by
+    # themselves; they route verification/gap analysis toward proof obligations
+    # that are not simple source-local memory bugs.
+    network_terms = ("recvfrom", "recvmsg", "sendto", "ndp_", "sockaddr", "IPV6", "AF_INET6", "tcp_open", "start_daemon")
+    if any(t in src for t in network_terms):
+        has_trust_guard = any(t in src for t in ("IPV6_HOPLIMIT", "hop_limit", "hops", "IN6_IS_ADDR_LINKLOCAL", "linklocal", "link-local", "127.0.0.1", "localhost", "INADDR_LOOPBACK", "SO_BINDTODEVICE"))
+        add_fact(
+            "protocol_or_network_boundary_surface",
+            "The target function is on a network/protocol boundary. Vulnerability proof should check protocol trust-boundary validation such as source address, hop limit, link-local/localhost restrictions, and accept/reject paths.",
+        )
+        if not has_trust_guard:
+            add_fact(
+                "missing_protocol_trust_boundary_guard",
+                "No obvious hop-limit, link-local, localhost, or equivalent trust-boundary guard is visible in this network/protocol function. This is high-signal local evidence for protocol/access-control validation bugs when the function accepts external input.",
+            )
+
+    if re.search(r"\b(?:xor|XOR|scrambl|encrypt|decrypt|cipher|hash|digest|key|password)\b", src):
+        add_fact(
+            "crypto_or_algorithmic_security_surface",
+            "The target function implements or uses a security-sensitive transform/key/password/scrambling operation. Vulnerability proof may be algorithmic/semantic rather than memory-safety only.",
+        )
+        if re.search(r"\b(?:xor|XOR|scrambl)\b", src) and not re.search(r"\b(?:random|nonce|salt|iv|keyfile|permutation|shuffle)\b", src, flags=re.I):
+            add_fact(
+                "possible_deterministic_transform_without_diversification",
+                "A deterministic XOR/scramble-like transform is visible without an obvious nonce/salt/randomization/diversification guard. This is queryable semantic evidence for algorithmic weakness, not a C buffer bug.",
+            )
+
+    parser_terms = ("parse", "decode", "load_", "read_", "xref", "object", "header", "payload", "offset", "length", "size", "seek", "fread", "memcpy")
+    if any(t in src.lower() for t in parser_terms):
+        add_fact(
+            "parser_state_machine_surface",
+            "The target function parses or transforms structured input using sizes, offsets, lengths, reads, seeks, or object/header state. Proof should follow input field -> parser state -> bounds/offset update -> later access/copy/seek.",
+        )
+
+    if re.search(r"\b(?:access|auth|verify|permission|privilege|token|session|login|user|root|daemon)\b", src, flags=re.I):
+        add_fact(
+            "access_control_or_privileged_surface",
+            "The target function appears to touch authentication, authorization, daemon/privileged execution, token/session, or permission logic. Proof should check missing security-boundary validation, not only memory safety.",
+        )
+
+    if re.search(r"\b(?:strcpy|strcat|sprintf|snprintf|memcpy|memmove|fread|read|recv|recvfrom|scanf)\b", src) and re.search(r"\b(?:len|length|size|count|offset|pos|idx|index|n_)\b", src):
+        add_fact(
+            "length_offset_sensitive_operation",
+            "The target function combines copy/read/receive/format operations with length/size/offset/index variables. Verification should prove exact guard dominance over the same operands before refuting integer/bounds hypotheses.",
+        )
+
     # bsdiff-style shifted bound checks.  A safe version checks the extra block
     # after newpos has been advanced by x; a vulnerable version may check extraPtr
     # too early before the diff copy changes newpos.
@@ -451,6 +498,49 @@ def _query_mentions(text: str, terms: List[str]) -> bool:
     return any(t.lower() in low for t in terms)
 
 
+_ALLOWED_CODEKG_PREFIXES = (
+    "security_context(", "evidence_slice(", "variable_flow(",
+    "call_neighborhood(", "semantic_facts(", "function_context(",
+    "file_context(", "shortest_path(",
+)
+
+
+def _looks_like_codekg_query(text: str) -> bool:
+    low = _norm_query(text)
+    return any(low.startswith(prefix) for prefix in _ALLOWED_CODEKG_PREFIXES)
+
+
+def _symbol_from_bad_query_text(text: str) -> str:
+    stripped = str(text or "").strip().strip('`').strip()
+    # Convert common LLM mistakes such as "length", "raw", "header" into a
+    # deterministic variable_flow query instead of wasting loop budget on a
+    # non-executable free-form string. Keep only simple C identifiers.
+    if re.fullmatch(r"[A-Za-z_]\w*", stripped):
+        return stripped
+    return ""
+
+
+def _sanitize_or_rewrite_query(q: KGQuery, sample: Dict[str, Any]) -> KGQuery | None:
+    fn = str(sample.get("func_name") or sample.get("function_name") or sample.get("target_function") or sample.get("function") or "").strip()
+    text = str(q.query_text or "").strip()
+    if not text or "<relative" in text or "<path" in text or "TODO" in text:
+        return None
+    if _looks_like_codekg_query(text):
+        return q
+    sym = _symbol_from_bad_query_text(text)
+    if sym and fn:
+        return _make_query(
+            q.query_id, q.hypothesis_id,
+            f"Rewritten invalid free-form query `{text}` into variable flow for `{sym}`",
+            f'variable_flow(target_function="{fn}", symbol="{sym}", data_depth=5)',
+            [sym],
+        )
+    # Drop arbitrary free-form graph/search requests. The KG tool contract is
+    # deliberately deterministic; non-call strings repeatedly returned zero
+    # evidence in larger runs.
+    return None
+
+
 def _make_query(query_id: str, hypothesis_id: Optional[str], purpose: str, query_text: str, variables: List[str] | None = None) -> KGQuery:
     return KGQuery(
         query_id=query_id,
@@ -523,6 +613,9 @@ def _auto_follow_up_queries_from_gaps(
         "raw", "raw_length", "length", "itemsize", "length_power",
         "in", "in_len", "in_pos", "ret", "ascii_prefix_length", "state", "wc",
         "op1", "op2", "rop", "curve", "p", "xdiff", "ydiff", "lambda",
+        "len", "size", "offset", "pos", "idx", "index", "count", "n", "num",
+        "buf", "buffer", "data", "dst", "src", "ptr", "packet", "msg", "addr",
+        "sock", "fd", "pid", "path", "header", "xref", "obj",
     ]
     for v in variables:
         if _query_mentions(gap_text, [v]):
@@ -548,6 +641,17 @@ def _auto_follow_up_queries_from_gaps(
         ("curve->p", "curve->p"),
         ("identity", "pointZZ_pIsIdentityElement"),
         ("point at infinity", "pointZZ_pIsIdentityElement"),
+        ("malloc", "malloc"),
+        ("calloc", "calloc"),
+        ("realloc", "realloc"),
+        ("memcpy", "memcpy"),
+        ("fread", "fread"),
+        ("recvfrom", "recvfrom"),
+        ("recvmsg", "recvmsg"),
+        ("hop", "hop_limit"),
+        ("link-local", "IN6_IS_ADDR_LINKLOCAL"),
+        ("localhost", "127.0.0.1"),
+        ("auth", "authorization"),
     ]
     for needle, stmt in expr_terms:
         if needle.lower() in gap_text.lower():
@@ -594,15 +698,14 @@ def _actionable_gap_queries(
     out: List[KGQuery] = []
     seen: set[str] = set()
     for q in combined:
-        text = str(q.query_text or "")
-        # Drop obvious placeholders that cannot execute deterministically.
-        if "<relative" in text or "<path" in text or "TODO" in text:
+        q2 = _sanitize_or_rewrite_query(q, sample)
+        if q2 is None:
             continue
-        norm = _norm_query(text)
+        norm = _norm_query(q2.query_text)
         if not norm or norm in seen:
             continue
         seen.add(norm)
-        out.append(q)
+        out.append(q2)
     return out
 
 
@@ -888,6 +991,24 @@ def run_agentic_proof_pipeline(
         text, KGQueryPlan,
         llm_repair=_repair_llm(llm_generate, config, sample_id, events, "02_kg_query_planning"),
     )
+    sanitized_initial_queries: List[KGQuery] = []
+    dropped_initial_queries = 0
+    seen_initial_query_texts: set[str] = set()
+    for q in query_plan.queries:
+        q2 = _sanitize_or_rewrite_query(q, sample)
+        if q2 is None:
+            dropped_initial_queries += 1
+            continue
+        norm = _norm_query(q2.query_text)
+        if norm in seen_initial_query_texts:
+            dropped_initial_queries += 1
+            continue
+        seen_initial_query_texts.add(norm)
+        sanitized_initial_queries.append(q2)
+    if dropped_initial_queries:
+        events.append(AgentEvent(sample_id, "02_kg_query_sanitization", "done",
+                                  details={"dropped_or_rewritten": dropped_initial_queries, "kept": len(sanitized_initial_queries)}))
+    query_plan.queries = sanitized_initial_queries
     query_dicts = [q.model_dump(mode="json") for q in query_plan.queries]
 
     # ── Stage 03: Initial KG retrieval ───────────────────────────────────────
