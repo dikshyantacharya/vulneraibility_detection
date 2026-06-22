@@ -229,3 +229,50 @@ class EvidenceGapPlan(BaseModel):
     # Allows the backend to record why no loop happened without free-text parsing.
     stop_reason_if_no_queries: Optional[str] = None
     stop_reason: Optional[str] = None        # legacy alias
+
+
+class ProofObligationStatus(str, Enum):
+    proven = "proven"
+    refuted = "refuted"
+    not_answered = "not_answered"
+    partially_proven = "partially_proven"
+
+
+class ProofObligation(BaseModel):
+    obligation_id: str
+    hypothesis_id: str
+    name: str
+    question: str
+    required: bool = True
+    family: str = "generic"
+    needed_symbols: List[str] = Field(default_factory=list)
+    expected_evidence: str = ""
+
+
+class ProofObligationVerification(BaseModel):
+    obligation_id: str
+    hypothesis_id: str
+    result: ProofObligationStatus
+    evidence_ids: List[str] = Field(default_factory=list)
+    counter_evidence_ids: List[str] = Field(default_factory=list)
+    missing_evidence: List[str] = Field(default_factory=list)
+    explanation: str = ""
+    confidence: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class ProofObligationVerificationEnvelope(BaseModel):
+    verifications: List[ProofObligationVerification] = Field(default_factory=list)
+
+
+class HypothesisProofLedger(BaseModel):
+    hypothesis_id: str
+    family: str = "generic"
+    obligations: List[ProofObligation] = Field(default_factory=list)
+    obligation_results: List[ProofObligationVerification] = Field(default_factory=list)
+    status_hint: str = "incomplete"
+    required_proven: int = 0
+    required_total: int = 0
+    required_missing: List[str] = Field(default_factory=list)
+    counter_evidence_ids: List[str] = Field(default_factory=list)
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)

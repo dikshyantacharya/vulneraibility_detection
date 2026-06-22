@@ -1,8 +1,8 @@
 from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
-from .schemas import CounterEvidenceReview, EvidenceGapPlan, FinalDecision, KGQueryPlan, HypothesisVerification, VulnerabilityHypothesis
-from .code_evidence import build_code_evidence_bundle, build_code_evidence_capsules, compact_code_evidence_index
+from .schemas import CounterEvidenceReview, EvidenceGapPlan, FinalDecision, KGQueryPlan, HypothesisVerification, VulnerabilityHypothesis, ProofObligationVerificationEnvelope
+from .code_evidence import build_code_evidence_bundle, build_code_evidence_capsules, build_obligation_code_capsules, compact_code_evidence_index
 
 COMMON_TAG_CONTRACT = """Return exactly:
 <analysis>
@@ -605,5 +605,56 @@ def consistency_repair_prompt(decision: Dict[str, Any], validation_notes: List[s
             f"REQUIRED OUTPUT CONTRACT (binary only — no inconclusive):\n{_BINARY_REPAIR_CONTRACT}\n\n"
             f"VALIDATION NOTES:\n{json.dumps(validation_notes, indent=2)}\n\n"
             f"CURRENT DECISION:\n{compact_json(decision, 12000)}"
+        )},
+    ]
+
+
+def proof_obligation_verification_prompt(
+    sample: Dict[str, Any],
+    hypothesis: Dict[str, Any],
+    obligation: Any,
+    evidence: List[Dict[str, Any]],
+    target_source: str = "",
+) -> List[Dict[str, str]]:
+    """Micro-verification prompt: one proof obligation, a few capsules.
+
+    The LLM is not asked to classify the whole hypothesis here.  It only marks
+    whether this one proof obligation is proven, refuted, partially proven, or
+    unanswered from the provided code capsules.
+    """
+    fn = _target_function_name(sample)
+    target_file = _target_file(sample)
+    schema = ProofObligationVerificationEnvelope.model_json_schema()
+    code_bundle = build_obligation_code_capsules(
+        evidence,
+        target_function=fn,
+        target_source=target_source,
+        target_file=target_file,
+        hypothesis=hypothesis,
+        obligation=obligation,
+        max_capsules=4,
+        max_code_chars=1100,
+        max_index_items=18,
+    )
+    obligation_payload = obligation.model_dump(mode="json") if hasattr(obligation, "model_dump") else obligation
+    return [
+        {"role": "system", "content": (
+            "You are a micro proof-obligation verifier for C/C++ security auditing. "
+            "Answer exactly one narrow proof question using only the provided source-code capsules. "
+            "Do not decide the entire vulnerability hypothesis. Do not speculate from missing evidence. "
+            "Return proven only when the code directly establishes this obligation. Return refuted only when positive source code contradicts this obligation. "
+            "Return partially_proven when the capsule supports the obligation but one sub-element remains missing. Return not_answered when the capsules do not answer it. "
+            "Cite only capsule_id values from the source-code bundle. Never use graph scores, semantic labels, or unstated assumptions as proof."
+        )},
+        {"role": "user", "content": (
+            f"{COMMON_TAG_CONTRACT}\n\n"
+            f"ANSWER JSON SCHEMA:\n{json.dumps(schema, indent=2)}\n\n"
+            f"TARGET FUNCTION:\n{fn}\n\n"
+            f"CURRENT HYPOTHESIS:\n{compact_json(hypothesis, 6000)}\n\n"
+            f"CURRENT PROOF OBLIGATION ONLY:\n{compact_json(obligation_payload, 5000)}\n\n"
+            f"SOURCE CODE CAPSULES FOR THIS OBLIGATION:\n{compact_json(code_bundle, 10000)}\n\n"
+            "Return exactly one object in verifications for the current obligation. "
+            "Use result = proven | refuted | partially_proven | not_answered. "
+            "If result is not proven, list the precise missing_evidence needed for this obligation only."
         )},
     ]

@@ -8,12 +8,19 @@ from .parser import parse_model_object
 from .prompts import (counter_evidence_prompt, counter_gap_analysis_prompt,
                       evidence_gap_analysis_prompt, final_decision_prompt,
                       hypothesis_verification_prompt, single_hypothesis_verification_prompt,
-                      kg_query_planning_prompt,
+                      proof_obligation_verification_prompt, kg_query_planning_prompt,
                       source_only_hypothesis_prompt, consistency_repair_prompt)
 from .schemas import (CounterEvidenceReview, EvidenceGapPlan, FinalDecision,
                       FinalPrediction, HypothesisStatus, HypothesisVerification, KGQuery, KGQueryPlan,
-                      VulnerabilityHypothesis)
+                      ProofObligationVerificationEnvelope, VulnerabilityHypothesis)
 from .validator import validate_final_decision
+from .proof_obligations import (
+    build_proof_obligations,
+    infer_proof_family,
+    obligation_queries,
+    summarize_ledger,
+    verification_from_ledger,
+)
 
 
 def _make_emergency_fallback_decision(error_msg: str) -> FinalDecision:
@@ -937,6 +944,11 @@ class AgenticProofConfig:
     max_counter_iterations: int = 2
     # Research-side default: verify one hypothesis at a time with code evidence.
     per_hypothesis_verification: bool = True
+    # New default: decompose each hypothesis into typed proof obligations and
+    # ask the LLM one narrow proof question per call.
+    enable_proof_obligation_ledger: bool = True
+    max_obligations_per_hypothesis: int = 8
+    max_queries_per_obligation: int = 3
     stop_on_confirmed_vulnerability: bool = True
     # Other
     temperature: float = 0.0
@@ -1303,275 +1315,417 @@ def run_agentic_proof_pipeline(
         latest_verification: Optional[Dict[str, Any]] = None
         hyp_stop_reason: Optional[str] = None
 
-        def _terminal_close_hypothesis(reason: str, iteration_no: int, retrieval_status: Dict[str, Any]) -> None:
-            """Run a final closure pass for one hypothesis when retrieval cannot continue.
-
-            This prevents an unresolved hypothesis from silently falling through to
-            the next hypothesis after duplicate/no-result follow-up queries.  The
-            LLM sees the same source-code bundle plus a retrieval-status object and
-            must return the best terminal status for this hypothesis under bounded
-            static evidence.
-            """
-            nonlocal latest_verification, hyp_stop_reason
-            terminal_stage = f"04_hypothesis_terminal_verification__{hyp_stage_id}_iter{iteration_no}"
-            terminal_payload = {
+        if config.enable_proof_obligation_ledger:
+            # ── Stage 04{hyp}: proof-obligation micro-verification ledger ──
+            # The controller decomposes the hypothesis into typed proof obligations
+            # and asks the LLM one narrow question at a time.  The final
+            # hypothesis verification is derived from this ledger, not from a
+            # single large hypothesis-level prompt.
+            family = infer_proof_family(hypothesis, target_source)
+            obligations = build_proof_obligations(hypothesis, target_source)[:config.max_obligations_per_hypothesis]
+            events.append(AgentEvent(sample_id, f"04_proof_ledger__{hyp_stage_id}", "start", details={
                 "hypothesis_id": hyp_id,
-                "closure_reason": reason,
-                "previous_status": (latest_verification or {}).get("status"),
-                "previous_missing_evidence": (latest_verification or {}).get("missing_evidence") or [],
-                "retrieval": retrieval_status,
-                "current_code_evidence_items": len(hyp_evidence),
-            }
-            text, usage = _call_llm(
-                llm_generate=llm_generate,
-                messages=single_hypothesis_verification_prompt(
-                    sample,
-                    hypothesis,
-                    hyp_evidence,
-                    target_source=target_source,
-                    retrieval_status=terminal_payload,
-                    terminal_closure=True,
-                ),
-                sample_id=sample_id,
-                stage=terminal_stage,
-                max_tokens=config.max_tokens_hypothesis_verification,
-                config=config,
-                events=events,
-            )
-            _merge_usage(usage_total, usage)
-            terminal_obj, _ = parse_model_object(
-                text,
-                _VerificationEnvelope,
-                llm_repair=_repair_llm(llm_generate, config, sample_id, events, terminal_stage),
-            )
-            terminal_verifs = terminal_obj.model_dump(mode="json").get("verifications") or []
-            if terminal_verifs:
-                latest_verification = next((v for v in terminal_verifs if v.get("hypothesis_id") == hyp_id), terminal_verifs[0])
-                latest_verification.setdefault("hypothesis_id", hyp_id)
-                latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
-                if gate_notes:
-                    events.append(AgentEvent(sample_id, terminal_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
-            hyp_stop_reason = reason
-            events.append(AgentEvent(sample_id, terminal_stage, "terminal_closed", details={
-                "hypothesis_id": hyp_id,
-                "stop_reason": reason,
-                "terminal_status": (latest_verification or {}).get("status"),
-                "confirmed_security_vulnerability": (latest_verification or {}).get("confirmed_security_vulnerability"),
+                "family": family,
+                "obligations": [o.model_dump(mode="json") for o in obligations],
             }))
-
-        # ── Stage 04{hyp}: verify and iterate only for this hypothesis ──────
-        for iteration in range(config.max_evidence_iterations + 1):
-            stage_suffix = "" if iteration == 0 else f"_iter{iteration}"
-            verif_stage = f"04_hypothesis_verification__{hyp_stage_id}{stage_suffix}"
-            text, usage = _call_llm(
-                llm_generate=llm_generate,
-                messages=single_hypothesis_verification_prompt(
-                    sample, hypothesis, hyp_evidence, target_source=target_source
-                ),
-                sample_id=sample_id,
-                stage=verif_stage,
-                max_tokens=config.max_tokens_hypothesis_verification,
-                config=config,
-                events=events,
-            )
-            _merge_usage(usage_total, usage)
-            verifications_obj, _ = parse_model_object(
-                text, _VerificationEnvelope,
-                llm_repair=_repair_llm(llm_generate, config, sample_id, events, verif_stage),
-            )
-            parsed_verifs = verifications_obj.model_dump(mode="json").get("verifications") or []
-            if parsed_verifs:
-                # The prompt asks for exactly one, but keep the matching one if a
-                # model emits extras.
-                latest_verification = next((v for v in parsed_verifs if v.get("hypothesis_id") == hyp_id), parsed_verifs[0])
-                latest_verification.setdefault("hypothesis_id", hyp_id)
-                latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
-                if gate_notes:
-                    events.append(AgentEvent(sample_id, verif_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
-            else:
-                latest_verification = {
-                    "hypothesis_id": hyp_id,
-                    "status": "insufficient_evidence",
-                    "local_risk_present": False,
-                    "confirmed_security_vulnerability": False,
-                    "proof": {},
-                    "supporting_evidence_ids": [],
-                    "counter_evidence_ids": [],
-                    "missing_evidence": ["LLM returned no verification object for this hypothesis."],
-                    "explanation": "No structured verification was returned for this hypothesis.",
-                }
-
-            # Stop this hypothesis as soon as it is confirmed/refuted/resolved.
-            one_verif_envelope = {"verifications": [latest_verification]}
-            if _all_hypotheses_resolved(one_verif_envelope):
-                hyp_stop_reason = "hypothesis_resolved"
-                break
-            # A raw confirmed status only closes the current hypothesis after the
-            # proof gate has accepted it.  It does not stop the global audit;
-            # counter-review and final validation still run later.
-            if not config.iterative_evidence_loop:
-                hyp_stop_reason = "loop_disabled"
-                break
-            if iteration >= config.max_evidence_iterations:
-                hyp_stop_reason = "max_iterations_reached"
-                break
-
-            # Ask for more code evidence for this hypothesis only.
-            gap_stage = f"04_evidence_gap__{hyp_stage_id}_iter{iteration + 1}"
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_started", {
-                    "sample_id": sample_id,
-                    "phase": "verification",
-                    "hypothesis_id": hyp_id,
-                    "iteration": iteration + 1,
-                    "accumulated_evidence_count": len(hyp_evidence),
-                })
-            try:
+            obligation_results = []
+            target_file = str(sample.get("filepath") or sample.get("file") or sample.get("target_file") or "")
+            for obligation in obligations:
+                po_stage_id = re.sub(r"[^A-Za-z0-9_\-]", "_", obligation.obligation_id)
+                po_query_stage = f"03_obligation_retrieval__{hyp_stage_id}__{po_stage_id}"
+                po_queries_raw = obligation_queries(sample, hypothesis, obligation, target_file=target_file)
+                po_queries: List[KGQuery] = []
+                dropped_po_queries = 0
+                for q in po_queries_raw[:config.max_queries_per_obligation]:
+                    q2 = _sanitize_or_rewrite_query(q, sample, target_source=target_source)
+                    if q2 is None:
+                        dropped_po_queries += 1
+                        continue
+                    norm = _norm_query(q2.query_text)
+                    if q2.query_id in executed_query_ids or norm in executed_query_texts:
+                        dropped_po_queries += 1
+                        continue
+                    po_queries.append(q2)
+                    executed_query_ids.add(q2.query_id)
+                    executed_query_texts.add(norm)
+                    all_query_models.append(q2)
+                if dropped_po_queries:
+                    events.append(AgentEvent(sample_id, f"03_obligation_query_sanitization__{hyp_stage_id}__{po_stage_id}", "done", details={
+                        "hypothesis_id": hyp_id,
+                        "obligation_id": obligation.obligation_id,
+                        "dropped_or_duplicate": dropped_po_queries,
+                        "kept": len(po_queries),
+                    }))
+                po_new_evidence: List[Dict[str, Any]] = []
+                if po_queries:
+                    po_query_dicts = [q.model_dump(mode="json") for q in po_queries]
+                    for _qd in po_query_dicts:
+                        _qd["_agentic_stage"] = po_query_stage
+                        _qd["_hypothesis_id"] = hyp_id
+                        _qd["_obligation_id"] = obligation.obligation_id
+                    events.append(AgentEvent(sample_id, po_query_stage, "start", details={
+                        "hypothesis_id": hyp_id,
+                        "obligation_id": obligation.obligation_id,
+                        "queries": len(po_query_dicts),
+                        "query_ids": [q.query_id for q in po_queries],
+                    }))
+                    po_new_evidence = kg_search(po_query_dicts, sample=sample, limit=config.evidence_limit_per_query)
+                    events.append(AgentEvent(sample_id, po_query_stage, "done", details={
+                        "hypothesis_id": hyp_id,
+                        "obligation_id": obligation.obligation_id,
+                        "items": len(po_new_evidence),
+                    }))
+                    if po_new_evidence:
+                        hyp_evidence.extend(po_new_evidence)
+                        accumulated_evidence.extend(po_new_evidence)
+                        retrieved.extend(po_new_evidence)
+                        iterations_completed += 1
+                po_verif_stage = f"04_proof_obligation__{hyp_stage_id}__{po_stage_id}"
                 text, usage = _call_llm(
                     llm_generate=llm_generate,
-                    messages=evidence_gap_analysis_prompt(
-                        sample,
-                        [latest_verification],
-                        hyp_evidence,
-                        list(executed_query_ids),
-                        iteration=iteration + 1,
+                    messages=proof_obligation_verification_prompt(
+                        sample, hypothesis, obligation, hyp_evidence, target_source=target_source
                     ),
                     sample_id=sample_id,
-                    stage=gap_stage,
-                    max_tokens=config.max_tokens_evidence_gap_analysis,
+                    stage=po_verif_stage,
+                    max_tokens=min(config.max_tokens_hypothesis_verification, 4096),
                     config=config,
                     events=events,
                 )
-            except Exception as _gap_exc:
-                if "Timeout" not in type(_gap_exc).__name__:
-                    raise
-                hyp_stop_reason = "llm_timeout_gap_analysis"
-                if on_iteration_event:
-                    on_iteration_event("evidence_iteration_completed", {
-                        "sample_id": sample_id,
-                        "phase": "verification",
-                        "hypothesis_id": hyp_id,
-                        "iteration": iteration + 1,
-                        "new_evidence_count": 0,
-                        "stop_reason": hyp_stop_reason,
-                    })
-                break
-            _merge_usage(usage_total, usage)
-            gap_plan, _ = parse_model_object(
-                text, EvidenceGapPlan,
-                llm_repair=_repair_llm(llm_generate, config, sample_id, events, gap_stage),
-            )
-            effective_gap_queries = _actionable_gap_queries(
-                sample, gap_plan, _effective_follow_up_queries(gap_plan),
-                prefix=f"QF-{hyp_stage_id}-{iteration + 1}-",
-                target_source=target_source,
-            )
-            events.append(AgentEvent(sample_id, gap_stage, "gap_plan", details={
-                "hypothesis_id": hyp_id,
-                "iteration": iteration + 1,
-                "needs_more_evidence": bool(gap_plan.needs_more_evidence),
-                "gaps": len(gap_plan.gaps or []),
-                "llm_follow_up_queries": len(gap_plan.follow_up_queries or []),
-                "effective_follow_up_queries": len(effective_gap_queries),
-            }))
-            if not _plan_effective_needs_more_evidence(gap_plan):
-                reason = (gap_plan.stop_reason_if_no_queries
-                          or gap_plan.stop_reason
-                          or "no_more_evidence_needed")
-                if not _all_hypotheses_resolved({"verifications": [latest_verification]}):
-                    _terminal_close_hypothesis(reason, iteration + 1, {
-                        "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
-                        "gap_plan_reason": gap_plan.reason,
-                        "gap_plan_stop_reason": reason,
-                        "attempted_new_queries": 0,
-                        "new_evidence_count": 0,
-                    })
+                _merge_usage(usage_total, usage)
+                po_obj, _ = parse_model_object(
+                    text,
+                    ProofObligationVerificationEnvelope,
+                    llm_repair=_repair_llm(llm_generate, config, sample_id, events, po_verif_stage),
+                )
+                po_items = po_obj.model_dump(mode="json").get("verifications") or []
+                if po_items:
+                    chosen = next((x for x in po_items if x.get("obligation_id") == obligation.obligation_id), po_items[0])
                 else:
-                    hyp_stop_reason = reason
-                if on_iteration_event:
-                    on_iteration_event("evidence_iteration_completed", {
-                        "sample_id": sample_id,
-                        "phase": "verification",
+                    chosen = {
+                        "obligation_id": obligation.obligation_id,
                         "hypothesis_id": hyp_id,
-                        "iteration": iteration + 1,
-                        "new_evidence_count": 0,
-                        "stop_reason": hyp_stop_reason,
-                    })
-                break
-            new_queries: List[KGQuery] = []
-            for q in effective_gap_queries[:config.max_queries_per_iteration]:
-                if not q.hypothesis_id:
-                    q.hypothesis_id = hyp_id
-                norm = _norm_query(q.query_text)
-                if q.query_id in executed_query_ids or norm in executed_query_texts:
-                    continue
-                new_queries.append(q)
-                executed_query_ids.add(q.query_id)
-                executed_query_texts.add(norm)
-                all_query_models.append(q)
-            if not new_queries:
-                duplicate_reason = "all_queries_duplicate"
-                _terminal_close_hypothesis(duplicate_reason, iteration + 1, {
-                    "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
-                    "gap_plan_reason": gap_plan.reason,
-                    "effective_follow_up_queries": [q.model_dump(mode="json") for q in effective_gap_queries[:config.max_queries_per_iteration]],
-                    "attempted_new_queries": 0,
-                    "duplicate_or_already_executed_queries": len(effective_gap_queries[:config.max_queries_per_iteration]),
-                    "new_evidence_count": 0,
-                })
-                if on_iteration_event:
-                    on_iteration_event("evidence_iteration_completed", {
-                        "sample_id": sample_id,
-                        "phase": "verification",
+                        "result": "not_answered",
+                        "evidence_ids": [],
+                        "counter_evidence_ids": [],
+                        "missing_evidence": ["LLM returned no obligation verification object."],
+                        "explanation": "No structured proof-obligation result was returned.",
+                        "confidence": 0.0,
+                    }
+                try:
+                    from .schemas import ProofObligationVerification
+                    obligation_results.append(ProofObligationVerification.model_validate(chosen))
+                except Exception:
+                    # Keep the pipeline robust: malformed micro-result becomes not_answered.
+                    from .schemas import ProofObligationVerification
+                    obligation_results.append(ProofObligationVerification.model_validate({
+                        "obligation_id": obligation.obligation_id,
                         "hypothesis_id": hyp_id,
-                        "iteration": iteration + 1,
-                        "new_evidence_count": 0,
-                        "stop_reason": hyp_stop_reason,
-                    })
-                break
+                        "result": "not_answered",
+                        "missing_evidence": ["Malformed proof-obligation verification output."],
+                        "explanation": "Malformed proof-obligation verification output.",
+                        "confidence": 0.0,
+                    }))
+                events.append(AgentEvent(sample_id, po_verif_stage, "ledger_update", details={
+                    "hypothesis_id": hyp_id,
+                    "obligation_id": obligation.obligation_id,
+                    "obligation_name": obligation.name,
+                    "required": obligation.required,
+                    "result": obligation_results[-1].result.value if hasattr(obligation_results[-1].result, "value") else str(obligation_results[-1].result),
+                    "evidence_ids": obligation_results[-1].evidence_ids,
+                    "counter_evidence_ids": obligation_results[-1].counter_evidence_ids,
+                    "missing_evidence": obligation_results[-1].missing_evidence,
+                }))
+            ledger = summarize_ledger(hyp_id, family, obligations, obligation_results)
+            latest_verification = verification_from_ledger(hypothesis, ledger)
+            latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
+            if gate_notes:
+                events.append(AgentEvent(sample_id, f"04_proof_ledger__{hyp_stage_id}", "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
+            hyp_stop_reason = f"proof_ledger_{ledger.status_hint}"
+            events.append(AgentEvent(sample_id, f"04_proof_ledger__{hyp_stage_id}", "done", details={
+                "hypothesis_id": hyp_id,
+                "family": ledger.family,
+                "required_proven": ledger.required_proven,
+                "required_total": ledger.required_total,
+                "required_missing": ledger.required_missing,
+                "status_hint": ledger.status_hint,
+                "supporting_evidence_ids": ledger.supporting_evidence_ids,
+                "counter_evidence_ids": ledger.counter_evidence_ids,
+                "derived_status": latest_verification.get("status"),
+                "confirmed_security_vulnerability": latest_verification.get("confirmed_security_vulnerability"),
+                "ledger": ledger.model_dump(mode="json"),
+            }))
 
-            followup_stage = f"03_followup_retrieval__{hyp_stage_id}_iter{iteration + 1}"
-            followup_dicts = [q.model_dump(mode="json") for q in new_queries]
-            for _qd in followup_dicts:
-                _qd["_agentic_stage"] = followup_stage
-                _qd["_hypothesis_id"] = hyp_id
-            events.append(AgentEvent(sample_id, followup_stage, "start",
-                                      details={"queries": len(followup_dicts), "hypothesis_id": hyp_id,
-                                               "query_ids": [q.query_id for q in new_queries]}))
-            new_evidence = kg_search(followup_dicts, sample=sample, limit=config.evidence_limit_per_query)
-            events.append(AgentEvent(sample_id, followup_stage, "done",
-                                      details={"items": len(new_evidence), "hypothesis_id": hyp_id}))
-            if not new_evidence and config.stop_when_no_new_evidence:
-                _terminal_close_hypothesis("no_new_evidence_returned", iteration + 1, {
-                    "attempted_new_queries": len(new_queries),
-                    "executed_query_ids": [q.query_id for q in new_queries],
-                    "executed_query_texts": [q.query_text for q in new_queries],
-                    "new_evidence_count": 0,
-                    "interpretation": "KG retrieval returned no previously unseen source-code evidence for this hypothesis.",
-                })
+        else:
+            def _terminal_close_hypothesis(reason: str, iteration_no: int, retrieval_status: Dict[str, Any]) -> None:
+                """Run a final closure pass for one hypothesis when retrieval cannot continue.
+
+                This prevents an unresolved hypothesis from silently falling through to
+                the next hypothesis after duplicate/no-result follow-up queries.  The
+                LLM sees the same source-code bundle plus a retrieval-status object and
+                must return the best terminal status for this hypothesis under bounded
+                static evidence.
+                """
+                nonlocal latest_verification, hyp_stop_reason
+                terminal_stage = f"04_hypothesis_terminal_verification__{hyp_stage_id}_iter{iteration_no}"
+                terminal_payload = {
+                    "hypothesis_id": hyp_id,
+                    "closure_reason": reason,
+                    "previous_status": (latest_verification or {}).get("status"),
+                    "previous_missing_evidence": (latest_verification or {}).get("missing_evidence") or [],
+                    "retrieval": retrieval_status,
+                    "current_code_evidence_items": len(hyp_evidence),
+                }
+                text, usage = _call_llm(
+                    llm_generate=llm_generate,
+                    messages=single_hypothesis_verification_prompt(
+                        sample,
+                        hypothesis,
+                        hyp_evidence,
+                        target_source=target_source,
+                        retrieval_status=terminal_payload,
+                        terminal_closure=True,
+                    ),
+                    sample_id=sample_id,
+                    stage=terminal_stage,
+                    max_tokens=config.max_tokens_hypothesis_verification,
+                    config=config,
+                    events=events,
+                )
+                _merge_usage(usage_total, usage)
+                terminal_obj, _ = parse_model_object(
+                    text,
+                    _VerificationEnvelope,
+                    llm_repair=_repair_llm(llm_generate, config, sample_id, events, terminal_stage),
+                )
+                terminal_verifs = terminal_obj.model_dump(mode="json").get("verifications") or []
+                if terminal_verifs:
+                    latest_verification = next((v for v in terminal_verifs if v.get("hypothesis_id") == hyp_id), terminal_verifs[0])
+                    latest_verification.setdefault("hypothesis_id", hyp_id)
+                    latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
+                    if gate_notes:
+                        events.append(AgentEvent(sample_id, terminal_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
+                hyp_stop_reason = reason
+                events.append(AgentEvent(sample_id, terminal_stage, "terminal_closed", details={
+                    "hypothesis_id": hyp_id,
+                    "stop_reason": reason,
+                    "terminal_status": (latest_verification or {}).get("status"),
+                    "confirmed_security_vulnerability": (latest_verification or {}).get("confirmed_security_vulnerability"),
+                }))
+
+            # ── Stage 04{hyp}: verify and iterate only for this hypothesis ──────
+            for iteration in range(config.max_evidence_iterations + 1):
+                stage_suffix = "" if iteration == 0 else f"_iter{iteration}"
+                verif_stage = f"04_hypothesis_verification__{hyp_stage_id}{stage_suffix}"
+                text, usage = _call_llm(
+                    llm_generate=llm_generate,
+                    messages=single_hypothesis_verification_prompt(
+                        sample, hypothesis, hyp_evidence, target_source=target_source
+                    ),
+                    sample_id=sample_id,
+                    stage=verif_stage,
+                    max_tokens=config.max_tokens_hypothesis_verification,
+                    config=config,
+                    events=events,
+                )
+                _merge_usage(usage_total, usage)
+                verifications_obj, _ = parse_model_object(
+                    text, _VerificationEnvelope,
+                    llm_repair=_repair_llm(llm_generate, config, sample_id, events, verif_stage),
+                )
+                parsed_verifs = verifications_obj.model_dump(mode="json").get("verifications") or []
+                if parsed_verifs:
+                    # The prompt asks for exactly one, but keep the matching one if a
+                    # model emits extras.
+                    latest_verification = next((v for v in parsed_verifs if v.get("hypothesis_id") == hyp_id), parsed_verifs[0])
+                    latest_verification.setdefault("hypothesis_id", hyp_id)
+                    latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
+                    if gate_notes:
+                        events.append(AgentEvent(sample_id, verif_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
+                else:
+                    latest_verification = {
+                        "hypothesis_id": hyp_id,
+                        "status": "insufficient_evidence",
+                        "local_risk_present": False,
+                        "confirmed_security_vulnerability": False,
+                        "proof": {},
+                        "supporting_evidence_ids": [],
+                        "counter_evidence_ids": [],
+                        "missing_evidence": ["LLM returned no verification object for this hypothesis."],
+                        "explanation": "No structured verification was returned for this hypothesis.",
+                    }
+
+                # Stop this hypothesis as soon as it is confirmed/refuted/resolved.
+                one_verif_envelope = {"verifications": [latest_verification]}
+                if _all_hypotheses_resolved(one_verif_envelope):
+                    hyp_stop_reason = "hypothesis_resolved"
+                    break
+                # A raw confirmed status only closes the current hypothesis after the
+                # proof gate has accepted it.  It does not stop the global audit;
+                # counter-review and final validation still run later.
+                if not config.iterative_evidence_loop:
+                    hyp_stop_reason = "loop_disabled"
+                    break
+                if iteration >= config.max_evidence_iterations:
+                    hyp_stop_reason = "max_iterations_reached"
+                    break
+
+                # Ask for more code evidence for this hypothesis only.
+                gap_stage = f"04_evidence_gap__{hyp_stage_id}_iter{iteration + 1}"
                 if on_iteration_event:
-                    on_iteration_event("evidence_iteration_completed", {
+                    on_iteration_event("evidence_iteration_started", {
                         "sample_id": sample_id,
                         "phase": "verification",
                         "hypothesis_id": hyp_id,
                         "iteration": iteration + 1,
-                        "new_evidence_count": 0,
-                        "stop_reason": hyp_stop_reason,
+                        "accumulated_evidence_count": len(hyp_evidence),
                     })
-                break
-            hyp_evidence.extend(new_evidence)
-            accumulated_evidence.extend(new_evidence)
-            retrieved.extend(new_evidence)
-            iterations_completed += 1
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id,
-                    "phase": "verification",
+                try:
+                    text, usage = _call_llm(
+                        llm_generate=llm_generate,
+                        messages=evidence_gap_analysis_prompt(
+                            sample,
+                            [latest_verification],
+                            hyp_evidence,
+                            list(executed_query_ids),
+                            iteration=iteration + 1,
+                        ),
+                        sample_id=sample_id,
+                        stage=gap_stage,
+                        max_tokens=config.max_tokens_evidence_gap_analysis,
+                        config=config,
+                        events=events,
+                    )
+                except Exception as _gap_exc:
+                    if "Timeout" not in type(_gap_exc).__name__:
+                        raise
+                    hyp_stop_reason = "llm_timeout_gap_analysis"
+                    if on_iteration_event:
+                        on_iteration_event("evidence_iteration_completed", {
+                            "sample_id": sample_id,
+                            "phase": "verification",
+                            "hypothesis_id": hyp_id,
+                            "iteration": iteration + 1,
+                            "new_evidence_count": 0,
+                            "stop_reason": hyp_stop_reason,
+                        })
+                    break
+                _merge_usage(usage_total, usage)
+                gap_plan, _ = parse_model_object(
+                    text, EvidenceGapPlan,
+                    llm_repair=_repair_llm(llm_generate, config, sample_id, events, gap_stage),
+                )
+                effective_gap_queries = _actionable_gap_queries(
+                    sample, gap_plan, _effective_follow_up_queries(gap_plan),
+                    prefix=f"QF-{hyp_stage_id}-{iteration + 1}-",
+                    target_source=target_source,
+                )
+                events.append(AgentEvent(sample_id, gap_stage, "gap_plan", details={
                     "hypothesis_id": hyp_id,
                     "iteration": iteration + 1,
-                    "new_evidence_count": len(new_evidence),
-                    "stop_reason": None,
-                })
+                    "needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                    "gaps": len(gap_plan.gaps or []),
+                    "llm_follow_up_queries": len(gap_plan.follow_up_queries or []),
+                    "effective_follow_up_queries": len(effective_gap_queries),
+                }))
+                if not _plan_effective_needs_more_evidence(gap_plan):
+                    reason = (gap_plan.stop_reason_if_no_queries
+                              or gap_plan.stop_reason
+                              or "no_more_evidence_needed")
+                    if not _all_hypotheses_resolved({"verifications": [latest_verification]}):
+                        _terminal_close_hypothesis(reason, iteration + 1, {
+                            "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                            "gap_plan_reason": gap_plan.reason,
+                            "gap_plan_stop_reason": reason,
+                            "attempted_new_queries": 0,
+                            "new_evidence_count": 0,
+                        })
+                    else:
+                        hyp_stop_reason = reason
+                    if on_iteration_event:
+                        on_iteration_event("evidence_iteration_completed", {
+                            "sample_id": sample_id,
+                            "phase": "verification",
+                            "hypothesis_id": hyp_id,
+                            "iteration": iteration + 1,
+                            "new_evidence_count": 0,
+                            "stop_reason": hyp_stop_reason,
+                        })
+                    break
+                new_queries: List[KGQuery] = []
+                for q in effective_gap_queries[:config.max_queries_per_iteration]:
+                    if not q.hypothesis_id:
+                        q.hypothesis_id = hyp_id
+                    norm = _norm_query(q.query_text)
+                    if q.query_id in executed_query_ids or norm in executed_query_texts:
+                        continue
+                    new_queries.append(q)
+                    executed_query_ids.add(q.query_id)
+                    executed_query_texts.add(norm)
+                    all_query_models.append(q)
+                if not new_queries:
+                    duplicate_reason = "all_queries_duplicate"
+                    _terminal_close_hypothesis(duplicate_reason, iteration + 1, {
+                        "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                        "gap_plan_reason": gap_plan.reason,
+                        "effective_follow_up_queries": [q.model_dump(mode="json") for q in effective_gap_queries[:config.max_queries_per_iteration]],
+                        "attempted_new_queries": 0,
+                        "duplicate_or_already_executed_queries": len(effective_gap_queries[:config.max_queries_per_iteration]),
+                        "new_evidence_count": 0,
+                    })
+                    if on_iteration_event:
+                        on_iteration_event("evidence_iteration_completed", {
+                            "sample_id": sample_id,
+                            "phase": "verification",
+                            "hypothesis_id": hyp_id,
+                            "iteration": iteration + 1,
+                            "new_evidence_count": 0,
+                            "stop_reason": hyp_stop_reason,
+                        })
+                    break
+
+                followup_stage = f"03_followup_retrieval__{hyp_stage_id}_iter{iteration + 1}"
+                followup_dicts = [q.model_dump(mode="json") for q in new_queries]
+                for _qd in followup_dicts:
+                    _qd["_agentic_stage"] = followup_stage
+                    _qd["_hypothesis_id"] = hyp_id
+                events.append(AgentEvent(sample_id, followup_stage, "start",
+                                          details={"queries": len(followup_dicts), "hypothesis_id": hyp_id,
+                                                   "query_ids": [q.query_id for q in new_queries]}))
+                new_evidence = kg_search(followup_dicts, sample=sample, limit=config.evidence_limit_per_query)
+                events.append(AgentEvent(sample_id, followup_stage, "done",
+                                          details={"items": len(new_evidence), "hypothesis_id": hyp_id}))
+                if not new_evidence and config.stop_when_no_new_evidence:
+                    _terminal_close_hypothesis("no_new_evidence_returned", iteration + 1, {
+                        "attempted_new_queries": len(new_queries),
+                        "executed_query_ids": [q.query_id for q in new_queries],
+                        "executed_query_texts": [q.query_text for q in new_queries],
+                        "new_evidence_count": 0,
+                        "interpretation": "KG retrieval returned no previously unseen source-code evidence for this hypothesis.",
+                    })
+                    if on_iteration_event:
+                        on_iteration_event("evidence_iteration_completed", {
+                            "sample_id": sample_id,
+                            "phase": "verification",
+                            "hypothesis_id": hyp_id,
+                            "iteration": iteration + 1,
+                            "new_evidence_count": 0,
+                            "stop_reason": hyp_stop_reason,
+                        })
+                    break
+                hyp_evidence.extend(new_evidence)
+                accumulated_evidence.extend(new_evidence)
+                retrieved.extend(new_evidence)
+                iterations_completed += 1
+                if on_iteration_event:
+                    on_iteration_event("evidence_iteration_completed", {
+                        "sample_id": sample_id,
+                        "phase": "verification",
+                        "hypothesis_id": hyp_id,
+                        "iteration": iteration + 1,
+                        "new_evidence_count": len(new_evidence),
+                        "stop_reason": None,
+                    })
 
         # ── Stage 05{hyp}: immediate counter-review before moving on ────────
         # A hypothesis is only terminal after its own counter-evidence review has

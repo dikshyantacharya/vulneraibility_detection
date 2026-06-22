@@ -386,3 +386,132 @@ def compact_code_evidence_index(evidence: List[Dict[str, Any]] | None, *, target
         if len(out) >= 120:
             break
     return [x for x in out if any(v for v in x.values())]
+
+
+def build_obligation_code_capsules(
+    evidence: List[Dict[str, Any]] | None,
+    *,
+    target_function: str,
+    target_source: str = "",
+    target_file: str = "",
+    hypothesis: Dict[str, Any] | Iterable[Dict[str, Any]] | None = None,
+    obligation: Any = None,
+    max_capsules: int = 4,
+    max_code_chars: int = 1200,
+    max_index_items: int = 20,
+) -> Dict[str, Any]:
+    """Build obligation-specific source-code capsules for one micro-review.
+
+    Unlike build_code_evidence_capsules(), this selector is intentionally
+    proof-obligation focused: it promotes snippets containing the obligation's
+    symbols/question terms and emits at most a few capsules.  This keeps each LLM
+    call small and complete for a single sub-question.
+    """
+    raw = [_as_dict(e) for e in (evidence or [])]
+    symbols = set(_symbols_from_hypothesis(hypothesis))
+    if obligation is not None:
+        try:
+            symbols.update(getattr(obligation, "needed_symbols", []) or [])
+            question = str(getattr(obligation, "question", "") or "")
+            name = str(getattr(obligation, "name", "") or "")
+        except Exception:
+            question = str(obligation)
+            name = ""
+        symbols.update(_symbols_from_hypothesis({"question": question, "name": name}))
+    else:
+        question = ""
+        name = ""
+
+    selected: List[Dict[str, Any]] = []
+    omitted: Counter[str] = Counter()
+    seen: Set[str] = set()
+
+    # Always include the target source only for obligations where local context is
+    # itself the evidence. Otherwise prefer slices/callees/callers first to avoid
+    # repeating the full function in every micro-call.
+    local_names = {"scaled_state_advance", "missing_remaining_bound_guard", "unsafe_continuation_or_accept_path", "dangerous_operation", "missing_guard_or_invariant", "domain_guard", "unsafe_extent_use"}
+    if target_source.strip() and (name in local_names or not raw):
+        selected.append({
+            "capsule_id": "TARGET-SOURCE",
+            "role": "target_function_source",
+            "symbol": target_function or None,
+            "file": target_file or None,
+            "code": clean_code_text(target_source, max_chars=max_code_chars),
+        })
+        seen.add("target-source")
+
+    candidates: List[tuple[int, Dict[str, Any], str]] = []
+    qlow = (question + " " + name).lower()
+    for item in raw:
+        kind = str(item.get("kind") or "")
+        code = clean_code_text(str(item.get("text") or ""), max_chars=max_code_chars)
+        if not _looks_like_code(kind, code):
+            omitted[f"non_code_or_noise_{kind or 'unknown'}"] += 1
+            continue
+        role = _role(item, target_function)
+        low = code.lower()
+        s = _score(item, target_function=target_function, symbols=symbols, code=code)
+        if name in {"counter_guard_or_caller_constraint", "counter_constraint", "positive_counter_evidence"} and role in {"caller_code", "callee_code", "definition_code", "related_function_code"}:
+            s += 130
+        if name == "callee_value_range" and role in {"callee_code", "related_function_code", "definition_code"}:
+            s += 160
+        if name in {"parsed_value_origin", "value_or_object_origin", "selector_origin", "extent_origin"} and role in {"caller_code", "callee_code", "target_related_code"}:
+            s += 80
+        if name in local_names and role in {"target_related_code", "statement_or_guard_code"}:
+            s += 90
+        if any(re.search(rf"\b{re.escape(sym)}\b", code) for sym in symbols):
+            s += 120
+        if "guard" in qlow and any(tok in low for tok in ("if", "while", "assert", "return -1", "error")):
+            s += 60
+        candidates.append((s, item, code))
+
+    for _sc, item, code in sorted(candidates, key=lambda row: (-row[0], _role(row[1], target_function), _eid(row[1]))):
+        key = _dedupe_key(item, code)
+        if key in seen:
+            omitted["duplicate_code"] += 1
+            continue
+        card = _card(item, target_function=target_function, max_code_chars=max_code_chars)
+        selected.append({
+            "capsule_id": card.get("id"),
+            "role": card.get("role"),
+            "symbol": card.get("symbol"),
+            "file": card.get("file"),
+            "code": card.get("code"),
+        })
+        seen.add(key)
+        if len(selected) >= max_capsules:
+            break
+
+    shown = {str(x.get("capsule_id")) for x in selected}
+    index: List[Dict[str, Any]] = []
+    for item in raw:
+        eid = _eid(item)
+        if not eid or eid in shown:
+            continue
+        kind = str(item.get("kind") or "")
+        code = clean_code_text(str(item.get("text") or ""), max_chars=220)
+        if not _looks_like_code(kind, code):
+            continue
+        index.append({
+            "id": eid,
+            "role": _role(item, target_function),
+            "symbol": item.get("function") or item.get("symbol") or item.get("name"),
+            "file": item.get("file") or item.get("relpath"),
+        })
+        if len(index) >= max_index_items:
+            break
+
+    oid = getattr(obligation, "obligation_id", None) if obligation is not None else None
+    return {
+        "policy": "Obligation-specific tiny source-code capsules. Cite capsule_id values. No graph scores, line spans, query summaries, or semantic labels as proof.",
+        "target_function": target_function or None,
+        "hypothesis_id": hypothesis.get("hypothesis_id") if isinstance(hypothesis, dict) else None,
+        "obligation_id": oid,
+        "obligation_name": name or None,
+        "question": question or None,
+        "code_capsules": [x for x in selected if x.get("code")],
+        "available_code_index": index,
+        "omitted_counts": dict(sorted(omitted.items())),
+        "raw_evidence_count": len(raw),
+        "shown_capsule_count": len([x for x in selected if x.get("code")]),
+    }

@@ -1888,6 +1888,9 @@ class ResearchInventory:
                         or stage.startswith("02_04_per_hypothesis_loop")
                         or stage.startswith("03_")
                         or stage.startswith("04_hypothesis_done")
+                        or stage.startswith("04_proof_ledger")
+                        or stage.startswith("04_proof_obligation")
+                        or stage.startswith("03_obligation_retrieval")
                         or stage.startswith("05_hypothesis_proof_state")
                         or stage.startswith("05_counter_evidence_review")
                         or "HYP-" in stage
@@ -1903,6 +1906,10 @@ class ResearchInventory:
                         "normalization_notes", "dropped_hypotheses", "pre_counter_status",
                         "post_counter_status", "accepted_confirmed", "counter_findings",
                         "remaining_hypotheses_skipped", "global_counter_llm_call",
+                        "family", "obligations", "obligation_id", "obligation_name",
+                        "required", "result", "required_proven", "required_total",
+                        "required_missing", "status_hint", "derived_status", "supporting_evidence_ids",
+                        "counter_evidence_ids", "missing_evidence", "ledger",
                     }}
                     try:
                         small_s = json.dumps(small, ensure_ascii=False)
