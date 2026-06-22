@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 from .schemas import CounterEvidenceReview, EvidenceGapPlan, FinalDecision, KGQueryPlan, HypothesisVerification, VulnerabilityHypothesis
+from .code_evidence import build_code_evidence_bundle, build_code_evidence_capsules, compact_code_evidence_index
 
 COMMON_TAG_CONTRACT = """Return exactly:
 <analysis>
@@ -147,17 +148,17 @@ STAGE_CONTEXT_POLICY: Dict[str, Dict[str, List[str]]] = {
     },
     "04_hypothesis_verification": {
         "allowed": ["system_prompt", "output_format", "schema", "target_function_name", "hypotheses",
-                    "kg_query_results", "initial_retrieval_evidence", "source_snippets"],
+                    "code_evidence_bundle", "source_code_sections", "retrieval_index"],
         "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit"],
     },
     "05_counter_evidence_review": {
         "allowed": ["system_prompt", "output_format", "schema", "target_function_name",
-                    "current_verifications", "evidence"],
+                    "current_verifications", "code_evidence_bundle"],
         "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit"],
     },
     "06_final_adjudication": {
         "allowed": ["system_prompt", "output_format", "schema", "target_function_name",
-                    "verifications", "counter_review", "evidence_index"],
+                    "verifications", "counter_review", "code_evidence_bundle"],
         "forbidden": ["sample_id", "project", "project_url", "label", "commit", "resolved_commit"],
     },
     "04_evidence_gap": {
@@ -196,26 +197,23 @@ def source_only_hypothesis_prompt(sample: Dict[str, Any], target_source: str) ->
     fn = _target_function_name(sample)
     return [
         {"role": "system", "content": (
-            "You are a source-only security hypothesis generator. "
-            "Generate candidate vulnerability hypotheses from the target function source. "
-            "Do not confirm vulnerabilities. Each hypothesis must identify a concrete risky operation, "
-            "a plausible attacker/input-control question, a missing-guard question, and a proof question "
-            "that later KG queries can test. Pay special attention to parsed length/count fields read "
-            "from raw buffers, integer/pointer wraparound, and missing checks before pointer advancement. "
-            "Do not collapse distinct values: a selector such as length_power is not the same as the "
-            "runtime length value read from input. Also pay attention to raw malloc/calloc/realloc results used "
-            "before a visible NULL/failure check, especially when the fixed counterpart might use a project wrapper "
-            "such as safe_calloc. A vulnerability hypothesis should be target-relevant and "
-            "testable, not merely a generic robustness concern. Do not treat GMP mpz_mul/mpz_sub as C integer "
-            "overflow/underflow; mpz values are arbitrary precision. Do not call sprintf('/proc/%d/environ', pid) "
-            "path traversal by itself because %d cannot inject slash components."
+            "You are a source-only C/C++ security hypothesis generator. "
+            "Generate candidate vulnerability hypotheses from the target function source only; do not confirm them. "
+            "For each hypothesis, identify a concrete risky operation, the value or object that must be attacker-controlled or malformed, "
+            "the exact guard/invariant that would be required, and the proof question that later CodeKG queries should test. "
+            "Cover vulnerability families broadly rather than relying on project-specific rules: memory safety, integer/bounds, parser/state-machine, "
+            "allocation/lifetime, path/file handling, command/API misuse, protocol/access-control, concurrency/lifecycle, and crypto/algorithmic misuse. "
+            "Use language-specific semantics when forming hypotheses: distinguish selectors from values they select, bounded formatting from path construction, "
+            "arbitrary-precision/library arithmetic from machine-integer arithmetic, and local robustness issues from externally reachable security impact. "
+            "Prefer hypotheses that are source-grounded, target-relevant, falsifiable by deterministic code evidence, and not merely generic style concerns. "
+            "Do not split the same root cause into many duplicate hypotheses; combine duplicate manifestations under one concise hypothesis."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
             f"SCHEMA:\n{json.dumps(schema, indent=2)}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
             f"TARGET FUNCTION SOURCE:\n```c\n{target_source}\n```\n\n"
-            "Generate 3 to 6 plausible vulnerability hypotheses from the target function source.\n"
+            "Generate all distinct, source-grounded vulnerability hypotheses that are plausible for this function; do not force an artificial fixed count.\n"
             "Use generic IDs: HYP-01, HYP-02, ...\n"
             "Prefer hypotheses that are testable by deterministic code evidence.\n"
             "Separate local source observations from non-vulnerability possibilities.\n"
@@ -229,10 +227,8 @@ def kg_query_planning_prompt(
     hypotheses: List[Dict[str, Any]],
     initial_evidence: List[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, str]]:
-    # Stage 02 plans deterministic CodeKG queries from the hypotheses only. It
-    # intentionally does NOT receive retrieved/initial evidence or dataset
-    # metadata (see STAGE_CONTEXT_POLICY). `initial_evidence` is accepted for
-    # backward-compatible call sites but deliberately ignored.
+    # Stage 02 plans deterministic CodeKG retrieval from hypotheses only.  It is
+    # intentionally general: no function-family examples and no project metadata.
     codekg_contract = (
         "Use only the deterministic CodeKG query interface. "
         "Put one complete function-call-style query in each query_text field.\n"
@@ -251,28 +247,26 @@ def kg_query_planning_prompt(
         '- function_context(target_function="<function>", depth=2)\n'
         '- file_context(file="<relative/source/file.c>")\n'
         '- shortest_path(source_node="<node-id>", target_node="<node-id>")\n\n'
-        "Prefer security_context for first-pass investigation. "
-        "Prefer evidence_slice when a suspicious expression is known. "
-        "Use variable_flow for suspicious symbols, call_neighborhood(direction=\"in\") for caller/input-source assumptions, "
-        "and semantic_facts for deterministic risk/guard evidence. "
-        "Do not ask for arbitrary free-form graph access. "
-        "Do not classify from the query name. "
-        "Final reasoning must use returned source-grounded evidence, not invented code."
+        "Choose queries that retrieve source code needed for a human security review: "
+        "the target operation, definitions/types/constants/macros used by it, callees that compute or validate values, "
+        "callers that supply arguments or establish preconditions, and variable/data-flow for values central to the hypothesis. "
+        "Prefer a small non-duplicated set. Use evidence_slice for exact risky expressions or guards, "
+        "variable_flow for provenance of critical values, call_neighborhood(direction=\"in\") for caller preconditions, "
+        "call_neighborhood(direction=\"out\") or function_context for callee behavior, and file_context for nearby definitions when required. "
+        "Do not ask free-form questions. Do not classify vulnerability status."
     )
     fn = _target_function_name(sample)
     target_file = _target_file(sample)
     file_block = f"OPTIONAL TARGET FILE:\n{target_file}\n\n" if target_file else ""
+    one = len(hypotheses or []) == 1
     return [
         {"role": "system", "content": (
-            "Plan source-grounded CodeKG retrieval queries to prove and disprove each hypothesis. "
-            "Generate a compact, non-redundant plan: prefer 5 to 8 total queries. "
-            "Always include at least one caller/input-source query when attacker control is a required "
-            "proof element, because vulnerable data often enters before the target function. "
-            "Prefer one security_context first, then evidence_slice for the most decisive suspicious "
-            "expressions, variable_flow for variables central to input control or bounds, "
-            "call_neighborhood(direction=\"in\") for caller constraints, and semantic_facts at most once. "
-            "Do not classify vulnerability status at this stage. "
-            "For buffer parsers, prefer queries that test the chain raw/user buffer -> parsed length/count -> size arithmetic -> pointer/index advance."
+            "Plan source-grounded CodeKG retrieval queries. "
+            "The goal is to fetch the smallest useful set of code evidence needed to prove or falsify the supplied hypothesis or hypotheses. "
+            "Be vulnerability-family agnostic: reason from the hypothesis proof obligations, not from hardcoded bug examples. "
+            "A good plan retrieves code that explains where relevant values come from, how they are transformed, which guards dominate the risky operation, "
+            "which callers/callees impose constraints, and which definitions/types/constants affect the semantics. "
+            "Avoid redundant queries and avoid broad graph dumps when a focused slice, caller, callee, variable-flow, or definition query is enough."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -280,51 +274,114 @@ def kg_query_planning_prompt(
             f"ANSWER JSON SCHEMA:\n{schema_block(KGQueryPlan)}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
             f"{file_block}"
-            f"HYPOTHESES:\n{compact_json(hypotheses, 12000)}\n\n"
-            "Generate a minimal deterministic KG query plan that can test or falsify the hypotheses.\n"
-            "Do not use prior retrieved evidence.\n"
-            "Do not invent evidence.\n"
-            "Do not classify vulnerability status at this stage."
+            f"{'CURRENT HYPOTHESIS' if one else 'HYPOTHESES'}:\n{compact_json(hypotheses, 12000)}\n\n"
+            "Generate deterministic CodeKG queries whose returned source code can test or falsify the hypothesis.\n"
+            "Do not use prior retrieved evidence. Do not invent evidence. Do not classify vulnerability status."
         )},
     ]
+
+
+def _verification_system_prompt() -> str:
+    return (
+        "Verify the supplied hypothesis using only the tiny source-code evidence capsules. "
+        "Answer the narrow proof question implied by the hypothesis; do not perform broad speculation. "
+        "A confirmed vulnerability requires a cited, source-grounded chain connecting: "
+        "a controllable or malformed value/object, the dangerous operation, the absent/failed dominating guard or invariant, "
+        "a reachable unsafe use or accept path, and a concrete security impact. "
+        "Refute only with positive code evidence that protects the same value/object and dominates the same dangerous operation, "
+        "or with caller/callee code that makes the dangerous state unreachable. "
+        "Do not treat absence of retrieved evidence as safety and do not treat generic semantic labels as proof. "
+        "Use the vulnerability-family proof obligations generically: memory/integer issues need operand, type/size, guard, and use evidence; "
+        "parser/state issues need input field, state/pointer/index update, remaining-bound guard, and accept/reject path evidence; "
+        "path/file/API issues need construction, validation, and sink evidence; protocol/access-control issues need trust boundary, required check, and accept/use path evidence; "
+        "lifecycle/concurrency issues need ownership/order/release evidence; crypto/algorithmic issues need attacker capability, deterministic weakness, missing diversification/validation, and consequence. "
+        "For scaled pointer/index traversal, do not require every scale operand to be attacker-controlled; instead check whether the parsed or malformed value is bounded against remaining space and the scale before the state advance."
+    )
 
 
 def hypothesis_verification_prompt(
     sample: Dict[str, Any],
     hypotheses: List[Dict[str, Any]],
     evidence: List[Dict[str, Any]],
+    target_source: str = "",
 ) -> List[Dict[str, str]]:
-    # Stage 04: no SAMPLE block, no dataset/project metadata. Target function name
-    # is extracted from the sample dict for orientation only.
+    # Backward-compatible multi-hypothesis prompt.  The new research flow calls
+    # single_hypothesis_verification_prompt, but tests/older callers may use this.
     fn = _target_function_name(sample)
+    target_file = _target_file(sample)
     schema = {"verifications": [HypothesisVerification.model_json_schema()]}
+    code_bundle = build_code_evidence_capsules(
+        evidence,
+        target_function=fn,
+        target_source=target_source,
+        target_file=target_file,
+        hypothesis=hypotheses,
+        max_capsules=12,
+        max_code_chars=1400,
+        max_index_items=32,
+    )
     return [
-        {"role": "system", "content": (
-            "Verify each hypothesis using only the provided evidence. "
-            "A confirmed vulnerability requires a complete cited chain: "
-            "input/control source → dangerous operation → missing or failed guard → "
-            "unsafe use/reachability → security impact. "
-            "If any element is missing, use plausible_but_unproven or insufficient_evidence. "
-            "Distinguish local risky code from exploitability. "
-            "Do not treat semantic-fact labels alone as proof of exploitability. "
-            "Do not treat absence of evidence as evidence of safety. "
-            "Do not infer attacker control unless caller/input evidence supports it. "
-            "For parser code, distinguish the encoded-width selector (for example length_power) from "
-            "the parsed runtime value (for example length = read(raw)); a guard on the selector does "
-            "not by itself bound the parsed value. If caller/input-source evidence is missing, keep the "
-            "hypothesis unresolved and make the missing caller/input evidence explicit. "
-            "Treat deterministic_source_fact items as source-grounded evidence. A pointer-wraparound "
-            "lower-bound guard (for example start = raw and raw >= start after raw advances) plus an "
-            "exact-end error return can be positive safety evidence for wraparound-to-lower-address parser traversal risks. "
-            "For allocation hypotheses, raw malloc/calloc/realloc used before a visible failure check is strong local evidence, "
-            "while safe_calloc and bounded reads within a safe allocation are strong counter-evidence for allocation-failure and fixed-buffer hypotheses. Use vulnerability-family-specific proof obligations: memory/allocation proofs require allocation-size origin, overflow/NULL guard, and use-before-check; parser/state proofs require input field, state/offset update, guard dominance, and later access; protocol/access-control proofs require trust boundary, required validation, missing check, and accept/use path; crypto/algorithmic proofs require attacker capability, deterministic weakness, missing diversification/validation, and security consequence."
-        )},
+        {"role": "system", "content": _verification_system_prompt()},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
             f"ANSWER JSON SCHEMA:\n{json.dumps(schema, indent=2)}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
             f"HYPOTHESES:\n{compact_json(hypotheses, 12000)}\n\n"
-            f"ACCUMULATED EVIDENCE:\n{compact_json(evidence, 22000)}"
+            f"SOURCE CODE EVIDENCE BUNDLE (TINY CAPSULES):\n{compact_json(code_bundle, 18000)}"
+        )},
+    ]
+
+
+def single_hypothesis_verification_prompt(
+    sample: Dict[str, Any],
+    hypothesis: Dict[str, Any],
+    evidence: List[Dict[str, Any]],
+    target_source: str = "",
+    retrieval_status: Dict[str, Any] | None = None,
+    terminal_closure: bool = False,
+) -> List[Dict[str, str]]:
+    fn = _target_function_name(sample)
+    target_file = _target_file(sample)
+    schema = {"verifications": [HypothesisVerification.model_json_schema()]}
+    code_bundle = build_code_evidence_capsules(
+        evidence,
+        target_function=fn,
+        target_source=target_source,
+        target_file=target_file,
+        hypothesis=hypothesis,
+        max_capsules=10,
+        max_code_chars=1400,
+        max_index_items=28,
+    )
+    status_block = ""
+    if retrieval_status:
+        status_block = (
+            "\n\nRETRIEVAL STATUS FOR THIS HYPOTHESIS:\n"
+            f"{compact_json(retrieval_status, 8000)}"
+        )
+    if terminal_closure:
+        instruction = (
+            "Return exactly one terminal verification object for the current hypothesis. "
+            "This is the closure pass for this hypothesis after the bounded KG retrieval loop. "
+            "If the available source code now proves a reachable dangerous operation on controllable or malformed data with no relevant dominating guard, use confirmed_vulnerability. "
+            "If positive code evidence refutes it, use the appropriate refuted_* status. "
+            "If the proof still lacks caller/input/source evidence, guard dominance, impact, or reachable unsafe use after all useful static queries were attempted, do not ask for duplicate evidence; use plausible_but_unproven or insufficient_evidence and explicitly say static evidence was exhausted for this hypothesis."
+        )
+    else:
+        instruction = (
+            "Return exactly one verification object for the current hypothesis. "
+            "If more code is needed to refute or confirm it, keep the status plausible_but_unproven or insufficient_evidence and list precise missing_evidence items."
+        )
+    return [
+        {"role": "system", "content": _verification_system_prompt()},
+        {"role": "user", "content": (
+            f"{COMMON_TAG_CONTRACT}\n\n"
+            f"ANSWER JSON SCHEMA:\n{json.dumps(schema, indent=2)}\n\n"
+            f"TARGET FUNCTION:\n{fn}\n\n"
+            f"CURRENT HYPOTHESIS ONLY:\n{compact_json(hypothesis, 9000)}\n\n"
+            f"SOURCE CODE EVIDENCE BUNDLE (TINY CAPSULES):\n{compact_json(code_bundle, 18000)}"
+            f"{status_block}\n\n"
+            f"{instruction}"
         )},
     ]
 
@@ -333,35 +390,33 @@ def counter_evidence_prompt(
     sample: Dict[str, Any],
     verifications: List[Dict[str, Any]],
     evidence: List[Dict[str, Any]],
+    target_source: str = "",
 ) -> List[Dict[str, str]]:
-    # Stage 05: no SAMPLE block, no dataset/project metadata.
     fn = _target_function_name(sample)
+    target_file = _target_file(sample)
+    code_bundle = build_code_evidence_capsules(
+        evidence,
+        target_function=fn,
+        target_source=target_source,
+        target_file=target_file,
+        hypothesis=verifications,
+        max_capsules=12,
+        max_code_chars=1300,
+        max_index_items=32,
+    )
     return [
         {"role": "system", "content": (
-            "You are the defense reviewer. Try to falsify each non-refuted hypothesis using "
-            "concrete evidence: guards, early returns, range checks, caller constraints, trusted "
-            "data origins, safe APIs, bounded allocation/length invariants, patched logic, or "
-            "unreachable paths. Missing proof is not itself a guard. "
-            "If counter-evidence only weakens the proof, say 'weakens' rather than 'refutes'. "
-            "Important: 'No evidence of attacker control' weakens confirmation but is not positive "
-            "counter-evidence of safety. 'Caller validates parameter X before this function' can be "
-            "counter-evidence. 'Guard checks X <= bound before dangerous operation' can be "
-            "counter-evidence. 'Semantic fact says nearby_guard_not_seen' is not counter-evidence. "
-            "A guard refutes a hypothesis only if it directly bounds the exact dangerous value or "
-            "dominates the exact dangerous operation. A guard on a related selector (for example "
-            "length_power) does NOT refute overflow of a parsed value (for example length = read(raw)). "
-            "Do not claim a reader-selection guard bounds the attacker-controlled value returned by the reader. "
-            "A saved-base lower-bound guard on the advanced pointer (for example start = raw and raw >= start) "
-            "combined with an exact-end error return may directly refute pointer-wraparound traversal hypotheses, "
-            "but only for that pointer-wraparound class of risk."
-            " Reject counter-evidence unless it protects the same variable/value, dominates the dangerous operation, and applies on all relevant paths."
+            "You are the defense reviewer. Try to falsify each non-refuted hypothesis using only concrete source code. "
+            "Positive counter-evidence must protect the same value/object and dominate the same dangerous operation, or must show a caller/callee invariant that makes the dangerous state unreachable. "
+            "Missing proof weakens confirmation but is not itself safety. Do not use graph scores, summaries, or unstated assumptions. "
+            "If counter-evidence only weakens the proof, say weakens rather than refutes."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
             f"ANSWER JSON SCHEMA:\n{schema_block(CounterEvidenceReview)}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
             f"CURRENT VERIFICATIONS:\n{compact_json(verifications, 16000)}\n\n"
-            f"EVIDENCE:\n{compact_json(evidence, 22000)}"
+            f"SOURCE CODE EVIDENCE BUNDLE (TINY CAPSULES):\n{compact_json(code_bundle, 18000)}"
         )},
     ]
 
@@ -371,31 +426,37 @@ def final_decision_prompt(
     verifications: List[Dict[str, Any]],
     counter_review: Dict[str, Any],
     evidence: List[Dict[str, Any]],
+    target_source: str = "",
 ) -> List[Dict[str, str]]:
-    # Stage 06: no SAMPLE block, no dataset/project metadata.
     fn = _target_function_name(sample)
+    target_file = _target_file(sample)
+    code_bundle = build_code_evidence_capsules(
+        evidence,
+        target_function=fn,
+        target_source=target_source,
+        target_file=target_file,
+        hypothesis=verifications,
+        max_capsules=10,
+        max_code_chars=1100,
+        max_index_items=30,
+    )
     return [
         {"role": "system", "content": (
             "Final adjudicator. Output compact valid JSON only inside <answer>. "
             "You MUST choose exactly one binary prediction: vulnerable or fixed/non-vulnerable. "
-            "Inconclusive is not allowed in the final answer. "
-            "Decide vulnerable only when a complete cited chain exists, or when deterministic source facts show a high-signal uncovered vulnerability pattern. "
-            "Local risk, TODO comments, unchecked realloc, possible side-channel, GMP arithmetic overflow/underflow claims, path traversal via numeric %d formatting, or missing caller proof alone is not enough. "
-            "Decide fixed/non-vulnerable when positive counter-evidence covers the remaining risk, when a suspected issue is unrelated/residual, or when proof remains incomplete after bounded retrieval. "
-            "For pointer-overflow parser hypotheses, a deterministic source fact showing a saved-base lower-bound guard on the advanced pointer plus an exact-end error return is exact counter-evidence for wraparound-to-lower-address traversal. "
-            "Never treat missing attacker-control evidence alone as safety evidence. "
-            "Do not output markdown/code fences. Do not exceed 1800 words. "
-            "For each final_hypothesis_statuses entry, always output a proof object; never output proof:null. "
-            "Keep every string concise and cite evidence IDs only, not long copied snippets."
-            " Use family-specific proof obligations: protocol validation, access-control, parser state, crypto/algorithmic, integer/bounds, allocation, path/file, and lifecycle bugs may each require different proof elements."
+            "Use only the structured verifications, counter-review findings, and source-code evidence capsules. "
+            "Choose vulnerable only when at least one hypothesis has a complete cited proof after proof-gate validation: input/control source, dangerous operation, missing/failed dominating guard, reachable unsafe use, and security impact. "
+            "Choose fixed/non-vulnerable when hypotheses are refuted by positive code evidence or remain unproven after the bounded per-hypothesis retrieval loop; local risk without complete proof is not confirmed vulnerability. "
+            "Never treat missing attacker-control evidence alone as safety evidence, and never use dataset labels, commit messages, graph scores, or raw metadata. "
+            "For each final_hypothesis_statuses entry, always output a proof object; never output proof:null. Cite evidence IDs only."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
             f"COMPACT ANSWER CONTRACT (must validate against FinalDecision):\n{_FINAL_DECISION_COMPACT_CONTRACT}\n\n"
             f"TARGET FUNCTION:\n{fn}\n\n"
-            f"VERIFICATIONS:\n{compact_json(verifications, 12000)}\n\n"
+            f"VERIFICATIONS:\n{compact_json(verifications, 16000)}\n\n"
             f"COUNTER REVIEW:\n{compact_json(counter_review, 9000)}\n\n"
-            f"EVIDENCE DIGEST:\n{compact_json(_short_evidence_digest(evidence), 12000)}"
+            f"SOURCE CODE EVIDENCE BUNDLE (TINY CAPSULES):\n{compact_json(code_bundle, 16000)}"
         )},
     ]
 
@@ -405,6 +466,8 @@ _CODEKG_QUERY_FORMS = (
     '- security_context(target_function="<fn>", depth=3, call_depth=2)\n'
     '- evidence_slice(target_function="<fn>", target_statement="<expr>", relation_depth=4)\n'
     '- variable_flow(target_function="<fn>", symbol="<var>", data_depth=4)\n'
+    '- call_neighborhood(target_function="<fn>", direction="in", call_depth=2)\n'
+    '- call_neighborhood(target_function="<fn>", direction="out", call_depth=2)\n'
     '- call_neighborhood(target_function="<fn>", direction="both", call_depth=2)\n'
     '- semantic_facts(target_function="<fn>")\n'
     '- function_context(target_function="<fn>", depth=2)\n'
@@ -435,11 +498,8 @@ def evidence_gap_analysis_prompt(
         for v in (verifications or [])
     ]
 
-    # Evidence index: id + kind only — no full text to stay within token budget
-    evidence_index = [
-        {"id": e.get("id") or e.get("evidence_id"), "kind": e.get("kind")}
-        for e in (evidence or [])
-    ]
+    # Evidence index: id + type + role only — no full text to stay within token budget.
+    evidence_index = compact_code_evidence_index(evidence, target_function=fn)
 
     return [
         {"role": "system", "content": (
@@ -459,6 +519,7 @@ def evidence_gap_analysis_prompt(
             "no_more_evidence_needed | no_queryable_gaps | duplicate_queries_only | "
             "all_hypotheses_resolved | no_new_evidence | insufficient_static_evidence. "
             "Generate only deterministic CodeKG queries using the allowed forms. "
+            "For variable_flow, the symbol must be a real identifier from the target code/evidence index, not an English proof-element word such as Bit, Bounds, Caller, or Unresolved. "
             "Do not duplicate already-executed queries (by text or id). "
             "Do not classify vulnerability status. Do not invent evidence."
         )},
@@ -476,7 +537,8 @@ def evidence_gap_analysis_prompt(
             "Propose follow_up_queries only for queryable=true gaps with non-duplicate query texts. "
             "If follow_up_queries is non-empty, set needs_more_evidence=true. "
             "Prioritize caller/input-source queries for missing attacker control, exact guard queries "
-            "for missing overflow/bounds checks, and family-specific queries for protocol validation, access-control, parser-state, allocation, crypto/algorithmic, and path/file vulnerabilities. Set needs_more_evidence=false with stop_reason_if_no_queries "
+            "for missing overflow/bounds checks, and family-specific queries for protocol validation, access-control, parser-state, allocation, crypto/algorithmic, and path/file vulnerabilities. "
+            "Never propose variable_flow over abstract English words; use only identifiers already visible in EVIDENCE ID INDEX or the current verification fields. Set needs_more_evidence=false with stop_reason_if_no_queries "
             "only if no useful queries exist."
         )},
     ]
@@ -501,17 +563,14 @@ def counter_gap_analysis_prompt(
         }
         for f in (counter_findings or [])
     ]
-    evidence_index = [
-        {"id": e.get("id") or e.get("evidence_id"), "kind": e.get("kind")}
-        for e in (evidence or [])
-    ]
+    evidence_index = compact_code_evidence_index(evidence, target_function=fn)
     return [
         {"role": "system", "content": (
             "You are a security defense analyst. Generate follow-up CodeKG queries to find "
             "concrete counter-evidence: guards, early returns, range checks, caller constraints, "
             "safe invariants, bounded allocation, or patched logic. "
-            "Only search for counter-evidence that directly applies to the exact dangerous operation/value. "
-            "For example, a bound on length_power does not bound length = read(raw). "
+            "Only search for counter-evidence that directly applies to the exact dangerous operation/value or makes that dangerous state unreachable. "
+            "A guard on a related value is not enough unless the code shows it dominates and constrains the same operand/object. "
             "If you propose follow_up_queries, needs_more_evidence must be true. "
             "Do not classify vulnerability status. Avoid duplicating already-executed queries."
         )},

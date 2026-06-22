@@ -623,3 +623,183 @@ def test_dynamic_growth_guard_prevents_raw_malloc_residual_from_forcing_vulnerab
     out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
     assert out.forced_prediction_bool is False
     assert out.decision_status == "forced_binary_non_vulnerable"
+
+
+def test_single_hypothesis_terminal_prompt_includes_retrieval_status():
+    from vckg_agentic_proof.prompts import single_hypothesis_verification_prompt
+
+    messages = single_hypothesis_verification_prompt(
+        {"target_function": "count_rows", "filepath": "x.c"},
+        {"hypothesis_id": "HYP-01", "title": "t", "risk_summary": "r"},
+        evidence=[{"id": "E1", "kind": "target_statement", "function": "count_rows", "text": "raw += length * itemsize;"}],
+        target_source="int count_rows(){ return 0; }",
+        retrieval_status={"closure_reason": "no_new_evidence_returned", "attempted_new_queries": 3},
+        terminal_closure=True,
+    )
+
+    text = "\n".join(m["content"] for m in messages)
+    assert "RETRIEVAL STATUS FOR THIS HYPOTHESIS" in text
+    assert "terminal verification object" in text
+    assert "no_new_evidence_returned" in text
+
+
+def test_variable_flow_sanitizer_rejects_english_gap_words():
+    from vckg_agentic_proof.adapter import _actionable_gap_queries
+
+    plan = EvidenceGapPlan(
+        needs_more_evidence=True,
+        gaps=[
+            GapItem(
+                gap_id="G1",
+                hypothesis_id="HYP-01",
+                proof_element="caller_constraints",
+                missing_evidence="Bit width and Caller constraints remain unresolved",
+                queryable=True,
+                priority="high",
+            )
+        ],
+        follow_up_queries=[
+            KGQuery(
+                query_id="BAD1",
+                hypothesis_id="HYP-01",
+                purpose="bad abstract variable",
+                query_text='variable_flow(target_function="count_rows", symbol="Bit", data_depth=5)',
+                expected_evidence="bad",
+            ),
+            KGQuery(
+                query_id="OK1",
+                hypothesis_id="HYP-01",
+                purpose="real target symbol",
+                query_text='variable_flow(target_function="count_rows", symbol="raw_length", data_depth=5)',
+                expected_evidence="ok",
+            ),
+        ],
+    )
+    src = "int count_rows(void *raw, int raw_length) { void *end = raw + raw_length; return 0; }"
+    out = _actionable_gap_queries({"function": "count_rows"}, plan, plan.follow_up_queries, prefix="QF-", target_source=src)
+    texts = [q.query_text for q in out]
+
+    assert not any('symbol="Bit"' in t for t in texts)
+    assert any('symbol="raw_length"' in t for t in texts)
+
+
+def test_confirmed_verification_with_missing_evidence_is_downgraded_by_proof_gate():
+    from vckg_agentic_proof.adapter import _gate_single_verification
+
+    v = {
+        "hypothesis_id": "HYP-01",
+        "status": "confirmed_vulnerability",
+        "local_risk_present": True,
+        "confirmed_security_vulnerability": True,
+        "proof": {
+            "input_control": "length is read from raw",
+            "dangerous_operation": "raw += length * itemsize",
+            "missing_or_failed_guard": "no overflow guard",
+            "unsafe_use": "raw may wrap",
+            "security_impact": "out-of-bounds read",
+            "cited_evidence_ids": ["TARGET-SOURCE"],
+        },
+        "missing_evidence": ["Caller constraints on length_power are still missing"],
+        "explanation": "claimed confirmed",
+    }
+
+    out, notes = _gate_single_verification(v, evidence=[])
+
+    assert out["status"] == "plausible_but_unproven"
+    assert out["confirmed_security_vulnerability"] is False
+    assert any("verification_still_lists_missing_evidence" in n for n in notes)
+
+
+def test_variable_flow_rejects_function_and_type_symbols_after_symbol_kind_routing():
+    from vckg_agentic_proof.adapter import _sanitize_or_rewrite_query
+
+    src = '''
+    int count_rows(void * raw, int raw_length, int length_power, int big_endian, int itemsize) {
+        IntRead read = choose_int_read(length_power, big_endian);
+        uint64_t length = read(raw);
+        raw += length * itemsize;
+        return 0;
+    }
+    '''
+    sample = {"function": "count_rows"}
+    valid = KGQuery(query_id="Q1", purpose="p", query_text='variable_flow(target_function="count_rows", symbol="length", data_depth=4)', expected_evidence="e")
+    bad_fn = KGQuery(query_id="Q2", purpose="p", query_text='variable_flow(target_function="count_rows", symbol="choose_int_read", data_depth=4)', expected_evidence="e")
+    bad_type = KGQuery(query_id="Q3", purpose="p", query_text='variable_flow(target_function="count_rows", symbol="IntRead", data_depth=4)', expected_evidence="e")
+    bad_target = KGQuery(query_id="Q4", purpose="p", query_text='variable_flow(target_function="count_rows", symbol="count_rows", data_depth=4)', expected_evidence="e")
+
+    assert _sanitize_or_rewrite_query(valid, sample, target_source=src) is not None
+    assert _sanitize_or_rewrite_query(bad_fn, sample, target_source=src) is None
+    assert _sanitize_or_rewrite_query(bad_type, sample, target_source=src) is None
+    assert _sanitize_or_rewrite_query(bad_target, sample, target_source=src) is None
+
+
+def test_counter_review_downgrades_raw_confirmed_before_final_adjudication():
+    from vckg_agentic_proof.adapter import _apply_counter_review_to_verifications
+
+    verifications = {"verifications": [
+        {
+            "hypothesis_id": "HYP-02",
+            "status": "confirmed_vulnerability",
+            "local_risk_present": True,
+            "confirmed_security_vulnerability": True,
+            "proof": {"input_control": "x", "dangerous_operation": "y", "missing_or_failed_guard": "z", "unsafe_use": "u", "security_impact": "i", "cited_evidence_ids": ["E1"]},
+            "supporting_evidence_ids": ["E1"],
+            "counter_evidence_ids": [],
+            "missing_evidence": [],
+            "explanation": "raw confirmed",
+        }
+    ]}
+    counter = {
+        "findings": [
+            {
+                "hypothesis_id": "HYP-02",
+                "strongest_counterargument": "dominating guard",
+                "counter_evidence_ids": ["C1"],
+                "refutes_or_weakens": "refutes",
+                "recommended_status": "refuted_by_guard",
+            }
+        ]
+    }
+    out, notes = _apply_counter_review_to_verifications(verifications, counter)
+    v = out["verifications"][0]
+    assert v["status"] == "refuted_by_guard"
+    assert v["confirmed_security_vulnerability"] is False
+    assert v["local_risk_present"] is False
+    assert v["counter_evidence_ids"] == ["C1"]
+    assert notes and "counter_review_updated HYP-02" in notes[0]
+
+
+def test_forced_vulnerable_decisive_ids_use_local_risk_evidence_not_counter_only():
+    decision = FinalDecision(
+        prediction=FinalPrediction.inconclusive,
+        confidence=0.6,
+        local_risk_present=True,
+        confirmed_security_vulnerability=False,
+        final_hypothesis_statuses=[
+            HypothesisVerification(
+                hypothesis_id="HYP-01",
+                status=HypothesisStatus.plausible_but_unproven,
+                local_risk_present=True,
+                explanation="raw pointer local risk",
+                proof={
+                    "dangerous_operation": "raw += length * itemsize",
+                    "missing_or_failed_guard": "no overflow guard",
+                    "unsafe_use": "raw may traverse beyond end",
+                    "security_impact": "out-of-bounds read",
+                    "cited_evidence_ids": ["E_LOCAL"],
+                },
+                supporting_evidence_ids=["E_LOCAL"],
+                counter_evidence_ids=["C_GUARD"],
+            )
+        ],
+        decisive_evidence_ids=["C_GUARD"],
+        explanation="inconclusive",
+    )
+    evidence = [
+        {"id": "E_LOCAL", "kind": "target_statement", "text": "raw += length * itemsize;"},
+        {"id": "C_GUARD", "kind": "target_statement", "text": "if (ordinal < 0 || ordinal > 8) return 0;"},
+    ]
+    out, notes, modified = validate_final_decision(decision, evidence_items=evidence, counter_review=None)
+    assert out.decision_status == "forced_binary_vulnerable"
+    assert "E_LOCAL" in out.decisive_evidence_ids
+    assert out.decisive_evidence_ids != ["C_GUARD"]

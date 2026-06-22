@@ -1763,6 +1763,9 @@ class ResearchInventory:
         _kv("final_prediction", _fp_bool)
         _kv("confidence", fp.get("confidence") or "—")
         _kv("decision_status", fp.get("decision_status") or "—")
+        _kv("evidence_strength", fp.get("evidence_strength") or "—")
+        _kv("forced_prediction_bool", fp.get("forced_prediction_bool") if fp.get("forced_prediction_bool") is not None else "—")
+        _kv("why_forced_binary", fp.get("why_forced_binary") or "—")
         commit_msg = sample_json.get("commit_message")
         _kv("commit_message", commit_msg if commit_msg else "unavailable")
         lines.append("")
@@ -1795,8 +1798,36 @@ class ResearchInventory:
                 lines.append("  [target function source not available]")
                 lines.append("")
 
-        # ── Stage timeline ───────────────────────────────────────────────────
+        # ── Final validator diagnostics ───────────────────────────────────────
         trace = _read_json(sd / "agent_trace.json") or {}
+        validator_mods = trace.get("final_validator_modifications") or []
+        limitations = fp.get("validation_notes") or fp.get("limitations") or []
+        normalization_warnings = fp.get("normalization_warnings") or []
+        if validator_mods or limitations or normalization_warnings or fp.get("why_forced_binary"):
+            _sec("FINAL VALIDATOR / BINARY NORMALIZATION")
+            _kv("decision_status", fp.get("decision_status") or "—")
+            _kv("evidence_strength", fp.get("evidence_strength") or "—")
+            _kv("forced_prediction", fp.get("forced_prediction") or "—")
+            _kv("forced_prediction_bool", fp.get("forced_prediction_bool") if fp.get("forced_prediction_bool") is not None else "—")
+            _kv("why_forced_binary", fp.get("why_forced_binary") or "—")
+            if limitations:
+                lines.append("  validator_notes / limitations:")
+                for note in limitations[:30]:
+                    lines.append(f"    - {note}")
+            if normalization_warnings:
+                lines.append("  normalization_warnings:")
+                for note in normalization_warnings[:30]:
+                    lines.append(f"    - {note}")
+            if validator_mods:
+                lines.append("  validator modification events:")
+                for mod in validator_mods[:20]:
+                    try:
+                        lines.append("    " + json.dumps(_mask_secrets(mod), ensure_ascii=False)[:1600])
+                    except Exception:
+                        lines.append("    " + str(mod)[:1600])
+            lines.append("")
+
+        # ── Stage timeline ───────────────────────────────────────────────────
         calls = trace.get("model_calls") or _read_jsonl(sd / "model_calls.jsonl")
         calls = _mask_secrets(calls or [])
 
@@ -1819,6 +1850,92 @@ class ResearchInventory:
                     f"tok={tok} elapsed={elapsed}s"
                 )
             lines.append("")
+
+        # ── Hypothesis-first summary ─────────────────────────────────────────
+        final_statuses = fp.get("final_hypothesis_statuses") or fp.get("hypothesis_ledger") or []
+        controller_events = flow_json.get("controller_events") or []
+        kg_qs_for_summary = self.kg_queries(run_id, sample_id)
+        if final_statuses or controller_events or kg_qs_for_summary:
+            _sec("HYPOTHESIS PROGRESS SUMMARY")
+            if final_statuses:
+                lines.append("  Latest terminal/near-terminal status per hypothesis:")
+                for h in final_statuses:
+                    hid = h.get("hypothesis_id") or "?"
+                    status = h.get("status") or "?"
+                    confirmed = h.get("confirmed_security_vulnerability")
+                    local = h.get("local_risk_present")
+                    miss = h.get("missing_evidence") or []
+                    support = h.get("supporting_evidence_ids") or []
+                    counter = h.get("counter_evidence_ids") or []
+                    lines.append(
+                        f"    {hid}: status={status} confirmed={confirmed} local_risk={local} "
+                        f"missing={len(miss)} supporting={support[:5]} counter={counter[:5]}"
+                    )
+                    expl = str(h.get("explanation") or "").strip()
+                    if expl:
+                        lines.append(f"      explanation: {expl[:500]}")
+                lines.append("")
+            if controller_events:
+                lines.append("  Controller/retrieval events by hypothesis:")
+                shown = 0
+                for ev in controller_events:
+                    d = ev.get("details") or {}
+                    hid = d.get("hypothesis_id")
+                    stage = ev.get("stage") or "?"
+                    event = ev.get("event") or "?"
+                    if not hid and not (
+                        stage.startswith("01_hypothesis")
+                        or stage.startswith("02_04_per_hypothesis_loop")
+                        or stage.startswith("03_")
+                        or stage.startswith("04_hypothesis_done")
+                        or stage.startswith("05_hypothesis_proof_state")
+                        or stage.startswith("05_counter_evidence_review")
+                        or "HYP-" in stage
+                    ):
+                        continue
+                    small = {k: v for k, v in d.items() if k in {
+                        "hypothesis_id", "queries", "query_ids", "items", "iteration",
+                        "new_evidence_count", "stop_reason", "status", "terminal_status",
+                        "confirmed_security_vulnerability", "needs_more_evidence", "gaps",
+                        "effective_follow_up_queries", "llm_follow_up_queries", "notes",
+                        "accepted_confirmed_hypotheses", "verified_hypotheses",
+                        "raw_count", "sanitized_count", "normalized_count", "review_order",
+                        "normalization_notes", "dropped_hypotheses", "pre_counter_status",
+                        "post_counter_status", "accepted_confirmed", "counter_findings",
+                        "remaining_hypotheses_skipped", "global_counter_llm_call",
+                    }}
+                    try:
+                        small_s = json.dumps(small, ensure_ascii=False)
+                    except Exception:
+                        small_s = str(small)
+                    lines.append(f"    {stage} [{event}] {small_s}")
+                    shown += 1
+                    if shown >= 180:
+                        lines.append("    [truncated controller event summary after 180 rows]")
+                        break
+                lines.append("")
+            if kg_qs_for_summary:
+                lines.append("  KG retrieval summary by hypothesis/stage:")
+                for q in kg_qs_for_summary[:120]:
+                    hid = q.get("hypothesis_id") or q.get("_hypothesis_id") or "—"
+                    stg = q.get("agentic_stage") or "—"
+                    qid = q.get("query_id") or "—"
+                    qtype = q.get("query_type") or "—"
+                    returned = q.get("returned_items") or len(q.get("items") or [])
+                    status = q.get("status") or "—"
+                    diags = q.get("diagnostics") or {}
+                    err = diags.get("error")
+                    node_count = diags.get("retrieved_node_count") or diags.get("query_view_node_count")
+                    query = str(q.get("query_text") or q.get("query") or "")[:220]
+                    suffix = f" status={status}"
+                    if node_count is not None:
+                        suffix += f" nodes={node_count}"
+                    if err:
+                        suffix += f" error={str(err)[:120]}"
+                    lines.append(f"    {hid} {stg} {qid} type={qtype} returned={returned}{suffix} query={query}")
+                if len(kg_qs_for_summary) > 120:
+                    lines.append(f"    [truncated KG summary: {len(kg_qs_for_summary)-120} more queries]")
+                lines.append("")
 
         # ── Per-stage detail ─────────────────────────────────────────────────
         _sec("PER-STAGE DETAIL")

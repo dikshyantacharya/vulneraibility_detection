@@ -89,11 +89,11 @@ def build_codekg_graph(
     compatibility view used by the existing target locator, evidence pack, and
     audit loop.
     """
-    from codekg_s.cli import _apply_joern_home, select_backend
-    from codekg_s.dashboard import write_dashboard
-    from codekg_s.exporter import QUERY_EXAMPLES, export_graph
-    from codekg_s.logging_utils import configure_logging
-    from codekg_s.backends import detect_java, detect_joern, joern_available, tree_sitter_available
+    from codekg.cli import _apply_joern_home, select_backend
+    from codekg.dashboard import write_dashboard
+    from codekg.exporter import QUERY_EXAMPLES, export_graph
+    from codekg.logging_utils import configure_logging
+    from codekg.backends import detect_java, detect_joern, joern_available, tree_sitter_available
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -312,7 +312,7 @@ def validate_codekg_query(obj: dict[str, Any]) -> dict[str, Any]:
 
 
 def execute_codekg_query(graph: ProjectGraph, query_obj: dict[str, Any], *, prefix: str, max_items: int = 10, max_text_chars: int = 900) -> tuple[list[EvidenceItem], dict[str, Any]]:
-    from codekg_s.query import GraphQueryEngine
+    from codekg.query import GraphQueryEngine
 
     graph_dir = graph_dir_from_project_graph(graph)
     if graph_dir is None:

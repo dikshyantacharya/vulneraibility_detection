@@ -17,7 +17,10 @@ _GENERIC_PROOF_PHRASES = {
 }
 
 def _evidence_id_set(evidence_items: Iterable[Any] | None) -> set[str]:
-    ids: set[str] = set()
+    # Verification prompts always expose the target function source as the virtual
+    # code section TARGET-SOURCE.  Allow proofs to cite it even though it is not a
+    # persisted KG EvidenceItem.
+    ids: set[str] = {"TARGET-SOURCE"}
     for item in evidence_items or []:
         if isinstance(item, dict):
             v = item.get("id") or item.get("evidence_id") or item.get("node_id")
@@ -44,7 +47,9 @@ def _source_fact_types(evidence_items: Iterable[Any] | None) -> set[str]:
         low = text.lower()
         if "pointer wraparound guard" in low or "wraparound-to-lower-address" in low:
             fact_types.add("pointer_wraparound_lower_bound_guard")
-        if "exact-end guard" in low and "return `-1`" in low:
+        if ("exact-end guard" in low or "exact-end" in low or "exact end" in low) and ("return `-1`" in low or "return -1" in low or "error return" in low):
+            fact_types.add("exact_end_success_else_error")
+        if ft == "exact_end_accept_else_error":
             fact_types.add("exact_end_success_else_error")
     return fact_types
 
@@ -316,6 +321,33 @@ def _set_binary_explanation(decision: FinalDecision, *, vulnerable: bool, reason
     decision.explanation = f"Validator-forced binary decision: {label}. {reason}"
 
 
+def _local_risk_evidence_ids(decision: FinalDecision) -> list[str]:
+    """Return evidence ids for unresolved local-risk hypotheses.
+
+    Used when the final binary label is forced vulnerable because of a strong
+    uncovered local pattern.  This prevents reports from citing unrelated
+    counter-evidence as the decisive evidence.
+    """
+    out: list[str] = []
+    refuted = {
+        HypothesisStatus.refuted_by_guard,
+        HypothesisStatus.refuted_by_caller_constraint,
+        HypothesisStatus.refuted_by_patch_or_changed_logic,
+        HypothesisStatus.irrelevant_to_target_function,
+    }
+    for h in decision.final_hypothesis_statuses or []:
+        if not getattr(h, "local_risk_present", False):
+            continue
+        if getattr(h, "status", None) in refuted:
+            continue
+        proof = getattr(h, "proof", None)
+        if proof is not None:
+            out.extend(str(x) for x in (proof.cited_evidence_ids or []) if str(x).strip())
+        out.extend(str(x) for x in (getattr(h, "supporting_evidence_ids", []) or []) if str(x).strip())
+    # Preserve order, keep report compact.
+    return list(dict.fromkeys(out))[:16]
+
+
 def validate_final_decision(
     decision: FinalDecision,
     *,
@@ -502,6 +534,9 @@ def validate_final_decision(
             decision.forced_prediction = "vulnerable"
             decision.forced_prediction_bool = True
             decision.decision_status = "forced_binary_vulnerable"
+            local_ids = _local_risk_evidence_ids(decision)
+            if local_ids:
+                decision.decisive_evidence_ids = local_ids
             notes.append(f"Forced vulnerable: {pattern_reason}.")
         else:
             decision.forced_prediction = "fixed/non-vulnerable"

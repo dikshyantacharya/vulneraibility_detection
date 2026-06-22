@@ -24,6 +24,7 @@ tar -a -c -f %ZIP_NAME% ^
     --exclude=".ruff_cache" ^
     --exclude=".gitignore" ^
     --exclude="make_project_zip.bat" ^
+    --exclude="docs" ^
   *
 
 echo.

@@ -487,6 +487,11 @@ class AgenticProofRuntimeConfig(BaseModel):
     stop_when_no_new_evidence: bool = True
     stop_when_no_new_queries: bool = True
     stop_when_all_hypotheses_resolved: bool = True
+    # Research-side loop control: stop the per-hypothesis loop immediately once
+    # a complete vulnerability proof has been confirmed.  This avoids wasting
+    # time on later hypotheses when the binary vulnerability decision is already
+    # source-grounded.
+    stop_on_confirmed_vulnerability: bool = True
     enable_counter_evidence_loop: bool = False
     max_counter_iterations: int = 2
 

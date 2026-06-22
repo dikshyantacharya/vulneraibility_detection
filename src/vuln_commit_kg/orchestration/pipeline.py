@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 import fnmatch
 import json
+import re
 import logging
 import time
 import threading
@@ -908,19 +909,19 @@ class CommitKGPipeline:
     def _classify_agentic_proof(self, *, sample: SecVulEvalSample, evidence: Any, graph: ProjectGraph, model: Any) -> tuple[Prediction, AgentTrace, Any]:
         from dataclasses import asdict, is_dataclass
         from vckg_agentic_proof import AgenticProofConfig, run_agentic_proof_pipeline
-        from vuln_commit_kg.agents.tool_query import KGToolExecutor
+        from vuln_commit_kg.agents.tool_query import KGToolExecutor, KGToolResult
 
         ap_cfg = getattr(self.cfg, "agentic_proof", None)
         proof_cfg = AgenticProofConfig(
             max_hypotheses=int(getattr(ap_cfg, "max_hypotheses", 12) or 12),
             max_queries_per_hypothesis=int(getattr(ap_cfg, "max_queries_per_hypothesis", 6) or 6),
             evidence_limit_per_query=int(getattr(ap_cfg, "evidence_limit_per_query", 8) or 8),
-            max_tokens_source_only_hypothesis=int(getattr(ap_cfg, "max_tokens_source_only_hypothesis", 16384) or 16384),
-            max_tokens_kg_query_planning=int(getattr(ap_cfg, "max_tokens_kg_query_planning", 8192) or 8192),
-            max_tokens_hypothesis_verification=int(getattr(ap_cfg, "max_tokens_hypothesis_verification", 16384) or 16384),
+            max_tokens_source_only_hypothesis=max(4096, int(getattr(ap_cfg, "max_tokens_source_only_hypothesis", 16384) or 16384)),
+            max_tokens_kg_query_planning=max(4096, int(getattr(ap_cfg, "max_tokens_kg_query_planning", 8192) or 8192)),
+            max_tokens_hypothesis_verification=max(4096, int(getattr(ap_cfg, "max_tokens_hypothesis_verification", 16384) or 16384)),
             max_tokens_counter_evidence_review=int(getattr(ap_cfg, "max_tokens_counter_evidence_review", 16384) or 16384),
-            max_tokens_final_decision=int(getattr(ap_cfg, "max_tokens_final_decision", 8192) or 8192),
-            max_tokens_schema_repair=int(getattr(ap_cfg, "max_tokens_schema_repair", 4096) or 4096),
+            max_tokens_final_decision=max(4096, int(getattr(ap_cfg, "max_tokens_final_decision", 8192) or 8192)),
+            max_tokens_schema_repair=max(4096, int(getattr(ap_cfg, "max_tokens_schema_repair", 4096) or 4096)),
             max_tokens_evidence_gap_analysis=int(getattr(ap_cfg, "max_tokens_evidence_gap_analysis", 8192) or 8192),
             iterative_evidence_loop=bool(getattr(ap_cfg, "iterative_evidence_loop", False)),
             max_evidence_iterations=int(getattr(ap_cfg, "max_evidence_iterations", 3) or 3),
@@ -928,6 +929,7 @@ class CommitKGPipeline:
             stop_when_no_new_evidence=bool(getattr(ap_cfg, "stop_when_no_new_evidence", True)),
             stop_when_no_new_queries=bool(getattr(ap_cfg, "stop_when_no_new_queries", True)),
             stop_when_all_hypotheses_resolved=bool(getattr(ap_cfg, "stop_when_all_hypotheses_resolved", True)),
+            stop_on_confirmed_vulnerability=bool(getattr(ap_cfg, "stop_on_confirmed_vulnerability", True)),
             enable_counter_evidence_loop=bool(getattr(ap_cfg, "enable_counter_evidence_loop", False)),
             max_counter_iterations=int(getattr(ap_cfg, "max_counter_iterations", 2) or 2),
             temperature=float(getattr(self.cfg.model, "temperature", 0.0) or 0.0),
@@ -994,11 +996,12 @@ class CommitKGPipeline:
             system = "\n\n".join(system_parts)
             prompt = "\n\n".join(user_parts)
             prompt_chars = len(system) + len(prompt)
-            self.logger.info("model.generate_start | sample=%s | stage=%s | attempt=primary | prompt_chars=%s", sample.sample_id, stage, prompt_chars)
+            prompt_has_truncation_marker = ("...<truncated>..." in system) or ("...<truncated>..." in prompt)
+            self.logger.info("model.generate_start | sample=%s | stage=%s | attempt=primary | prompt_chars=%s | prompt_has_truncation_marker=%s", sample.sample_id, stage, prompt_chars, prompt_has_truncation_marker)
             if self.live:
                 self.live.update_sample(sample.sample_id, {"status": "running", "agent_stage": stage, "api_stage": stage, "api_state": "requesting", "last_prompt_chars": prompt_chars, "current_model_stage": stage})
-                self.live.event("model_call.prompt_ready", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars})
-                self.live.event("model_call.start", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars})
+                self.live.event("model_call.prompt_ready", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars, "prompt_has_truncation_marker": prompt_has_truncation_marker})
+                self.live.event("model_call.start", {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars, "prompt_has_truncation_marker": prompt_has_truncation_marker})
             def _provider_wait_seconds_from_error(exc: Exception) -> float:
                 resp = getattr(exc, "response", None)
                 if resp is not None:
@@ -1121,6 +1124,7 @@ class CommitKGPipeline:
                     "prompt": prompt,
                     "system": system,
                     "prompt_chars": prompt_chars,
+                    "prompt_has_truncation_marker": prompt_has_truncation_marker,
                     "response": text,
                     "raw": text,
                     "usage": usage,
@@ -1145,7 +1149,7 @@ class CommitKGPipeline:
                     pass
                 trace.raw_outputs.append(text)
                 if self.live:
-                    done_payload = {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars, "response_chars": len(text), "elapsed_seconds": elapsed, "usage": usage, "json_status": "raw_agentic_proof_pending_parse"}
+                    done_payload = {"sample_id": sample.sample_id, "stage": stage, "prompt_chars": prompt_chars, "prompt_has_truncation_marker": prompt_has_truncation_marker, "response_chars": len(text), "elapsed_seconds": elapsed, "usage": usage, "json_status": "raw_agentic_proof_pending_parse"}
                     self.live.event("model_call.done", done_payload)
                     # Do not overwrite cumulative live token/cost counters here;
                     # model_call.done already increments them stage-by-stage.
@@ -1201,8 +1205,24 @@ class CommitKGPipeline:
         kg_tool_steps: list[dict[str, Any]] = []
 
         def infer_query_type(q: dict[str, Any]) -> str:
+            """Infer a legacy query type only when query_text is not CodeKG-call syntax.
+
+            Agentic-proof prompts emit deterministic function-call style CodeKG
+            queries such as ``variable_flow(...)``.  The previous adapter mapped
+            those calls back to coarse legacy labels (risk/guard/variable) and
+            then replaced the executable query with the first variable name.  In
+            practice this starved the KG layer: broad CodeKG queries were not
+            actually executed and many returned zero items.
+
+            If query_text is already a CodeKG function call, preserve its kind so
+            ``KGToolExecutor._as_codekg_query`` can execute the exact query.
+            """
+            text_raw = str(q.get("query_text") or q.get("query") or "").strip()
+            m = re.match(r"^\s*([A-Za-z_]\w*)\s*\(", text_raw)
+            if m:
+                return m.group(1).lower()
             purpose = str(q.get("purpose") or "").lower()
-            text = str(q.get("query_text") or "").lower()
+            text = text_raw.lower()
             if "guard" in purpose or "guard" in text or "check" in text:
                 return "guard"
             if "caller" in purpose:
@@ -1223,10 +1243,17 @@ class CommitKGPipeline:
                 text = str(q.get("query_text") or q.get("query") or "").strip()
                 qtype = infer_query_type(q)
                 variables = [str(v).strip() for v in (q.get("variables") or []) if str(v).strip()]
-                query_text = variables[0] if qtype in {"variable", "guard", "safety", "risk"} and variables else text
+                is_codekg_call = bool(re.match(r"^\s*[A-Za-z_]\w*\s*\(", text))
+                # Preserve executable CodeKG query_text.  Only legacy non-CodeKG
+                # queries use a variable as their query payload.
+                query_payload = text if is_codekg_call else (variables[0] if qtype in {"variable", "guard", "safety", "risk"} and variables else text)
                 mapped.append({
                     "query_type": qtype,
-                    "query": query_text,
+                    "query": query_payload,
+                    "query_id": q.get("query_id"),
+                    "hypothesis_id": q.get("hypothesis_id") or q.get("_hypothesis_id"),
+                    "agentic_stage": q.get("_agentic_stage"),
+                    "query_text": text,
                     "reason": q.get("purpose") or q.get("expected_evidence"),
                     "match": "substring" if qtype in {"search", "safety", "risk"} else "exact_identifier",
                     "wanted_evidence": [q.get("expected_evidence")] if q.get("expected_evidence") else [],
@@ -1235,9 +1262,14 @@ class CommitKGPipeline:
             results = executor.execute_many(graph=graph, sample=sample_obj, queries=mapped, round_index=3, evidence_id_prefix="AP", query_source="agentic_proof")
             new_items = []
             seen = {item.evidence_id for item in evidence.items}
-            for result in results:
+            for _idx, result in enumerate(results):
                 step = result.to_dict()
                 kg_tool_steps.append(step)
+                if _idx < len(mapped):
+                    mapped[_idx]["returned_items"] = len(result.items or [])
+                    mapped[_idx]["status"] = result.status
+                    mapped[_idx]["diagnostics"] = result.diagnostics
+                    mapped[_idx]["items"] = [KGToolResult._item_to_dict(i) for i in KGToolResult._flatten_items(result.items)]
                 for item in result.items:
                     if item.evidence_id not in seen:
                         evidence.items.append(item)
@@ -1368,6 +1400,15 @@ class CommitKGPipeline:
                     if c.get("name") not in ("final_decision",)
                 ],
                 "iterations": _iter_rows,
+                "controller_events": [
+                    {
+                        "stage": getattr(ev, "stage", None),
+                        "event": getattr(ev, "event", None),
+                        "elapsed_seconds": getattr(ev, "elapsed_seconds", 0.0),
+                        "details": getattr(ev, "details", {}) or {},
+                    }
+                    for ev in (getattr(result, "events", []) or [])
+                ],
                 "total_evidence_items": len(evidence.items),
                 "initial_evidence_items": trace.initial_evidence_count,
             }
@@ -1398,6 +1439,13 @@ class CommitKGPipeline:
             model_backend=self.cfg.model.backend,
             usage=usage,
             validation_notes=list(decision.limitations or []),
+            forced_prediction=decision.forced_prediction,
+            forced_prediction_bool=decision.forced_prediction_bool,
+            evidence_strength=decision.evidence_strength,
+            why_forced_binary=decision.why_forced_binary,
+            residual_uncertainty=list(decision.residual_uncertainty or []),
+            final_hypothesis_statuses=[h.model_dump(mode="json") if hasattr(h, "model_dump") else dict(h) for h in (decision.final_hypothesis_statuses or [])],
+            normalization_warnings=list(decision.normalization_warnings or []),
         )
         pred.raw_response = str(final_json)
         if self.live:

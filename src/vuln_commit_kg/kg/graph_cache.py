@@ -65,7 +65,7 @@ class GraphCache:
         if not (out_dir / "graph.json").exists():
             return
         try:
-            from codekg_s.dashboard import rebuild_dashboard_from_graph_dir
+            from codekg.dashboard import rebuild_dashboard_from_graph_dir
 
             dashboard_path = rebuild_dashboard_from_graph_dir(out_dir, logger=self.logger)
             if graph is not None:

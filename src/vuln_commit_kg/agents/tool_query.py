@@ -247,8 +247,15 @@ class KGToolExecutor:
         """
         raw_kind = str(query_obj.get("kind") or query_obj.get("query_type") or query_obj.get("type") or "").strip().lower()
         qtext = str(query_obj.get("query") or query or "").strip()
-        if raw_kind in NEW_CODEKG_QUERY_KINDS or (qtext and re.match(r"^[A-Za-z_]\w*\s*\(", qtext)):
+        query_text = str(query_obj.get("query_text") or "").strip()
+        executable_text = qtext if re.match(r"^[A-Za-z_]\w*\s*\(", qtext) else (query_text if re.match(r"^[A-Za-z_]\w*\s*\(", query_text) else "")
+        if raw_kind in NEW_CODEKG_QUERY_KINDS or executable_text:
+            # If a deterministic CodeKG function-call query is present, parse it
+            # directly.  Legacy wrappers often carry query_type=guard/risk/search;
+            # those labels must not override the executable function-call form.
             base = dict(query_obj)
+            if executable_text:
+                base["query"] = executable_text
             base.setdefault("target_function", sample.func_name)
             return parse_codekg_query_object(base, defaults={"target_function": sample.func_name})
 

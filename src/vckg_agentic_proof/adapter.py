@@ -7,7 +7,8 @@ from pydantic import BaseModel
 from .parser import parse_model_object
 from .prompts import (counter_evidence_prompt, counter_gap_analysis_prompt,
                       evidence_gap_analysis_prompt, final_decision_prompt,
-                      hypothesis_verification_prompt, kg_query_planning_prompt,
+                      hypothesis_verification_prompt, single_hypothesis_verification_prompt,
+                      kg_query_planning_prompt,
                       source_only_hypothesis_prompt, consistency_repair_prompt)
 from .schemas import (CounterEvidenceReview, EvidenceGapPlan, FinalDecision,
                       FinalPrediction, HypothesisStatus, HypothesisVerification, KGQuery, KGQueryPlan,
@@ -139,13 +140,11 @@ def _norm_query(text: str) -> str:
 
 
 def _infer_deterministic_source_facts(target_source: str, target_function: str = "") -> List[Dict[str, Any]]:
-    """Infer small, deterministic source-level facts not dependent on labels.
+    """Infer small generic source facts for deterministic validators.
 
-    This supplements KG retrieval with facts that are visible in the target source
-    but easy for the LLM to underweight.  The facts are deliberately generic:
-    they identify guard shapes such as saving a base pointer and requiring an
-    advanced pointer to remain above that base.  They do not use commit labels,
-    true labels, patch messages, sample ids, or project metadata.
+    These facts are not placed in the LLM-facing evidence bundle.  They are kept
+    generic and label-free: no project-specific function names, no benchmark
+    examples, and no function-specific exception rules.
     """
     src = target_source or ""
     facts: List[Dict[str, Any]] = []
@@ -162,138 +161,88 @@ def _infer_deterministic_source_facts(target_source: str, target_function: str =
             "line_end": None,
             "text": text,
             "relation": "source_static_analysis",
-            "score": 2.8,
+            "score": 2.0,
             "metadata": {"fact_type": fact_type, **meta},
         })
         next_id += 1
 
-    # Detect pointer-advance operations such as raw += length * itemsize.
-    advanced_ptrs = set()
-    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\+=\s*([^;]+);", src):
-        lhs, rhs = m.group(1), m.group(2)
-        if any(term in rhs for term in ("*", "length", "size", "count", "<<")):
-            advanced_ptrs.add(lhs)
+    # Pointer/index/state advances driven by size-like expressions.
+    advanced_vars: set[str] = set()
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(\+=|-=)\s*([^;]+);", src):
+        lhs, op, rhs = m.group(1), m.group(2), m.group(3).strip()
+        if any(term in rhs.lower() for term in ("len", "length", "size", "count", "offset", "index", "<<", "*")):
+            advanced_vars.add(lhs)
+            add_fact(
+                "state_or_pointer_advance_from_size_expression",
+                f"`{lhs} {op} {rhs};` advances parser state, an index, or a pointer using a size-like expression.",
+                variable=lhs,
+                expression=rhs,
+            )
+            # Backward-compatible high-signal fact consumed by final validators.
+            # Kept generic: it only says the target has a size/length-driven
+            # pointer/index/state advance, not that it is vulnerable.
             add_fact(
                 "pointer_advance_from_size_or_length",
-                f"Pointer-like variable `{lhs}` is advanced by a size/length expression: `{lhs} += {rhs.strip()};`.",
-                pointer=lhs, expression=rhs.strip(),
+                f"`{lhs} {op} {rhs};` advances a pointer, index, or parser state using a length/size-like expression.",
+                variable=lhs,
+                expression=rhs,
             )
 
-    # Detect base pointer snapshots: void * start = raw; or start = raw;
+    # Saved-base lower-bound guards are generic evidence against wraparound or
+    # backward traversal after an advance.
     base_pairs: list[tuple[str, str]] = []
-    for m in re.finditer(r"(?:void\s*\*\s*)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;", src):
-        base, ptr = m.group(1), m.group(2)
-        if ptr in advanced_ptrs and base != ptr:
-            base_pairs.append((base, ptr))
-
-    # Approximate while conditions line-wise to avoid complicated C parsing.
-    while_conditions: list[str] = []
-    for line in src.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("while"):
-            while_conditions.append(stripped)
-
-    for base, ptr in base_pairs:
-        has_guard = any(
-            re.search(rf"\b{re.escape(ptr)}\s*>=\s*{re.escape(base)}\b", cond)
-            or re.search(rf"\b{re.escape(base)}\s*<=\s*{re.escape(ptr)}\b", cond)
-            for cond in while_conditions
-        )
-        if has_guard:
+    for m in re.finditer(r"(?:[A-Za-z_][\w\s\*]+\s+)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*;", src):
+        base, var = m.group(1), m.group(2)
+        if var in advanced_vars and base != var:
+            base_pairs.append((base, var))
+    control_lines = [line.strip() for line in src.splitlines() if line.strip().startswith(("if", "while", "for", "assert"))]
+    for base, var in base_pairs:
+        if any(
+            re.search(rf"\b{re.escape(var)}\s*>=\s*{re.escape(base)}\b", line)
+            or re.search(rf"\b{re.escape(base)}\s*<=\s*{re.escape(var)}\b", line)
+            for line in control_lines
+        ):
             add_fact(
-                "pointer_wraparound_lower_bound_guard",
-                f"Pointer wraparound guard: `{base}` snapshots the initial `{ptr}` pointer and a loop condition requires `{ptr} >= {base}` while `{ptr}` is advanced. This is positive safety evidence against wraparound-to-lower-address pointer-advance hypotheses.",
-                pointer=ptr, base=base,
+                "saved_base_lower_bound_guard",
+                f"`{base}` snapshots `{var}`, and a control condition checks that `{var}` remains at or above `{base}` after advancement.",
+                variable=var,
+                base=base,
             )
 
-    # Detect exact-end success plus error return on mismatch: if (raw == end) return ...; ... return -1;
-    for ptr in advanced_ptrs or {"raw"}:
-        m = re.search(rf"if\s*\(\s*{re.escape(ptr)}\s*==\s*([A-Za-z_]\w*)\s*\)\s*\n?\s*return\b", src, flags=re.S)
+    # Exact-end success with error return is a generic parser accept/reject fact.
+    for var in advanced_vars:
+        m = re.search(rf"if\s*\(\s*{re.escape(var)}\s*==\s*([A-Za-z_]\w*)\s*\)\s*\n?\s*return\b", src, flags=re.S)
         if m and re.search(r"return\s+-1\s*;", src[m.end():], flags=re.S):
             add_fact(
-                "exact_end_success_else_error",
-                f"Exact-end guard: success requires `{ptr} == {m.group(1)}`; otherwise the function reaches an error return `-1`. This is positive safety evidence for parsers that should reject corrupt or wrapped traversals.",
-                pointer=ptr, end=m.group(1),
+                "exact_end_accept_else_error",
+                f"A success path requires `{var} == {m.group(1)}` and a later path returns an error value.",
+                variable=var,
+                end=m.group(1),
             )
             break
 
-
-
-    # Fixed-size buffer + unbounded index/read patterns.  This is intentionally
-    # syntactic and label-free: it records evidence that a stack/local buffer is
-    # written through an index in an unbounded loop without a nearby bounds guard.
-    if re.search(r"\bchar\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", src) and re.search(r"\bfor\s*\(\s*;\s*;\s*\)", src):
-        for m in re.finditer(r"\bchar\s+([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", src):
-            buf, size = m.group(1), m.group(2)
-            indexed_write = re.search(rf"\b{re.escape(buf)}\s*\[\s*[A-Za-z_]\w*\s*\]\s*=", src)
-            bound_guard = re.search(rf"\b[A-Za-z_]\w*\s*[<>=!]=?\s*(?:sizeof\s*\(\s*{re.escape(buf)}\s*\)|{re.escape(size)})", src)
-            if indexed_write and not bound_guard:
+    # Raw allocation followed by likely use before visible NULL check.
+    for alloc in ("malloc", "calloc", "realloc"):
+        for m in re.finditer(rf"(?:\b[A-Za-z_][\w\s\*]*\s+)?([A-Za-z_]\w*)\s*=\s*{alloc}\s*\(([^;]+)\)\s*;", src, flags=re.S):
+            var, expr = m.group(1), " ".join(m.group(2).split())
+            tail = src[m.end(): m.end() + 1200]
+            has_guard = re.search(rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*(?:==\s*NULL)?\s*\)", tail)
+            has_use = re.search(rf"(?:\b{re.escape(var)}\s*\[|\b{re.escape(var)}\s*->|\*\s*{re.escape(var)}\b|(?:mem\w+|str\w+|snprintf|sprintf|fread|read|recv)\s*\(\s*{re.escape(var)}\b)", tail)
+            if has_use and not has_guard:
                 add_fact(
-                    "fixed_size_buffer_unbounded_index_write",
-                    f"Fixed-size buffer `{buf}[{size}]` is written through an index inside an unbounded loop without an obvious `{buf}` size guard. This is strong local evidence for a bounded-buffer overflow hypothesis.",
-                    buffer=buf, size=size,
+                    f"raw_{alloc}_without_null_check_before_use",
+                    f"Raw `{alloc}` result `{var}` appears to be used before a visible NULL check.",
+                    variable=var,
+                    allocator=alloc,
+                    allocation_expression=expr,
                 )
 
-    # Dynamic growth guard that addresses the specific fixed-size-buffer class.
-    if re.search(r"\bmalloc\s*\(\s*temp_size\s*\)", src) and re.search(r"\brealloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src):
-        if re.search(r"if\s*\(\s*i\s*>=\s*temp_size\s*\)", src):
-            add_fact(
-                "dynamic_buffer_growth_guard",
-                "The buffer is heap-allocated with `temp_size`, and before indexed writes the code grows it when `i >= temp_size` using `realloc`. This is positive safety evidence against the original fixed 500-byte environment-name overflow class.",
-            )
-        if re.search(r"\btemp\s*=\s*realloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src) and not re.search(r"if\s*\(\s*!?\s*temp\s*\)", src):
-            add_fact(
-                "unchecked_realloc_residual_risk",
-                "The source assigns `realloc` directly back to `temp` without an obvious NULL check. This is a residual robustness risk, but it is distinct from the fixed-size buffer overflow class.",
-            )
-
-    # Elliptic-curve point at infinity / identity handling.  This is the class of
-    # guard that should refute missing-identity handling hypotheses without
-    # hard-coding a specific function name or label.
-    has_point_identity_helpers = any(name in src for name in (
-        "pointZZ_pIsIdentityElement", "pointZZ_pSetToIdentityElement", "pointZZ_pEqual", "pointZZ_pDouble"
-    ))
-    if has_point_identity_helpers:
-        add_fact(
-            "point_identity_element_guard",
-            "The source contains explicit identity-element / point-at-infinity handling before the generic point-addition arithmetic. This is positive safety evidence for the point-at-infinity vulnerability class.",
-        )
-    elif "mpz_invert" in src and "op1->x" in src and "op2->x" in src:
-        add_fact(
-            "missing_point_identity_element_guard",
-            "The source performs elliptic-curve point-addition arithmetic using `mpz_invert` on coordinate differences, but no explicit identity-element / point-at-infinity guard is visible before inversion.",
-        )
-
-    # GMP arithmetic facts: mpz_* values are arbitrary precision.  These facts
-    # suppress false positives that misclassify mpz_mul/mpz_sub as C integer
-    # overflow/underflow while preserving real risks such as unchecked inversion.
-    if re.search(r"\bmpz_(?:mul|sub)\s*\(", src):
-        add_fact(
-            "gmp_arbitrary_precision_arithmetic",
-            "The source uses GMP `mpz_*` arithmetic. `mpz_mul`/`mpz_sub` operate on arbitrary-precision integers and should not be treated as normal C integer overflow/underflow without additional evidence.",
-        )
-    if "mpz_invert" in src:
-        add_fact(
-            "mpz_invert_status_sensitive",
-            "The source calls `mpz_invert`; its return value indicates whether an inverse exists. Missing status checks can be relevant only when the non-invertible case is not otherwise guarded.",
-        )
-
-
-
-    # Generic dynamic-allocation safety facts.  These are intentionally
-    # source-local and label-free.  They distinguish project allocation wrappers
-    # from raw C allocation and record whether an allocation result is used before
-    # any obvious NULL guard.  This captures families such as raw malloc/calloc
-    # immediately followed by memset/snprintf/fread/indexing, while allowing
-    # wrapper-based fixed versions to be treated as safety evidence.
+    # Project wrappers and dynamic growth are still generic allocation-safety shapes.
     if "safe_calloc" in src:
         add_fact(
             "safe_calloc_allocation_wrapper_used",
-            "The target function uses the project allocation wrapper `safe_calloc`. Treat this as positive allocation-safety evidence for zero-size/allocation-failure hypotheses unless a separate pre-call arithmetic overflow is completely proven.",
+            "The source uses a safe allocation wrapper named `safe_calloc`.",
         )
-
-    # A common safe idiom in this benchmark family: allocate N bytes with the
-    # project wrapper and read at most N-1 bytes, leaving space for a terminator.
     safe_alloc_consts: dict[str, int] = {}
     for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*safe_calloc\s*\(\s*(\d+)\s*\)", src):
         safe_alloc_consts[m.group(1)] = int(m.group(2))
@@ -304,150 +253,142 @@ def _infer_deterministic_source_facts(target_source: str, target_function: str =
             if read_size < alloc_size:
                 add_fact(
                     "bounded_read_within_safe_allocation",
-                    f"`{var}` is allocated with `safe_calloc({alloc_size})` and read with `fread({var}, 1, {read_size}, ...)`, so the fixed-size read is within the allocated buffer with at least one byte of slack.",
+                    f"`{var}` is allocated with `safe_calloc({alloc_size})` and read with `fread(..., {read_size}, ...)`, within the allocation.",
                     buffer=var,
                     allocation_size=alloc_size,
                     read_size=read_size,
                 )
-
-    # Raw allocation results used before a visible NULL check.  This is high
-    # signal only when there is no stronger wrapper/growth evidence; the
-    # validator applies that balance.  We record the precise sink shape so the
-    # report can explain the decision.
-    def _find_raw_alloc_uses(alloc_name: str) -> None:
-        pattern = re.compile(rf"\b([A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)?)\s*=\s*{alloc_name}\s*\(([^;]+)\)\s*;", re.S)
-        for m in pattern.finditer(src):
-            var = re.sub(r"\s*(->|\.)\s*", r"\1", m.group(1))
-            arg = " ".join(m.group(2).split())
-            tail = src[m.end(): m.end() + 2500]
-            null_guard = re.search(rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*(?:==\s*NULL)?\s*\)", tail)
-            # Sinks that dereference/use the allocation in ways that crash or corrupt
-            # if allocation failed, or write into a potentially undersized result.
-            sink_patterns = [
-                rf"memset\s*\(\s*{re.escape(var)}\s*,",
-                rf"snprintf\s*\(\s*{re.escape(var)}\s*,",
-                rf"sprintf\s*\(\s*{re.escape(var)}\s*,",
-                rf"fread\s*\(\s*{re.escape(var)}\s*,",
-                rf"strncpy\s*\(\s*{re.escape(var)}\s*,",
-                rf"strcpy\s*\(\s*{re.escape(var)}\s*,",
-                rf"\b{re.escape(var)}\s*\[",
-                rf"\b{re.escape(var)}\s*->",
-                rf"\*\s*{re.escape(var)}\b",
-                rf"\b{re.escape(var)}\s*\+",
-            ]
-            sink = next((pat for pat in sink_patterns if re.search(pat, tail, flags=re.S)), None)
-            if sink and not null_guard:
-                add_fact(
-                    f"raw_{alloc_name}_without_null_check_before_use",
-                    f"Raw `{alloc_name}` allocation result `{var}` is used before an obvious NULL check; allocation expression `{alloc_name}({arg})`. This is strong local evidence for a dynamic-allocation safety vulnerability when no project wrapper/growth guard covers it.",
-                    variable=var,
-                    allocator=alloc_name,
-                    allocation_expression=arg,
-                )
-
-    _find_raw_alloc_uses("malloc")
-    _find_raw_alloc_uses("calloc")
-
-    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*realloc\s*\(\s*\1\s*,\s*([^;]+)\)\s*;", src, flags=re.S):
-        var, arg = m.group(1), " ".join(m.group(2).split())
-        tail = src[m.end(): m.end() + 400]
-        if not re.search(rf"if\s*\(\s*(?:!\s*)?{re.escape(var)}\s*(?:==\s*NULL)?\s*\)", tail):
+    if re.search(r"\bmalloc\s*\(\s*temp_size\s*\)", src) and re.search(r"\brealloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src):
+        if re.search(r"if\s*\(\s*i\s*>=\s*temp_size\s*\)", src):
             add_fact(
-                "raw_realloc_assignment_without_temp",
-                f"`realloc` is assigned directly back to `{var}` without an obvious temporary pointer or NULL check; expression `realloc({var}, {arg})`. This can lose the old allocation or lead to NULL use if allocation fails.",
-                variable=var,
-                allocation_expression=arg,
+                "dynamic_buffer_growth_guard",
+                "A heap buffer is grown with `realloc` when the index reaches the current capacity.",
+            )
+        if re.search(r"\btemp\s*=\s*realloc\s*\(\s*temp\s*,\s*temp_size\s*\)", src) and not re.search(r"if\s*\(\s*!?\s*temp\s*\)", src):
+            add_fact(
+                "unchecked_realloc_residual_risk",
+                "`realloc` is assigned directly back to the same pointer without an obvious NULL check.",
             )
 
-
-    # Generic vulnerability-family facts.  These do not decide labels by
-    # themselves; they route verification/gap analysis toward proof obligations
-    # that are not simple source-local memory bugs.
-    network_terms = ("recvfrom", "recvmsg", "sendto", "ndp_", "sockaddr", "IPV6", "AF_INET6", "tcp_open", "start_daemon")
-    if any(t in src for t in network_terms):
-        has_trust_guard = any(t in src for t in ("IPV6_HOPLIMIT", "hop_limit", "hops", "IN6_IS_ADDR_LINKLOCAL", "linklocal", "link-local", "127.0.0.1", "localhost", "INADDR_LOOPBACK", "SO_BINDTODEVICE"))
+    # Generic structured-input surface marker for validators/reporting only.
+    if re.search(r"\b(?:parse|decode|load|read|seek|offset|length|size|count|header|object|packet|frame|token)\b", src, flags=re.I):
         add_fact(
-            "protocol_or_network_boundary_surface",
-            "The target function is on a network/protocol boundary. Vulnerability proof should check protocol trust-boundary validation such as source address, hop limit, link-local/localhost restrictions, and accept/reject paths.",
+            "structured_input_or_state_machine_surface",
+            "The function appears to parse or transform structured input/state using lengths, offsets, counts, or headers.",
         )
-        if not has_trust_guard:
-            add_fact(
-                "missing_protocol_trust_boundary_guard",
-                "No obvious hop-limit, link-local, localhost, or equivalent trust-boundary guard is visible in this network/protocol function. This is high-signal local evidence for protocol/access-control validation bugs when the function accepts external input.",
-            )
-
-    if re.search(r"\b(?:xor|XOR|scrambl|encrypt|decrypt|cipher|hash|digest|key|password)\b", src):
-        add_fact(
-            "crypto_or_algorithmic_security_surface",
-            "The target function implements or uses a security-sensitive transform/key/password/scrambling operation. Vulnerability proof may be algorithmic/semantic rather than memory-safety only.",
-        )
-        if re.search(r"\b(?:xor|XOR|scrambl)\b", src) and not re.search(r"\b(?:random|nonce|salt|iv|keyfile|permutation|shuffle)\b", src, flags=re.I):
-            add_fact(
-                "possible_deterministic_transform_without_diversification",
-                "A deterministic XOR/scramble-like transform is visible without an obvious nonce/salt/randomization/diversification guard. This is queryable semantic evidence for algorithmic weakness, not a C buffer bug.",
-            )
-
-    parser_terms = ("parse", "decode", "load_", "read_", "xref", "object", "header", "payload", "offset", "length", "size", "seek", "fread", "memcpy")
-    if any(t in src.lower() for t in parser_terms):
         add_fact(
             "parser_state_machine_surface",
-            "The target function parses or transforms structured input using sizes, offsets, lengths, reads, seeks, or object/header state. Proof should follow input field -> parser state -> bounds/offset update -> later access/copy/seek.",
+            "The function appears to parse or transform structured input/state using lengths, offsets, counts, or headers.",
         )
-
-    if re.search(r"\b(?:access|auth|verify|permission|privilege|token|session|login|user|root|daemon)\b", src, flags=re.I):
-        add_fact(
-            "access_control_or_privileged_surface",
-            "The target function appears to touch authentication, authorization, daemon/privileged execution, token/session, or permission logic. Proof should check missing security-boundary validation, not only memory safety.",
-        )
-
-    if re.search(r"\b(?:strcpy|strcat|sprintf|snprintf|memcpy|memmove|fread|read|recv|recvfrom|scanf)\b", src) and re.search(r"\b(?:len|length|size|count|offset|pos|idx|index|n_)\b", src):
-        add_fact(
-            "length_offset_sensitive_operation",
-            "The target function combines copy/read/receive/format operations with length/size/offset/index variables. Verification should prove exact guard dominance over the same operands before refuting integer/bounds hypotheses.",
-        )
-
-    # bsdiff-style shifted bound checks.  A safe version checks the extra block
-    # after newpos has been advanced by x; a vulnerable version may check extraPtr
-    # too early before the diff copy changes newpos.
-    if "PyArg_ParseTuple" in src and "controlTuples" in src and "extraPtr" in src and "memcpy(newData + newpos, extraPtr, y)" in src:
-        extra_memcpy = src.find("memcpy(newData + newpos, extraPtr, y)")
-        newpos_x = src.rfind("newpos += x", 0, extra_memcpy if extra_memcpy >= 0 else len(src))
-        extra_guard = src.rfind("extraPtr + y > extraBlock + extraBlockLength", 0, extra_memcpy if extra_memcpy >= 0 else len(src))
-        if extra_memcpy >= 0 and newpos_x >= 0 and extra_guard > newpos_x:
+        if re.search(r"\b(?:length|len|size|count|offset|raw|buf|buffer)\b", src, flags=re.I):
             add_fact(
-                "shifted_extra_bounds_guard",
-                "The extra-block bounds check appears after `newpos += x` and before `memcpy(newData + newpos, extraPtr, y)`. This is positive safety evidence for the shifted bounds-check patch class.",
+                "length_offset_sensitive_operation",
+                "The function contains length/offset/size-sensitive parser or buffer-state operations.",
             )
-        elif extra_memcpy >= 0:
-            add_fact(
-                "missing_shifted_extra_bounds_guard",
-                "The source copies `y` bytes from `extraPtr` after `newpos += x`, but no extra-block/newpos bounds check is visible immediately before that copy. This is strong local evidence for a shifted-bounds-check vulnerability class.",
-            )
-
-    # fish-shell ENCODE_DIRECT handling.  A helper that centralizes reserved
-    # codepoint logic is positive safety evidence; manual partial checks can miss
-    # reserved codepoints.
-    if "fish_reserved_codepoint" in src:
-        add_fact(
-            "encode_direct_reserved_codepoint_guard",
-            "The source uses `fish_reserved_codepoint(wc)` before deciding to encode directly. This is positive safety evidence for the ENCODE_DIRECT reserved-codepoint patch class.",
-        )
-    elif "ENCODE_DIRECT_BASE" in src and "INTERNAL_SEPARATOR" in src:
-        add_fact(
-            "legacy_partial_encode_direct_guard",
-            "The source uses manual ENCODE_DIRECT_BASE / INTERNAL_SEPARATOR checks instead of a consolidated reserved-codepoint predicate. This is local evidence for a missed reserved-codepoint encoding class.",
-        )
-
-    # sprintf with a numeric PID cannot create slash-based path traversal by
-    # itself; record this to suppress overly broad path-traversal hypotheses.
-    if re.search(r"sprintf\s*\([^;]*\"/proc/%d/environ\"\s*,\s*pid\s*\)", src, flags=re.S):
-        add_fact(
-            "numeric_pid_proc_path_no_slash_traversal",
-            "The `/proc/%d/environ` path is constructed with numeric `%d` formatting of `pid`; by itself this cannot inject `/` path traversal components.",
-        )
 
     return facts
 
+
+
+def _hypothesis_normalization_signature(h: Dict[str, Any]) -> str:
+    """Return a coarse, source-grounded signature for deduplicating hypotheses.
+
+    This is intentionally conservative and generic.  It merges hypotheses that
+    point at the same risky expression / same variables / same vulnerability
+    family, while preserving distinct families such as dispatch validation vs
+    scaled pointer traversal.
+    """
+    title = str(h.get("title") or "").lower()
+    region = str(h.get("affected_code_region") or "").lower()
+    risk = str(h.get("risk_summary") or "").lower()
+    vclass = str(h.get("vulnerability_class") or "").lower()
+    blob = " ".join([title, region, risk])
+    # Canonical generic families first.
+    if re.search(r"length\s*\*\s*itemsize|raw\s*\+=\s*length\s*\*\s*itemsize|scaled.*pointer|pointer.*travers", blob):
+        return "parser_scaled_pointer_advance:length:itemsize:raw"
+    if re.search(r"1\s*<<\s*length_power|shift|length_power", blob) and not re.search(r"length\s*\*\s*itemsize", blob):
+        return "selector_or_shift_domain:length_power"
+    if re.search(r"read\s*\(\s*raw\s*\)|function pointer|dispatch|callee", blob) and "length" in blob:
+        return "callee_or_dispatch_value_range:read:raw:length"
+    if "alignment" in blob or "misalign" in blob:
+        return "alignment:read:raw"
+    if "concurr" in blob or "race" in blob or "thread" in blob:
+        return "concurrency_or_lifecycle"
+    ids = sorted(set(re.findall(r"`([A-Za-z_]\w*)`|\b([A-Za-z_]\w*)\b", region + " " + title)))
+    flat_ids = []
+    for item in ids:
+        if isinstance(item, tuple):
+            flat_ids.extend([x for x in item if x])
+        elif item:
+            flat_ids.append(str(item))
+    flat_ids = [x.lower() for x in flat_ids if x.lower() not in {"the", "and", "or", "via", "in", "of"}]
+    return f"{vclass}:{':'.join(sorted(set(flat_ids))[:8])}"
+
+
+def _normalize_hypotheses_for_sequential_review(
+    hypotheses: List[Dict[str, Any]],
+    target_source: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Deduplicate and lightly rank hypotheses before sequential review.
+
+    The LLM may emit overlapping hypotheses.  For the one-hypothesis lifecycle,
+    processing duplicates wastes calls and can pollute proof state.  This routine
+    keeps the highest-signal representative per signature and drops weak family
+    hypotheses when the target source contains no family signal.
+    """
+    src_l = (target_source or "").lower()
+    kept: List[Dict[str, Any]] = []
+    notes: List[Dict[str, Any]] = []
+    by_sig: Dict[str, Dict[str, Any]] = {}
+    score_by_sig: Dict[str, int] = {}
+
+    def score(h: Dict[str, Any]) -> int:
+        blob = " ".join(str(h.get(k) or "").lower() for k in ("title", "risk_summary", "affected_code_region", "vulnerability_class"))
+        s = 0
+        if any(x in blob for x in ("overflow", "out-of-bounds", "bounds", "pointer", "memory")): s += 3
+        if any(x in blob for x in ("length", "size", "count", "offset", "raw", "buffer")): s += 3
+        if "concurr" in blob or "race" in blob: s -= 3
+        if h.get("affected_code_region"): s += 1
+        s += min(3, len(h.get("required_proof_questions") or []))
+        return s
+
+    for h in hypotheses:
+        blob = " ".join(str(h.get(k) or "").lower() for k in ("title", "risk_summary", "vulnerability_class"))
+        if ("concurr" in blob or "race" in blob or "thread" in blob) and not re.search(r"\b(thread|pthread|mutex|lock|atomic|volatile|shared|global|static)\b", src_l):
+            notes.append({
+                "hypothesis_id": h.get("hypothesis_id"),
+                "action": "dropped",
+                "reason": "weak_concurrency_lifecycle_hypothesis_without_source_signal",
+                "title": h.get("title"),
+            })
+            continue
+        sig = _hypothesis_normalization_signature(h)
+        s = score(h)
+        if sig not in by_sig:
+            by_sig[sig] = h
+            score_by_sig[sig] = s
+        else:
+            old = by_sig[sig]
+            if s > score_by_sig[sig]:
+                by_sig[sig] = h
+                score_by_sig[sig] = s
+                kept_id = h.get("hypothesis_id")
+                dropped_id = old.get("hypothesis_id")
+            else:
+                kept_id = old.get("hypothesis_id")
+                dropped_id = h.get("hypothesis_id")
+            notes.append({
+                "action": "merged_duplicate",
+                "signature": sig,
+                "kept_hypothesis_id": kept_id,
+                "dropped_hypothesis_id": dropped_id,
+            })
+    kept = sorted(by_sig.values(), key=score, reverse=True)
+    # Re-number only if ids are missing. Preserve original IDs for report continuity.
+    for i, h in enumerate(kept, start=1):
+        if not str(h.get("hypothesis_id") or "").strip():
+            h["hypothesis_id"] = f"HYP-{i:02d}"
+    return kept, notes
 
 def _all_hypotheses_resolved(verifications: Dict[str, Any]) -> bool:
     items = verifications.get("verifications") or []
@@ -512,26 +453,173 @@ def _looks_like_codekg_query(text: str) -> bool:
 
 def _symbol_from_bad_query_text(text: str) -> str:
     stripped = str(text or "").strip().strip('`').strip()
-    # Convert common LLM mistakes such as "length", "raw", "header" into a
-    # deterministic variable_flow query instead of wasting loop budget on a
-    # non-executable free-form string. Keep only simple C identifiers.
+    # Convert common LLM mistakes such as "length" or "raw" into a deterministic
+    # variable_flow query only if the identifier actually appears in the target
+    # source.  This prevents English gap words such as "Bit", "Caller",
+    # "Bounds", or "Unresolved" from becoming bogus CodeKG variable queries.
     if re.fullmatch(r"[A-Za-z_]\w*", stripped):
         return stripped
     return ""
 
 
-def _sanitize_or_rewrite_query(q: KGQuery, sample: Dict[str, Any]) -> KGQuery | None:
+def _strip_c_comments(src: str) -> str:
+    src = re.sub(r"/\*.*?\*/", " ", src or "", flags=re.S)
+    src = re.sub(r"//.*", " ", src)
+    return src
+
+
+def _code_identifiers(target_source: str) -> set[str]:
+    """Identifiers visible in the target function source.
+
+    Used only for query sanitation.  It is deliberately language-generic for
+    C/C++: if the symbol is not syntactically present in the target body, a
+    target-scoped variable_flow query is almost certainly wasted.
+    """
+    src = _strip_c_comments(target_source or "")
+    ids = set(re.findall(r"\b[A-Za-z_]\w*\b", src))
+    c_keywords = {
+        "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+        "continue", "return", "sizeof", "typedef", "struct", "enum", "union",
+        "static", "const", "volatile", "extern", "register", "inline", "void",
+        "char", "short", "int", "long", "float", "double", "signed", "unsigned",
+        "bool", "true", "false", "NULL", "nullptr", "class", "public", "private",
+        "protected", "template", "typename", "namespace", "using", "new", "delete",
+    }
+    return {x for x in ids if x not in c_keywords}
+
+
+def _function_calls(target_source: str) -> set[str]:
+    src = _strip_c_comments(target_source or "")
+    calls = {m.group(1) for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", src)}
+    c_keywords = {"if", "while", "for", "switch", "return", "sizeof", "do"}
+    return {c for c in calls if c not in c_keywords}
+
+
+def _target_variable_symbols(target_source: str, target_function: str = "") -> set[str]:
+    """Return local/parameter symbols suitable for target-scoped variable_flow.
+
+    The broader identifier set includes function names, typedefs, and callee
+    names.  Passing those to variable_flow wastes KG calls.  This conservative
+    extractor keeps parameters and locals declared in the target body.
+    """
+    src = _strip_c_comments(target_source or "")
+    out: set[str] = set()
+    header = src.split("{", 1)[0]
+    if "(" in header and ")" in header:
+        params = header[header.find("(") + 1: header.rfind(")")]
+        for part in params.split(","):
+            part = part.strip()
+            if not part or part == "void":
+                continue
+            m = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$", part.replace("*", " "))
+            if m:
+                out.add(m.group(1))
+    body = src[src.find("{") + 1: src.rfind("}")] if "{" in src and "}" in src else src
+    # Common C/C++ local declarations, including typedef-like uppercase names.
+    decl_re = re.compile(
+        r"(?:^|[;{}]\s*)"
+        r"(?:const\s+|volatile\s+|static\s+|unsigned\s+|signed\s+|long\s+|short\s+|struct\s+[A-Za-z_]\w*\s+)*"
+        r"(?:[A-Za-z_]\w*(?:_t)?|bool|char|int|float|double|void)"
+        r"\s*[\*\s]+([A-Za-z_]\w*)\s*(?:=|;|,|\[)",
+        flags=re.M,
+    )
+    for m in decl_re.finditer(body):
+        out.add(m.group(1))
+    if target_function:
+        out.discard(target_function)
+    out -= _function_calls(target_source)
+    return out
+
+
+def _parse_query_call(text: str) -> tuple[str, dict[str, str]]:
+    m = re.match(r"\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$", text or "", flags=re.S)
+    if not m:
+        return "", {}
+    kind = m.group(1)
+    body = m.group(2)
+    args: dict[str, str] = {}
+    # Lightweight parser sufficient for sanitizer diagnostics.  The authoritative
+    # parser still lives in codekg_adapter.
+    parts: list[str] = []
+    cur: list[str] = []
+    quote = None
+    esc = False
+    depth = 0
+    for ch in body:
+        if quote:
+            cur.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+            cur.append(ch)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+    for part in parts:
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        args[k.strip()] = v.strip().strip('"\'')
+    return kind, args
+
+
+def _sanitize_or_rewrite_query(q: KGQuery, sample: Dict[str, Any], *, target_source: str = "") -> KGQuery | None:
     fn = str(sample.get("func_name") or sample.get("function_name") or sample.get("target_function") or sample.get("function") or "").strip()
     text = str(q.query_text or "").strip()
     if not text or "<relative" in text or "<path" in text or "TODO" in text:
         return None
+    target_symbols = _code_identifiers(target_source)
+    target_variables = _target_variable_symbols(target_source, fn)
+    target_calls = _function_calls(target_source)
+
     if _looks_like_codekg_query(text):
+        kind, args = _parse_query_call(text)
+        kind_l = kind.lower()
+        # Target-scoped variable_flow must reference a real target-source symbol.
+        if kind_l == "variable_flow":
+            sym = str(args.get("symbol") or "").strip()
+            if not sym:
+                return None
+            if target_source.strip() and sym not in target_variables:
+                return None
+            # A function/type name is not a valid variable-flow target.
+            if sym == fn or sym in target_calls:
+                return None
+        # function_context on a helper is useful only if it is the target or a call
+        # syntactically visible in the target source.  This avoids hallucinated
+        # helper names while remaining function-agnostic.
+        if kind_l == "function_context":
+            tf = str(args.get("target_function") or "").strip()
+            if target_calls and tf and tf != fn and tf not in target_calls:
+                return None
+        # evidence_slice should name code that is visible or a standard operator/API;
+        # one-word English abstractions are not valid slices.
+        if kind_l == "evidence_slice":
+            stmt = str(args.get("target_statement") or "").strip()
+            if stmt and re.fullmatch(r"[A-Za-z_]\w*", stmt) and target_symbols and stmt not in target_symbols and stmt not in target_calls:
+                return None
         return q
+
     sym = _symbol_from_bad_query_text(text)
-    if sym and fn:
+    if sym and fn and (not target_source.strip() or sym in target_variables) and sym != fn and sym not in target_calls:
         return _make_query(
             q.query_id, q.hypothesis_id,
-            f"Rewritten invalid free-form query `{text}` into variable flow for `{sym}`",
+            f"Rewritten invalid free-form query `{text}` into variable flow for target-source symbol `{sym}`",
             f'variable_flow(target_function="{fn}", symbol="{sym}", data_depth=5)',
             [sym],
         )
@@ -558,14 +646,16 @@ def _auto_follow_up_queries_from_gaps(
     gap_plan: EvidenceGapPlan,
     *,
     prefix: str,
+    target_source: str = "",
 ) -> List[KGQuery]:
-    """Create deterministic fallback KG queries for queryable high-value gaps.
+    """Create bounded deterministic follow-up queries for real code symbols only.
 
-    The LLM often identifies the right missing proof elements but then emits
-    duplicate, underspecified, or weak follow-up queries.  The controller should
-    not stop a loop as ``no_new_evidence_returned`` while high-priority gaps are
-    still explicitly queryable.  These fallback queries are label-free and use
-    only the target function name plus the gap text.
+    The previous fallback expanded English gap text into dozens of variable_flow
+    queries.  That produced invalid symbols such as ``Bit`` or ``Caller`` and
+    consumed the iteration budget before useful caller/callee/source queries ran.
+    This version is universal but code-grounded: it uses only the target function,
+    real identifiers present in the target source, exact backticked expressions,
+    and helper calls syntactically visible in the target function.
     """
     fn = str(sample.get("func_name") or sample.get("function_name") or sample.get("target_function") or sample.get("function") or "").strip()
     if not fn:
@@ -577,6 +667,9 @@ def _auto_follow_up_queries_from_gaps(
 
     out: List[KGQuery] = []
     seen: set[str] = set()
+    target_symbols = _code_identifiers(target_source)
+    target_variables = _target_variable_symbols(target_source, fn)
+    target_calls = _function_calls(target_source)
 
     def add(purpose: str, query_text: str, variables: List[str] | None = None, hypothesis_id: Optional[str] = None) -> None:
         norm = _norm_query(query_text)
@@ -585,9 +678,11 @@ def _auto_follow_up_queries_from_gaps(
         seen.add(norm)
         out.append(_make_query(f"{prefix}{len(out)+1:02d}", hypothesis_id, purpose, query_text, variables))
 
-    # Always try broad caller/data contexts first when any queryable gap remains.
+    # Broad but still bounded context queries.  These should be useful for most
+    # C/C++ vulnerability families: caller preconditions, callee helpers,
+    # local guards, types/macros/globals, and semantic source facts.
     add(
-        "Expanded caller/input-source context for unresolved proof gaps",
+        "Expanded security context for unresolved proof gaps",
         f'security_context(target_function="{fn}", depth=4, call_depth=3, data_depth=5, include_callers=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=900)',
     )
     add(
@@ -595,8 +690,8 @@ def _auto_follow_up_queries_from_gaps(
         f'call_neighborhood(target_function="{fn}", direction="in", call_depth=4)',
     )
     add(
-        "Bidirectional call neighborhood to find helper guards and related validation",
-        f'call_neighborhood(target_function="{fn}", direction="both", call_depth=3)',
+        "Outgoing callees and helper validation for unresolved proof gaps",
+        f'call_neighborhood(target_function="{fn}", direction="out", call_depth=3)',
     )
     add(
         "Semantic guard/risk facts for unresolved proof gaps",
@@ -608,79 +703,59 @@ def _auto_follow_up_queries_from_gaps(
         for g in gaps
     )
 
-    # Variables commonly decisive in the current benchmark families.
-    variables = [
-        "raw", "raw_length", "length", "itemsize", "length_power",
-        "in", "in_len", "in_pos", "ret", "ascii_prefix_length", "state", "wc",
-        "op1", "op2", "rop", "curve", "p", "xdiff", "ydiff", "lambda",
-        "len", "size", "offset", "pos", "idx", "index", "count", "n", "num",
-        "buf", "buffer", "data", "dst", "src", "ptr", "packet", "msg", "addr",
-        "sock", "fd", "pid", "path", "header", "xref", "obj",
-    ]
-    for v in variables:
-        if _query_mentions(gap_text, [v]):
-            add(
-                f"Variable flow for `{v}` because an unresolved queryable gap mentions it",
-                f'variable_flow(target_function="{fn}", symbol="{v}", data_depth=5)',
-                [v],
-            )
+    # Variable-flow only for target-source identifiers that are explicitly named
+    # in the missing-evidence text.  This preserves generality without creating
+    # queries over English words.
+    mentioned_symbols = []
+    if target_variables:
+        for sym in sorted(target_variables):
+            if re.search(rf"\b{re.escape(sym)}\b", gap_text):
+                mentioned_symbols.append(sym)
+    elif not target_source.strip():
+        # Unit-test / degraded-mode fallback when target source is unavailable.
+        # Keep this conservative: only code-like lowercase/underscore symbols,
+        # not abstract proof words.  Normal audits always have target_source and
+        # therefore use the precise symbol-kind router above.
+        stop_words = {
+            "caller", "callers", "bounds", "bound", "validation", "logic", "source", "input",
+            "evidence", "constraint", "constraints", "proof", "element", "need", "missing",
+            "high", "medium", "low", "function", "target", "unresolved", "guard", "guards",
+        }
+        for sym in sorted(set(re.findall(r"\b[a-z_][a-z0-9_]{2,}\b", gap_text))):
+            if sym not in stop_words:
+                mentioned_symbols.append(sym)
+    for sym in mentioned_symbols[:8]:
+        add(
+            f"Variable flow for target-source symbol `{sym}` mentioned by unresolved gap",
+            f'variable_flow(target_function="{fn}", symbol="{sym}", data_depth=5)',
+            [sym],
+        )
 
-    # Exact suspicious expressions/helper names seen in gap text.
-    expr_terms = [
-        ("length * itemsize", "raw += length * itemsize;"),
-        ("length_power", "1 << length_power"),
-        ("raw_length", "raw + raw_length"),
-        ("raw == end", "raw == end"),
-        ("raw >= start", "raw >= start"),
-        ("count_ascii_prefix", "count_ascii_prefix"),
-        ("mbrtowc", "std::mbrtowc"),
-        ("in_pos += ret", "in_pos += ret"),
-        ("use_encode_direct", "use_encode_direct"),
-        ("encode_direct", "ENCODE_DIRECT"),
-        ("mpz_invert", "mpz_invert"),
-        ("curve->p", "curve->p"),
-        ("identity", "pointZZ_pIsIdentityElement"),
-        ("point at infinity", "pointZZ_pIsIdentityElement"),
-        ("malloc", "malloc"),
-        ("calloc", "calloc"),
-        ("realloc", "realloc"),
-        ("memcpy", "memcpy"),
-        ("fread", "fread"),
-        ("recvfrom", "recvfrom"),
-        ("recvmsg", "recvmsg"),
-        ("hop", "hop_limit"),
-        ("link-local", "IN6_IS_ADDR_LINKLOCAL"),
-        ("localhost", "127.0.0.1"),
-        ("auth", "authorization"),
-    ]
-    for needle, stmt in expr_terms:
-        if needle.lower() in gap_text.lower():
-            add(
-                f"Evidence slice for `{stmt}` because an unresolved queryable gap mentions it",
-                f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=5, data_depth=5, control_depth=4, call_depth=3, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=700)',
-            )
+    # Evidence slices for exact expressions quoted by the verifier/gap analyzer.
+    expressions: list[str] = []
+    for expr in re.findall(r"`([^`]{2,120})`", gap_text):
+        expr = expr.strip()
+        if any(ch in expr for ch in "[]()+-*/%<>=&|.^") or re.search(r"\b[A-Za-z_]\w*\s*\(", expr):
+            expressions.append(expr)
+    # Also capture unquoted C/C++ field/index expressions such as curve->p
+    # from proof_element/missing_evidence text when the model forgot backticks.
+    for expr in re.findall(r"\b[A-Za-z_]\w*(?:->|\.)[A-Za-z_]\w*\b", gap_text):
+        expressions.append(expr)
+    for expr in list(dict.fromkeys(expressions))[:6]:
+        add(
+            f"Evidence slice for exact expression `{expr}` mentioned by unresolved gap",
+            f'evidence_slice(target_function="{fn}", target_statement="{expr}", relation_depth=5, data_depth=5, control_depth=4, call_depth=3, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=700)',
+        )
 
-    # Helper functions often hold the guard/counter-evidence, so ask directly
-    # when the gap mentions them. External/library names are harmless: CodeKG
-    # returns no evidence if absent.
-    helpers = [
-        "count_ascii_prefix", "fish_reserved_codepoint", "pointZZ_pIsIdentityElement",
-        "pointZZ_pEqual", "pointZZ_pDouble", "pointZZ_pSetToIdentityElement",
-        "buildCurveZZ_p", "mpz_invert", "mbrtowc",
-    ]
-    for h in helpers:
-        if h.lower() in gap_text.lower():
+    # Helper context for callees visible in target source and named by the gap.
+    for helper in sorted(target_calls - {fn}):
+        if re.search(rf"\b{re.escape(helper)}\b", gap_text):
             add(
-                f"Function context for helper `{h}` mentioned by unresolved gap",
-                f'function_context(target_function="{h}", depth=3)',
-            )
-            add(
-                f"Semantic facts for helper `{h}` mentioned by unresolved gap",
-                f'semantic_facts(target_function="{h}")',
+                f"Function context for visible helper `{helper}` mentioned by unresolved gap",
+                f'function_context(target_function="{helper}", depth=3)',
             )
 
     return out
-
 
 def _actionable_gap_queries(
     sample: Dict[str, Any],
@@ -688,17 +763,18 @@ def _actionable_gap_queries(
     llm_queries: List[KGQuery],
     *,
     prefix: str,
+    target_source: str = "",
 ) -> List[KGQuery]:
     """Combine deterministic fallback queries with LLM queries.
 
     Fallback queries are placed first so a weak/duplicate LLM proposal cannot
     consume the small per-iteration query budget and prematurely end the loop.
     """
-    combined = _auto_follow_up_queries_from_gaps(sample, gap_plan, prefix=prefix) + list(llm_queries or [])
+    combined = _auto_follow_up_queries_from_gaps(sample, gap_plan, prefix=prefix, target_source=target_source) + list(llm_queries or [])
     out: List[KGQuery] = []
     seen: set[str] = set()
     for q in combined:
-        q2 = _sanitize_or_rewrite_query(q, sample)
+        q2 = _sanitize_or_rewrite_query(q, sample, target_source=target_source)
         if q2 is None:
             continue
         norm = _norm_query(q2.query_text)
@@ -708,10 +784,138 @@ def _actionable_gap_queries(
         out.append(q2)
     return out
 
+def _evidence_ids_for_gate(evidence: List[Dict[str, Any]] | None) -> set[str]:
+    ids = {"TARGET-SOURCE"}
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        v = item.get("id") or item.get("evidence_id") or item.get("node_id")
+        if v:
+            ids.add(str(v))
+    return ids
+
+
+def _verification_missing_is_blocking(missing: List[Any] | None) -> bool:
+    # Strict by design: a confirmed_vulnerability should not still say that
+    # attacker control, caller constraints, guard dominance, impact, or callee
+    # behavior is missing.  This prevents the LLM from promoting uncertainty into
+    # confirmation and lets the final validator make any forced-binary fallback.
+    return bool([m for m in (missing or []) if str(m).strip()])
+
+
+def _gate_single_verification(verification: Dict[str, Any], evidence: List[Dict[str, Any]] | None) -> tuple[Dict[str, Any], List[str]]:
+    """Apply a deterministic proof gate to one LLM verification object.
+
+    The LLM may mark a hypothesis as confirmed while its own object still lists
+    missing proof elements.  That is not a valid source-grounded proof.  This
+    gate is model-agnostic and function-agnostic: it only checks the structured
+    proof contract and evidence IDs.
+    """
+    v = dict(verification or {})
+    notes: List[str] = []
+    if v.get("status") != HypothesisStatus.confirmed_vulnerability.value and not v.get("confirmed_security_vulnerability"):
+        return v, notes
+
+    proof = v.get("proof") or {}
+    required = ["input_control", "dangerous_operation", "missing_or_failed_guard", "unsafe_use", "security_impact"]
+    missing_fields = [k for k in required if not str(proof.get(k) or "").strip()]
+    cited = {str(x) for x in (proof.get("cited_evidence_ids") or []) if str(x).strip()}
+    existing = _evidence_ids_for_gate(evidence)
+    missing_ids = sorted(cited - existing)
+    uncertainty = str(proof.get("input_control") or "").lower()
+
+    reasons: List[str] = []
+    if missing_fields:
+        reasons.append(f"proof_missing_fields={missing_fields}")
+    if not cited:
+        reasons.append("proof_has_no_cited_evidence_ids")
+    if missing_ids:
+        reasons.append(f"proof_cites_unknown_evidence_ids={missing_ids[:8]}")
+    if _verification_missing_is_blocking(v.get("missing_evidence") or []):
+        reasons.append("verification_still_lists_missing_evidence")
+    if any(marker in uncertainty for marker in ("unproven", "unknown", "no evidence", "not proven", "assumed", "unclear")):
+        reasons.append("input_control_field_is_uncertain")
+
+    if reasons:
+        old_status = v.get("status")
+        v["status"] = HypothesisStatus.plausible_but_unproven.value if bool(v.get("local_risk_present")) else HypothesisStatus.insufficient_evidence.value
+        v["confirmed_security_vulnerability"] = False
+        existing_missing = list(v.get("missing_evidence") or [])
+        existing_missing.append("Proof gate downgrade: LLM confirmation did not satisfy the complete cited proof contract.")
+        v["missing_evidence"] = existing_missing
+        notes.append(f"downgraded {v.get('hypothesis_id') or '?'} from {old_status}: {', '.join(reasons)}")
+    return v, notes
+
+
+def _apply_counter_review_to_verifications(
+    verifications: Dict[str, Any],
+    counter_review: Any,
+) -> tuple[Dict[str, Any], List[str]]:
+    """Downgrade/annotate hypothesis states using counter-review output.
+
+    This prevents a raw per-hypothesis confirmation from remaining final if a
+    later defense pass found a relevant guard, caller constraint, or other
+    counter-evidence.  The controller uses this normalized proof state for the
+    final adjudicator and report.
+    """
+    findings = []
+    if hasattr(counter_review, "model_dump"):
+        findings = list((counter_review.model_dump(mode="json") or {}).get("findings") or [])
+    elif isinstance(counter_review, dict):
+        findings = list(counter_review.get("findings") or [])
+    by_h: dict[str, list[dict[str, Any]]] = {}
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        hid = str(f.get("hypothesis_id") or "").strip()
+        if hid:
+            by_h.setdefault(hid, []).append(f)
+
+    out_items: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    unsupported = {
+        HypothesisStatus.plausible_but_unproven.value,
+        HypothesisStatus.refuted_by_guard.value,
+        HypothesisStatus.refuted_by_caller_constraint.value,
+        HypothesisStatus.refuted_by_patch_or_changed_logic.value,
+        HypothesisStatus.irrelevant_to_target_function.value,
+        HypothesisStatus.insufficient_evidence.value,
+    }
+    for item in list((verifications or {}).get("verifications") or []):
+        v = dict(item or {})
+        hid = str(v.get("hypothesis_id") or "").strip()
+        for f in by_h.get(hid, []):
+            rec = f.get("recommended_status")
+            rec_val = rec.value if hasattr(rec, "value") else str(rec or "")
+            refutes = str(f.get("refutes_or_weakens") or "").lower()
+            counter_ids = [str(x) for x in (f.get("counter_evidence_ids") or []) if str(x).strip()]
+            if counter_ids:
+                merged = list(dict.fromkeys(list(v.get("counter_evidence_ids") or []) + counter_ids))
+                v["counter_evidence_ids"] = merged
+            if rec_val in unsupported and (
+                v.get("status") == HypothesisStatus.confirmed_vulnerability.value
+                or v.get("confirmed_security_vulnerability")
+                or "refut" in refutes
+                or "weaken" in refutes
+            ):
+                old = v.get("status")
+                v["status"] = rec_val
+                v["confirmed_security_vulnerability"] = False
+                if rec_val in {HypothesisStatus.refuted_by_guard.value, HypothesisStatus.refuted_by_caller_constraint.value, HypothesisStatus.refuted_by_patch_or_changed_logic.value, HypothesisStatus.irrelevant_to_target_function.value}:
+                    v["local_risk_present"] = False
+                    v["missing_evidence"] = []
+                else:
+                    miss = list(v.get("missing_evidence") or [])
+                    miss.append("Counter-review downgraded the raw confirmation; proof state is not accepted_confirmed.")
+                    v["missing_evidence"] = miss
+                notes.append(f"counter_review_updated {hid}: {old} -> {rec_val}")
+        out_items.append(v)
+    return {"verifications": out_items}, notes
+
 
 @dataclass
 class AgenticProofConfig:
-    max_hypotheses: int = 12
+    max_hypotheses: int = 24
     max_queries_per_hypothesis: int = 6
     evidence_limit_per_query: int = 8
     # Per-stage token budgets
@@ -731,6 +935,9 @@ class AgenticProofConfig:
     stop_when_all_hypotheses_resolved: bool = True
     enable_counter_evidence_loop: bool = False
     max_counter_iterations: int = 2
+    # Research-side default: verify one hypothesis at a time with code evidence.
+    per_hypothesis_verification: bool = True
+    stop_on_confirmed_vulnerability: bool = True
     # Other
     temperature: float = 0.0
     provider_extra_body: Dict[str, Any] = field(
@@ -848,11 +1055,13 @@ def _call_llm(
         normalized_messages.append(copied)
 
     prompt_chars = sum(len(m.get("content", "")) for m in normalized_messages)
+    prompt_has_truncation_marker = any("...<truncated>..." in m.get("content", "") for m in normalized_messages)
     if coerced_fields:
         events.append(AgentEvent(sample_id, stage, "prompt_content_coerced",
                                   details={"coerced_fields": coerced_fields}))
     events.append(AgentEvent(sample_id, stage, "start",
-                              details={"prompt_chars": prompt_chars, "max_tokens": max_tokens}))
+                              details={"prompt_chars": prompt_chars, "max_tokens": max_tokens,
+                                       "prompt_has_truncation_marker": prompt_has_truncation_marker}))
     try:
         response = llm_generate(
             normalized_messages,
@@ -872,6 +1081,7 @@ def _call_llm(
     usage = _usage(response)
     events.append(AgentEvent(sample_id, stage, "done", elapsed_seconds=elapsed,
                               details={"response_chars": len(text or ""), "usage": usage,
+                                       "prompt_has_truncation_marker": prompt_has_truncation_marker,
                                        "enable_thinking": config.provider_extra_body.get(
                                            "chat_template_kwargs", {}).get("enable_thinking")}))
     return text, usage
@@ -946,9 +1156,9 @@ def run_agentic_proof_pipeline(
     events: List[AgentEvent] = []
     usage_total: Dict[str, Any] = {}
 
-    # Deterministic source-level facts are label-free and prompt-visible. They
-    # help the verifier/counter-review distinguish unguarded local risk from
-    # patched guard logic even when CodeKG caller queries return no new nodes.
+    # Deterministic source-level facts remain internal evidence for validators and
+    # reports. The LLM-facing code-evidence bundle intentionally excludes these
+    # textual facts so verification receives source code, not summaries.
     source_facts = _infer_deterministic_source_facts(
         target_source, str(sample.get("function") or sample.get("func_name") or sample.get("target_function") or "")
     )
@@ -974,242 +1184,508 @@ def run_agentic_proof_pipeline(
         llm_repair=_repair_llm(llm_generate, config, sample_id, events, "01_source_only_hypothesis"),
     )
     hypotheses = hypothesis_obj.model_dump(mode="json")
-    hypotheses["hypotheses"] = hypotheses.get("hypotheses", [])[:config.max_hypotheses]
-
-    # ── Stage 02: KG query planning ──────────────────────────────────────────
-    text, usage = _call_llm(
-        llm_generate=llm_generate,
-        messages=kg_query_planning_prompt(sample, hypotheses["hypotheses"], initial_evidence),
-        sample_id=sample_id,
-        stage="02_kg_query_planning",
-        max_tokens=config.max_tokens_kg_query_planning,
-        config=config,
-        events=events,
-    )
-    _merge_usage(usage_total, usage)
-    query_plan, _ = parse_model_object(
-        text, KGQueryPlan,
-        llm_repair=_repair_llm(llm_generate, config, sample_id, events, "02_kg_query_planning"),
-    )
-    sanitized_initial_queries: List[KGQuery] = []
-    dropped_initial_queries = 0
-    seen_initial_query_texts: set[str] = set()
-    for q in query_plan.queries:
-        q2 = _sanitize_or_rewrite_query(q, sample)
-        if q2 is None:
-            dropped_initial_queries += 1
+    raw_hypotheses = list(hypotheses.get("hypotheses") or [])[:config.max_hypotheses]
+    clean_hypotheses: List[Dict[str, Any]] = []
+    dropped_hypotheses: List[Dict[str, Any]] = []
+    for h in raw_hypotheses:
+        title = str(h.get("title") or "").strip()
+        risk = str(h.get("risk_summary") or "").strip()
+        region = str(h.get("affected_code_region") or "").strip()
+        # JSON-repair can conservatively close a truncated hypothesis with empty
+        # risk text or a syntactically broken affected region.  Such records are
+        # not useful proof tasks and should not consume per-hypothesis loop time.
+        if not title or not risk or region.endswith("*") or region.endswith("+"):
+            dropped_hypotheses.append({
+                "hypothesis_id": h.get("hypothesis_id"),
+                "title": title,
+                "reason": "incomplete_or_truncated_hypothesis_record",
+            })
             continue
-        norm = _norm_query(q2.query_text)
-        if norm in seen_initial_query_texts:
-            dropped_initial_queries += 1
-            continue
-        seen_initial_query_texts.add(norm)
-        sanitized_initial_queries.append(q2)
-    if dropped_initial_queries:
-        events.append(AgentEvent(sample_id, "02_kg_query_sanitization", "done",
-                                  details={"dropped_or_rewritten": dropped_initial_queries, "kept": len(sanitized_initial_queries)}))
-    query_plan.queries = sanitized_initial_queries
-    query_dicts = [q.model_dump(mode="json") for q in query_plan.queries]
+        clean_hypotheses.append(h)
+    normalized_hypotheses, normalization_notes = _normalize_hypotheses_for_sequential_review(
+        clean_hypotheses, target_source
+    )
+    hypotheses["hypotheses"] = normalized_hypotheses
+    if dropped_hypotheses or normalization_notes:
+        events.append(AgentEvent(sample_id, "01_hypothesis_normalization", "done", details={
+            "raw_count": len(raw_hypotheses),
+            "sanitized_count": len(clean_hypotheses),
+            "normalized_count": len(normalized_hypotheses),
+            "dropped_hypotheses": dropped_hypotheses,
+            "normalization_notes": normalization_notes,
+            "review_order": [h.get("hypothesis_id") for h in normalized_hypotheses],
+        }))
 
-    # ── Stage 03: Initial KG retrieval ───────────────────────────────────────
-    events.append(AgentEvent(sample_id, "03_initial_retrieval", "start",
-                              details={"queries": len(query_dicts)}))
-    retrieved = kg_search(query_dicts, sample=sample, limit=config.evidence_limit_per_query)
-    events.append(AgentEvent(sample_id, "03_initial_retrieval", "done",
-                              details={"items": len(retrieved)}))
-
-    accumulated_evidence = list(initial_evidence) + list(retrieved)
-    # Track which query IDs and normalized query texts have been executed to
-    # prevent re-running duplicates (by id OR by identical text with a new id).
-    executed_query_ids: set[str] = {q.get("query_id", "") for q in query_dicts}
-    executed_query_texts: set[str] = {_norm_query(q.get("query_text", "")) for q in query_dicts}
-
-    # ── Stages 04 + iterative evidence loop ──────────────────────────────────
-    verifications: Dict[str, Any] = {}
+    # ── Stages 02–04/05: sequential per-hypothesis retrieval, verification,
+    # proof-gating, and local counter-review ─────────────────────────────────
+    # Research-side strategy: treat each hypothesis as an independent security
+    # proof task.  For each hypothesis, plan targeted CodeKG queries, retrieve
+    # code evidence, verify only that hypothesis, and loop for more evidence only
+    # when that hypothesis still needs code to be confirmed or falsified.
+    all_query_models: List[KGQuery] = []
+    retrieved: List[Dict[str, Any]] = []
+    accumulated_evidence = list(initial_evidence)
+    executed_query_ids: set[str] = set()
+    executed_query_texts: set[str] = set()
+    final_verification_items: List[Dict[str, Any]] = []
+    # Per-hypothesis counter-review state.  A hypothesis is not allowed to
+    # release control to the next hypothesis until its own verification has
+    # been proof-gated and counter-reviewed.  This prevents the older global
+    # pattern where a raw confirmation was only challenged after all hypotheses
+    # had already run.
+    accepted_confirmed_hypotheses: List[str] = []
+    per_hypothesis_counter_findings: List[Dict[str, Any]] = []
     loop_stop_reason: Optional[str] = None
     iterations_completed: int = 0
 
-    for iteration in range(config.max_evidence_iterations + 1):
-        stage_suffix = "" if iteration == 0 else f"_iter{iteration}"
-        verif_stage = f"04_hypothesis_verification{stage_suffix}"
+    hypotheses_list: List[Dict[str, Any]] = list(hypotheses.get("hypotheses") or [])
+    events.append(AgentEvent(sample_id, "02_04_per_hypothesis_loop", "start",
+                              details={"hypotheses": len(hypotheses_list)}))
 
+    for hyp_index, hypothesis in enumerate(hypotheses_list, start=1):
+        hyp_id = str(hypothesis.get("hypothesis_id") or f"HYP-{hyp_index:02d}")
+        hyp_stage_id = re.sub(r"[^A-Za-z0-9_\-]", "_", hyp_id)
+
+        # ── Stage 02{hyp}: targeted KG query planning ──────────────────────
+        plan_stage = f"02_kg_query_planning__{hyp_stage_id}"
         text, usage = _call_llm(
             llm_generate=llm_generate,
-            messages=hypothesis_verification_prompt(
-                sample, hypotheses["hypotheses"], accumulated_evidence
-            ),
+            messages=kg_query_planning_prompt(sample, [hypothesis], initial_evidence),
             sample_id=sample_id,
-            stage=verif_stage,
-            max_tokens=config.max_tokens_hypothesis_verification,
+            stage=plan_stage,
+            max_tokens=config.max_tokens_kg_query_planning,
             config=config,
             events=events,
         )
         _merge_usage(usage_total, usage)
-        verifications_obj, _ = parse_model_object(
-            text, _VerificationEnvelope,
-            llm_repair=_repair_llm(llm_generate, config, sample_id, events, verif_stage),
+        hyp_query_plan, _ = parse_model_object(
+            text, KGQueryPlan,
+            llm_repair=_repair_llm(llm_generate, config, sample_id, events, plan_stage),
         )
-        verifications = verifications_obj.model_dump(mode="json")
 
-        # ── Stopping checks ──────────────────────────────────────────────────
-        if not config.iterative_evidence_loop:
-            loop_stop_reason = "loop_disabled"
-            break
+        sanitized_hyp_queries: List[KGQuery] = []
+        dropped_hyp_queries = 0
+        for q in hyp_query_plan.queries[:config.max_queries_per_hypothesis]:
+            q2 = _sanitize_or_rewrite_query(q, sample, target_source=target_source)
+            if q2 is None:
+                dropped_hyp_queries += 1
+                continue
+            if not q2.hypothesis_id:
+                q2.hypothesis_id = hyp_id
+            norm = _norm_query(q2.query_text)
+            if norm in executed_query_texts:
+                dropped_hyp_queries += 1
+                continue
+            sanitized_hyp_queries.append(q2)
+            executed_query_texts.add(norm)
+            executed_query_ids.add(q2.query_id)
+            all_query_models.append(q2)
+        if dropped_hyp_queries:
+            events.append(AgentEvent(sample_id, f"02_kg_query_sanitization__{hyp_stage_id}", "done",
+                                      details={"dropped_or_rewritten": dropped_hyp_queries,
+                                               "kept": len(sanitized_hyp_queries)}))
 
-        if iteration >= config.max_evidence_iterations:
-            loop_stop_reason = "max_iterations_reached"
-            break
+        # ── Stage 03{hyp}: hypothesis-specific KG retrieval ────────────────
+        hyp_query_dicts = [q.model_dump(mode="json") for q in sanitized_hyp_queries]
+        retrieval_stage = f"03_retrieval__{hyp_stage_id}"
+        for _qd in hyp_query_dicts:
+            _qd["_agentic_stage"] = retrieval_stage
+            _qd["_hypothesis_id"] = hyp_id
+        events.append(AgentEvent(sample_id, retrieval_stage, "start",
+                                  details={"queries": len(hyp_query_dicts), "hypothesis_id": hyp_id}))
+        hyp_retrieved = kg_search(hyp_query_dicts, sample=sample, limit=config.evidence_limit_per_query) if hyp_query_dicts else []
+        events.append(AgentEvent(sample_id, retrieval_stage, "done",
+                                  details={"items": len(hyp_retrieved), "hypothesis_id": hyp_id}))
+        retrieved.extend(hyp_retrieved)
+        accumulated_evidence.extend(hyp_retrieved)
+        hyp_evidence = list(accumulated_evidence)
 
-        if (config.stop_when_all_hypotheses_resolved
-                and _all_hypotheses_resolved(verifications)):
-            loop_stop_reason = "all_hypotheses_resolved"
-            break
+        latest_verification: Optional[Dict[str, Any]] = None
+        hyp_stop_reason: Optional[str] = None
 
-        # ── Stage 04_evidence_gap_iter{N}: gap analysis ───────────────────
-        gap_stage = f"04_evidence_gap_iter{iteration + 1}"
+        def _terminal_close_hypothesis(reason: str, iteration_no: int, retrieval_status: Dict[str, Any]) -> None:
+            """Run a final closure pass for one hypothesis when retrieval cannot continue.
 
-        if on_iteration_event:
-            on_iteration_event("evidence_iteration_started", {
-                "sample_id": sample_id, "phase": "verification",
-                "iteration": iteration + 1, "accumulated_evidence_count": len(accumulated_evidence),
-            })
-
-        # Gap analysis is an optional loop stage: a ReadTimeout here should
-        # stop the evidence loop gracefully rather than failing the whole sample.
-        try:
+            This prevents an unresolved hypothesis from silently falling through to
+            the next hypothesis after duplicate/no-result follow-up queries.  The
+            LLM sees the same source-code bundle plus a retrieval-status object and
+            must return the best terminal status for this hypothesis under bounded
+            static evidence.
+            """
+            nonlocal latest_verification, hyp_stop_reason
+            terminal_stage = f"04_hypothesis_terminal_verification__{hyp_stage_id}_iter{iteration_no}"
+            terminal_payload = {
+                "hypothesis_id": hyp_id,
+                "closure_reason": reason,
+                "previous_status": (latest_verification or {}).get("status"),
+                "previous_missing_evidence": (latest_verification or {}).get("missing_evidence") or [],
+                "retrieval": retrieval_status,
+                "current_code_evidence_items": len(hyp_evidence),
+            }
             text, usage = _call_llm(
                 llm_generate=llm_generate,
-                messages=evidence_gap_analysis_prompt(
+                messages=single_hypothesis_verification_prompt(
                     sample,
-                    verifications.get("verifications") or [],
-                    accumulated_evidence,
-                    list(executed_query_ids),
-                    iteration=iteration + 1,
+                    hypothesis,
+                    hyp_evidence,
+                    target_source=target_source,
+                    retrieval_status=terminal_payload,
+                    terminal_closure=True,
                 ),
                 sample_id=sample_id,
-                stage=gap_stage,
-                max_tokens=config.max_tokens_evidence_gap_analysis,
+                stage=terminal_stage,
+                max_tokens=config.max_tokens_hypothesis_verification,
                 config=config,
                 events=events,
             )
-        except Exception as _gap_exc:
-            if "Timeout" not in type(_gap_exc).__name__:
-                raise
-            loop_stop_reason = "llm_timeout_gap_analysis"
+            _merge_usage(usage_total, usage)
+            terminal_obj, _ = parse_model_object(
+                text,
+                _VerificationEnvelope,
+                llm_repair=_repair_llm(llm_generate, config, sample_id, events, terminal_stage),
+            )
+            terminal_verifs = terminal_obj.model_dump(mode="json").get("verifications") or []
+            if terminal_verifs:
+                latest_verification = next((v for v in terminal_verifs if v.get("hypothesis_id") == hyp_id), terminal_verifs[0])
+                latest_verification.setdefault("hypothesis_id", hyp_id)
+                latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
+                if gate_notes:
+                    events.append(AgentEvent(sample_id, terminal_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
+            hyp_stop_reason = reason
+            events.append(AgentEvent(sample_id, terminal_stage, "terminal_closed", details={
+                "hypothesis_id": hyp_id,
+                "stop_reason": reason,
+                "terminal_status": (latest_verification or {}).get("status"),
+                "confirmed_security_vulnerability": (latest_verification or {}).get("confirmed_security_vulnerability"),
+            }))
+
+        # ── Stage 04{hyp}: verify and iterate only for this hypothesis ──────
+        for iteration in range(config.max_evidence_iterations + 1):
+            stage_suffix = "" if iteration == 0 else f"_iter{iteration}"
+            verif_stage = f"04_hypothesis_verification__{hyp_stage_id}{stage_suffix}"
+            text, usage = _call_llm(
+                llm_generate=llm_generate,
+                messages=single_hypothesis_verification_prompt(
+                    sample, hypothesis, hyp_evidence, target_source=target_source
+                ),
+                sample_id=sample_id,
+                stage=verif_stage,
+                max_tokens=config.max_tokens_hypothesis_verification,
+                config=config,
+                events=events,
+            )
+            _merge_usage(usage_total, usage)
+            verifications_obj, _ = parse_model_object(
+                text, _VerificationEnvelope,
+                llm_repair=_repair_llm(llm_generate, config, sample_id, events, verif_stage),
+            )
+            parsed_verifs = verifications_obj.model_dump(mode="json").get("verifications") or []
+            if parsed_verifs:
+                # The prompt asks for exactly one, but keep the matching one if a
+                # model emits extras.
+                latest_verification = next((v for v in parsed_verifs if v.get("hypothesis_id") == hyp_id), parsed_verifs[0])
+                latest_verification.setdefault("hypothesis_id", hyp_id)
+                latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
+                if gate_notes:
+                    events.append(AgentEvent(sample_id, verif_stage, "proof_gate", details={"hypothesis_id": hyp_id, "notes": gate_notes}))
+            else:
+                latest_verification = {
+                    "hypothesis_id": hyp_id,
+                    "status": "insufficient_evidence",
+                    "local_risk_present": False,
+                    "confirmed_security_vulnerability": False,
+                    "proof": {},
+                    "supporting_evidence_ids": [],
+                    "counter_evidence_ids": [],
+                    "missing_evidence": ["LLM returned no verification object for this hypothesis."],
+                    "explanation": "No structured verification was returned for this hypothesis.",
+                }
+
+            # Stop this hypothesis as soon as it is confirmed/refuted/resolved.
+            one_verif_envelope = {"verifications": [latest_verification]}
+            if _all_hypotheses_resolved(one_verif_envelope):
+                hyp_stop_reason = "hypothesis_resolved"
+                break
+            # A raw confirmed status only closes the current hypothesis after the
+            # proof gate has accepted it.  It does not stop the global audit;
+            # counter-review and final validation still run later.
+            if not config.iterative_evidence_loop:
+                hyp_stop_reason = "loop_disabled"
+                break
+            if iteration >= config.max_evidence_iterations:
+                hyp_stop_reason = "max_iterations_reached"
+                break
+
+            # Ask for more code evidence for this hypothesis only.
+            gap_stage = f"04_evidence_gap__{hyp_stage_id}_iter{iteration + 1}"
+            if on_iteration_event:
+                on_iteration_event("evidence_iteration_started", {
+                    "sample_id": sample_id,
+                    "phase": "verification",
+                    "hypothesis_id": hyp_id,
+                    "iteration": iteration + 1,
+                    "accumulated_evidence_count": len(hyp_evidence),
+                })
+            try:
+                text, usage = _call_llm(
+                    llm_generate=llm_generate,
+                    messages=evidence_gap_analysis_prompt(
+                        sample,
+                        [latest_verification],
+                        hyp_evidence,
+                        list(executed_query_ids),
+                        iteration=iteration + 1,
+                    ),
+                    sample_id=sample_id,
+                    stage=gap_stage,
+                    max_tokens=config.max_tokens_evidence_gap_analysis,
+                    config=config,
+                    events=events,
+                )
+            except Exception as _gap_exc:
+                if "Timeout" not in type(_gap_exc).__name__:
+                    raise
+                hyp_stop_reason = "llm_timeout_gap_analysis"
+                if on_iteration_event:
+                    on_iteration_event("evidence_iteration_completed", {
+                        "sample_id": sample_id,
+                        "phase": "verification",
+                        "hypothesis_id": hyp_id,
+                        "iteration": iteration + 1,
+                        "new_evidence_count": 0,
+                        "stop_reason": hyp_stop_reason,
+                    })
+                break
+            _merge_usage(usage_total, usage)
+            gap_plan, _ = parse_model_object(
+                text, EvidenceGapPlan,
+                llm_repair=_repair_llm(llm_generate, config, sample_id, events, gap_stage),
+            )
+            effective_gap_queries = _actionable_gap_queries(
+                sample, gap_plan, _effective_follow_up_queries(gap_plan),
+                prefix=f"QF-{hyp_stage_id}-{iteration + 1}-",
+                target_source=target_source,
+            )
+            events.append(AgentEvent(sample_id, gap_stage, "gap_plan", details={
+                "hypothesis_id": hyp_id,
+                "iteration": iteration + 1,
+                "needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                "gaps": len(gap_plan.gaps or []),
+                "llm_follow_up_queries": len(gap_plan.follow_up_queries or []),
+                "effective_follow_up_queries": len(effective_gap_queries),
+            }))
+            if not _plan_effective_needs_more_evidence(gap_plan):
+                reason = (gap_plan.stop_reason_if_no_queries
+                          or gap_plan.stop_reason
+                          or "no_more_evidence_needed")
+                if not _all_hypotheses_resolved({"verifications": [latest_verification]}):
+                    _terminal_close_hypothesis(reason, iteration + 1, {
+                        "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                        "gap_plan_reason": gap_plan.reason,
+                        "gap_plan_stop_reason": reason,
+                        "attempted_new_queries": 0,
+                        "new_evidence_count": 0,
+                    })
+                else:
+                    hyp_stop_reason = reason
+                if on_iteration_event:
+                    on_iteration_event("evidence_iteration_completed", {
+                        "sample_id": sample_id,
+                        "phase": "verification",
+                        "hypothesis_id": hyp_id,
+                        "iteration": iteration + 1,
+                        "new_evidence_count": 0,
+                        "stop_reason": hyp_stop_reason,
+                    })
+                break
+            new_queries: List[KGQuery] = []
+            for q in effective_gap_queries[:config.max_queries_per_iteration]:
+                if not q.hypothesis_id:
+                    q.hypothesis_id = hyp_id
+                norm = _norm_query(q.query_text)
+                if q.query_id in executed_query_ids or norm in executed_query_texts:
+                    continue
+                new_queries.append(q)
+                executed_query_ids.add(q.query_id)
+                executed_query_texts.add(norm)
+                all_query_models.append(q)
+            if not new_queries:
+                duplicate_reason = "all_queries_duplicate"
+                _terminal_close_hypothesis(duplicate_reason, iteration + 1, {
+                    "gap_plan_needs_more_evidence": bool(gap_plan.needs_more_evidence),
+                    "gap_plan_reason": gap_plan.reason,
+                    "effective_follow_up_queries": [q.model_dump(mode="json") for q in effective_gap_queries[:config.max_queries_per_iteration]],
+                    "attempted_new_queries": 0,
+                    "duplicate_or_already_executed_queries": len(effective_gap_queries[:config.max_queries_per_iteration]),
+                    "new_evidence_count": 0,
+                })
+                if on_iteration_event:
+                    on_iteration_event("evidence_iteration_completed", {
+                        "sample_id": sample_id,
+                        "phase": "verification",
+                        "hypothesis_id": hyp_id,
+                        "iteration": iteration + 1,
+                        "new_evidence_count": 0,
+                        "stop_reason": hyp_stop_reason,
+                    })
+                break
+
+            followup_stage = f"03_followup_retrieval__{hyp_stage_id}_iter{iteration + 1}"
+            followup_dicts = [q.model_dump(mode="json") for q in new_queries]
+            for _qd in followup_dicts:
+                _qd["_agentic_stage"] = followup_stage
+                _qd["_hypothesis_id"] = hyp_id
+            events.append(AgentEvent(sample_id, followup_stage, "start",
+                                      details={"queries": len(followup_dicts), "hypothesis_id": hyp_id,
+                                               "query_ids": [q.query_id for q in new_queries]}))
+            new_evidence = kg_search(followup_dicts, sample=sample, limit=config.evidence_limit_per_query)
+            events.append(AgentEvent(sample_id, followup_stage, "done",
+                                      details={"items": len(new_evidence), "hypothesis_id": hyp_id}))
+            if not new_evidence and config.stop_when_no_new_evidence:
+                _terminal_close_hypothesis("no_new_evidence_returned", iteration + 1, {
+                    "attempted_new_queries": len(new_queries),
+                    "executed_query_ids": [q.query_id for q in new_queries],
+                    "executed_query_texts": [q.query_text for q in new_queries],
+                    "new_evidence_count": 0,
+                    "interpretation": "KG retrieval returned no previously unseen source-code evidence for this hypothesis.",
+                })
+                if on_iteration_event:
+                    on_iteration_event("evidence_iteration_completed", {
+                        "sample_id": sample_id,
+                        "phase": "verification",
+                        "hypothesis_id": hyp_id,
+                        "iteration": iteration + 1,
+                        "new_evidence_count": 0,
+                        "stop_reason": hyp_stop_reason,
+                    })
+                break
+            hyp_evidence.extend(new_evidence)
+            accumulated_evidence.extend(new_evidence)
+            retrieved.extend(new_evidence)
+            iterations_completed += 1
             if on_iteration_event:
                 on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id, "phase": "verification",
-                    "iteration": iteration + 1, "new_evidence_count": 0,
-                    "stop_reason": "llm_timeout_gap_analysis",
+                    "sample_id": sample_id,
+                    "phase": "verification",
+                    "hypothesis_id": hyp_id,
+                    "iteration": iteration + 1,
+                    "new_evidence_count": len(new_evidence),
+                    "stop_reason": None,
                 })
+
+        # ── Stage 05{hyp}: immediate counter-review before moving on ────────
+        # A hypothesis is only terminal after its own counter-evidence review has
+        # run and the proof state has been normalized.  Raw LLM confirmations are
+        # treated as proposed_confirmed, never as accepted_confirmed.
+        if latest_verification is not None:
+            latest_verification.setdefault("hypothesis_id", hyp_id)
+            pre_counter_status = latest_verification.get("status")
+            counter_stage = f"05_counter_evidence_review__{hyp_stage_id}"
+            events.append(AgentEvent(sample_id, counter_stage, "start", details={
+                "hypothesis_id": hyp_id,
+                "pre_counter_status": pre_counter_status,
+                "local_risk_present": latest_verification.get("local_risk_present"),
+                "confirmed_security_vulnerability": latest_verification.get("confirmed_security_vulnerability"),
+            }))
+            text, usage = _call_llm(
+                llm_generate=llm_generate,
+                messages=counter_evidence_prompt(
+                    sample, [latest_verification], hyp_evidence,
+                    target_source=target_source
+                ),
+                sample_id=sample_id,
+                stage=counter_stage,
+                max_tokens=config.max_tokens_counter_evidence_review,
+                config=config,
+                events=events,
+            )
+            _merge_usage(usage_total, usage)
+            local_counter_review, _ = parse_model_object(
+                text, CounterEvidenceReview,
+                llm_repair=_repair_llm(llm_generate, config, sample_id, events, counter_stage),
+            )
+            local_findings = (local_counter_review.model_dump(mode="json") or {}).get("findings") or []
+            per_hypothesis_counter_findings.extend(local_findings)
+
+            normalized_one, counter_notes = _apply_counter_review_to_verifications(
+                {"verifications": [latest_verification]}, local_counter_review
+            )
+            normalized_items = normalized_one.get("verifications") or []
+            if normalized_items:
+                latest_verification = normalized_items[0]
+            if counter_notes:
+                events.append(AgentEvent(sample_id, counter_stage, "proof_state_update", details={
+                    "hypothesis_id": hyp_id,
+                    "notes": counter_notes,
+                }))
+
+            accepted_confirmed = (
+                latest_verification.get("status") == HypothesisStatus.confirmed_vulnerability.value
+                and bool(latest_verification.get("confirmed_security_vulnerability"))
+            )
+            if accepted_confirmed:
+                accepted_confirmed_hypotheses.append(hyp_id)
+                hyp_stop_reason = "accepted_confirmed_after_local_counter_review"
+            events.append(AgentEvent(sample_id, f"05_hypothesis_proof_state__{hyp_stage_id}", "done", details={
+                "hypothesis_id": hyp_id,
+                "pre_counter_status": pre_counter_status,
+                "post_counter_status": latest_verification.get("status"),
+                "accepted_confirmed": accepted_confirmed,
+                "counter_findings": len(local_findings),
+                "stop_reason": hyp_stop_reason,
+            }))
+            final_verification_items.append(latest_verification)
+
+        events.append(AgentEvent(sample_id, f"04_hypothesis_done__{hyp_stage_id}", "done",
+                                  details={"hypothesis_id": hyp_id,
+                                           "status": (latest_verification or {}).get("status"),
+                                           "accepted_confirmed": bool(accepted_confirmed_hypotheses and accepted_confirmed_hypotheses[-1] == hyp_id),
+                                           "stop_reason": hyp_stop_reason}))
+        loop_stop_reason = hyp_stop_reason or loop_stop_reason
+        if (
+            config.stop_on_confirmed_vulnerability
+            and accepted_confirmed_hypotheses
+            and accepted_confirmed_hypotheses[-1] == hyp_id
+        ):
+            loop_stop_reason = "stopped_on_accepted_confirmed_vulnerability"
+            events.append(AgentEvent(sample_id, "02_04_per_hypothesis_loop", "early_stop", details={
+                "hypothesis_id": hyp_id,
+                "accepted_confirmed_hypotheses": list(accepted_confirmed_hypotheses),
+                "remaining_hypotheses_skipped": max(0, len(hypotheses_list) - hyp_index),
+            }))
             break
-        _merge_usage(usage_total, usage)
-        gap_plan, _ = parse_model_object(
-            text, EvidenceGapPlan,
-            llm_repair=_repair_llm(llm_generate, config, sample_id, events, gap_stage),
-        )
 
-        # ── Stopping checks on gap plan ───────────────────────────────────
-        # Do not blindly trust needs_more_evidence=false when the same response
-        # contains queryable gaps and concrete follow-up queries. That exact
-        # contradiction was responsible for premature loop termination on
-        # pointer-overflow cases where caller/input-source evidence was still
-        # missing.
-        effective_gap_queries = _actionable_gap_queries(
-            sample, gap_plan, _effective_follow_up_queries(gap_plan),
-            prefix=f"QF{iteration + 1}-",
-        )
-        if not _plan_effective_needs_more_evidence(gap_plan):
-            _stop = (gap_plan.stop_reason_if_no_queries
-                     or gap_plan.stop_reason
-                     or "no_more_evidence_needed")
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id, "phase": "verification",
-                    "iteration": iteration + 1, "new_evidence_count": 0,
-                    "stop_reason": _stop,
-                })
-            loop_stop_reason = _stop
-            break
+    query_plan = KGQueryPlan(queries=all_query_models)
+    verifications: Dict[str, Any] = {"verifications": final_verification_items}
+    events.append(AgentEvent(sample_id, "02_04_per_hypothesis_loop", "done",
+                              details={"verified_hypotheses": len(final_verification_items),
+                                       "queries": len(all_query_models),
+                                       "retrieved_items": len(retrieved),
+                                       "loop_stop_reason": loop_stop_reason}))
 
-        if not effective_gap_queries and config.stop_when_no_new_queries:
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id, "phase": "verification",
-                    "iteration": iteration + 1, "new_evidence_count": 0,
-                    "stop_reason": "no_new_queries_proposed",
-                })
-            loop_stop_reason = "no_new_queries_proposed"
-            break
-
-        # Deduplicate by query_id AND by normalized query_text (LLM may reuse
-        # identical text with a fresh id to bypass id-only dedup).
-        new_queries = [
-            q for q in effective_gap_queries[:config.max_queries_per_iteration]
-            if q.query_id not in executed_query_ids
-            and _norm_query(q.query_text) not in executed_query_texts
-        ]
-        if not new_queries and config.stop_when_no_new_queries:
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id, "phase": "verification",
-                    "iteration": iteration + 1, "new_evidence_count": 0,
-                    "stop_reason": "all_queries_duplicate",
-                })
-            loop_stop_reason = "all_queries_duplicate"
-            break
-
-        # ── Follow-up KG retrieval ────────────────────────────────────────
-        retrieval_stage = f"03_followup_retrieval_iter{iteration + 1}"
-        followup_dicts = [q.model_dump(mode="json") for q in new_queries]
-        events.append(AgentEvent(sample_id, retrieval_stage, "start",
-                                  details={"queries": len(followup_dicts)}))
-        new_evidence = kg_search(followup_dicts, sample=sample, limit=config.evidence_limit_per_query)
-        events.append(AgentEvent(sample_id, retrieval_stage, "done",
-                                  details={"items": len(new_evidence)}))
-
-        if not new_evidence and config.stop_when_no_new_evidence:
-            if on_iteration_event:
-                on_iteration_event("evidence_iteration_completed", {
-                    "sample_id": sample_id, "phase": "verification",
-                    "iteration": iteration + 1, "new_evidence_count": 0,
-                    "stop_reason": "no_new_evidence_returned",
-                })
-            loop_stop_reason = "no_new_evidence_returned"
-            break
-
-        accumulated_evidence.extend(new_evidence)
-        executed_query_ids.update(q.query_id for q in new_queries)
-        executed_query_texts.update(_norm_query(q.query_text) for q in new_queries)
-        iterations_completed = iteration + 1
-
-        if on_iteration_event:
-            on_iteration_event("evidence_iteration_completed", {
-                "sample_id": sample_id, "phase": "verification",
-                "iteration": iteration + 1, "new_evidence_count": len(new_evidence),
-                "stop_reason": None,
-            })
-
-    # ── Stage 05: Counter-evidence review ────────────────────────────────────
-    text, usage = _call_llm(
-        llm_generate=llm_generate,
-        messages=counter_evidence_prompt(
-            sample, verifications.get("verifications") or [], accumulated_evidence
+    # ── Stage 05 aggregate: all counter-reviews already ran per hypothesis ───
+    # The new controller architecture counter-reviews each hypothesis before the
+    # next hypothesis is allowed to start.  Therefore the old global Stage-05 LLM
+    # call is intentionally replaced by an aggregate object.  This keeps Stage-06
+    # compatible while preserving the one-hypothesis-at-a-time proof lifecycle.
+    counter_review = CounterEvidenceReview(
+        findings=per_hypothesis_counter_findings,
+        overall_notes=(
+            "Counter-evidence was reviewed immediately per hypothesis before "
+            "moving to the next hypothesis. This aggregate contains all local "
+            "counter-review findings."
         ),
-        sample_id=sample_id,
-        stage="05_counter_evidence_review",
-        max_tokens=config.max_tokens_counter_evidence_review,
-        config=config,
-        events=events,
     )
-    _merge_usage(usage_total, usage)
-    counter_review, _ = parse_model_object(
-        text, CounterEvidenceReview,
-        llm_repair=_repair_llm(llm_generate, config, sample_id, events, "05_counter_evidence_review"),
-    )
+    events.append(AgentEvent(sample_id, "05_counter_evidence_review", "aggregate_from_local_reviews", details={
+        "findings": len(per_hypothesis_counter_findings),
+        "accepted_confirmed_hypotheses": list(accepted_confirmed_hypotheses),
+        "global_counter_llm_call": False,
+    }))
 
     # ── Optional counter-evidence iterative loop ──────────────────────────────
-    if config.enable_counter_evidence_loop:
+    # Disabled in the one-hypothesis lifecycle.  Counter iteration belongs inside
+    # the current hypothesis closure, not after all hypotheses have run.
+    if False and config.enable_counter_evidence_loop:
         counter_executed_ids = set(executed_query_ids)
         counter_executed_texts = set(executed_query_texts)
         for c_iter in range(1, config.max_counter_iterations + 1):
@@ -1254,6 +1730,7 @@ def run_agentic_proof_pipeline(
             c_effective_queries = _actionable_gap_queries(
                 sample, c_gap, _effective_follow_up_queries(c_gap),
                 prefix=f"QCF{c_iter}-",
+                target_source=target_source,
             )
             if not _plan_effective_needs_more_evidence(c_gap) or not c_effective_queries:
                 if on_iteration_event:
@@ -1299,7 +1776,8 @@ def run_agentic_proof_pipeline(
             text, usage = _call_llm(
                 llm_generate=llm_generate,
                 messages=counter_evidence_prompt(
-                    sample, verifications.get("verifications") or [], accumulated_evidence
+                    sample, verifications.get("verifications") or [], accumulated_evidence,
+                    target_source=target_source
                 ),
                 sample_id=sample_id,
                 stage=c_rev_stage,
@@ -1319,6 +1797,26 @@ def run_agentic_proof_pipeline(
                     "stop_reason": None,
                 })
 
+    # Normalize proof state with the final counter-review before Stage 06.
+    verifications, counter_notes = _apply_counter_review_to_verifications(verifications, counter_review)
+    if counter_notes:
+        events.append(AgentEvent(sample_id, "05_counter_evidence_review", "proof_state_update", details={"notes": counter_notes}))
+
+    accepted_confirmed_ids = [
+        v.get("hypothesis_id") for v in (verifications.get("verifications") or [])
+        if v.get("status") == HypothesisStatus.confirmed_vulnerability.value
+        and v.get("confirmed_security_vulnerability")
+    ]
+    if accepted_confirmed_ids:
+        loop_stop_reason = "accepted_confirmed_after_counter_review"
+    elif loop_stop_reason == "stopped_on_confirmed_vulnerability":
+        loop_stop_reason = "raw_confirmation_downgraded_after_counter_review"
+    events.append(AgentEvent(sample_id, "05_proof_state", "done", details={
+        "accepted_confirmed_hypotheses": accepted_confirmed_ids,
+        "verified_hypotheses": len(verifications.get("verifications") or []),
+        "loop_stop_reason": loop_stop_reason,
+    }))
+
     # ── Stage 06: Final adjudication ─────────────────────────────────────────
     text, usage = _call_llm(
         llm_generate=llm_generate,
@@ -1327,6 +1825,7 @@ def run_agentic_proof_pipeline(
             verifications.get("verifications") or [],
             counter_review.model_dump(mode="json"),
             accumulated_evidence,
+            target_source=target_source,
         ),
         sample_id=sample_id,
         stage="06_final_adjudication",
@@ -1372,6 +1871,14 @@ def run_agentic_proof_pipeline(
             "forced_prediction_bool": decision.forced_prediction_bool,
         }))
 
+    # Keep validator notes visible in final_prediction.json and dashboard reports.
+    if notes:
+        merged_limitations = list(decision.limitations or [])
+        for note in notes:
+            if note not in merged_limitations:
+                merged_limitations.append(note)
+        decision.limitations = merged_limitations
+
     # ── Stage 07: Schema consistency repair (conditional) ────────────────────
     # Skip repair when the validator has already produced a definitive forced binary
     # decision — repair cannot improve on a deterministically-set forced_prediction_bool.
@@ -1409,6 +1916,13 @@ def run_agentic_proof_pipeline(
                 "prediction": decision.prediction.value,
                 "confidence": decision.confidence,
             }))
+
+    if notes:
+        merged_limitations = list(decision.limitations or [])
+        for note in notes:
+            if note not in merged_limitations:
+                merged_limitations.append(note)
+        decision.limitations = merged_limitations
 
     events.append(AgentEvent(sample_id, "agentic_proof", "done", details={
         "prediction": decision.prediction.value, "forced_prediction": decision.forced_prediction,

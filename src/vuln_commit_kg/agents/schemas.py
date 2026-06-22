@@ -356,6 +356,14 @@ class Prediction(BaseModel):
     model_backend: str | None = None
     usage: dict = Field(default_factory=dict)
     validation_notes: list[str] = Field(default_factory=list)
+    # Agentic-proof validator diagnostics.  Optional so legacy agents remain compatible.
+    forced_prediction: str | None = None
+    forced_prediction_bool: bool | None = None
+    evidence_strength: str | None = None
+    why_forced_binary: str | None = None
+    residual_uncertainty: list[str] = Field(default_factory=list)
+    final_hypothesis_statuses: list[dict] = Field(default_factory=list)
+    normalization_warnings: list[str] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):
