@@ -437,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "view-kg":
             graph_dir = _resolve_graph_dir(args.graph_dir)
             if (graph_dir / "graph.json").exists():
-                from codekg.dashboard import rebuild_dashboard_from_graph_dir
+                from codekg_s.dashboard import rebuild_dashboard_from_graph_dir
                 out = rebuild_dashboard_from_graph_dir(graph_dir)
             else:
                 from vuln_commit_kg.config import KGConfig
@@ -468,8 +468,8 @@ def main(argv: list[str] | None = None) -> int:
                 }
             graph_dir = _resolve_graph_dir(args.graph_dir)
             if (graph_dir / "graph.json").exists():
-                from codekg.query import GraphQueryEngine
-                from codekg.dashboard import rebuild_dashboard_from_graph_dir
+                from codekg_s.query import GraphQueryEngine
+                from codekg_s.dashboard import rebuild_dashboard_from_graph_dir
                 engine = GraphQueryEngine(graph_dir)
                 kind = query.pop("kind", args.kind)
                 if "symbols" in query and query["symbols"] and not query.get("symbol"):

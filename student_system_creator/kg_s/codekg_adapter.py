@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vuln_commit_kg.kg.graph_store import KGEdge, KGNode, ProjectGraph
-from vuln_commit_kg.retrieval.evidence import EvidenceItem
+from kg_s.graph_store import KGEdge, KGNode, ProjectGraph
+from retrieval_s.evidence import EvidenceItem
 
 
 NEW_CODEKG_QUERY_KINDS = {

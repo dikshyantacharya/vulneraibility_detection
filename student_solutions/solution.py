@@ -47,6 +47,9 @@ import re
 import time
 import urllib.error
 import urllib.request
+
+STUDENT_AGENT_VERSION = "research_exact_like_v7_family_safe_20260619"
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -277,6 +280,10 @@ def analyze_source(sample: Dict[str, Any]) -> SourceFacts:
         elif func == "realloc":
             facts.add_risk("raw_realloc_direct_assignment", stmt)
 
+    # Dynamic growth guard: a buffer capacity check followed by realloc before indexed writes.
+    if re.search(r"if\s*\([^)]*(?:>=|==)[^)]*(?:size|capacity|cap|allocated)[^)]*\).*?realloc\s*\(", src, re.I | re.S) and re.search(r"\[[^\]]+\]\s*=", src):
+        facts.add_safety("dynamic_growth_guarded_buffer")
+
     for m in _SAFE_ALLOC_RE.finditer(src):
         facts.add_safety("safe_allocation_wrapper_used")
         facts.variables.add(m.group("var").split("->")[-1])
@@ -381,6 +388,10 @@ class SampleState:
     seen_query_keys: set[str] = field(default_factory=set)
     trace: List[Dict[str, Any]] = field(default_factory=list)
     last_evidence_len: int = 0
+    pending_queries: List[Dict[str, Any]] = field(default_factory=list)
+    pending_stage: str = ""
+    pending_reason: str = ""
+    pending_next_stage: str = ""
 
     def add_trace(self, stage: str, output: Any) -> None:
         self.trace.append({"stage": stage, "output": _jsonable(output), "ts": time.time()})
@@ -399,6 +410,7 @@ class FullStageAgenticStudent:
         self.llm_api_key_env = key_env
         self.llm_api_key = os.getenv(key_env, os.getenv("STUDENT_LLM_API_KEY", ""))
         self.llm_call_count = 0
+        print(f"student.solution.version | version={STUDENT_AGENT_VERSION} | mode=full_research_like_kg_loop", flush=True)
 
     def step(self, sample: Dict[str, Any], observation: Dict[str, Any], budget: Dict[str, Any]) -> Dict[str, Any]:
         sid = _sample_id(sample)
@@ -415,6 +427,14 @@ class FullStageAgenticStudent:
         if force_final:
             return self._final_action(st, reason="budget_force_final")
 
+        # If a previous research stage planned more KG queries than the evaluator
+        # can execute in one round, keep draining that exact queued plan before
+        # moving to verification/final stages.  This mirrors Research Audit more
+        # closely than returning 12 queries and letting the evaluator silently run
+        # only the first 3.
+        if st.pending_queries:
+            return self._dequeue_query_action(st, budget)
+
         # Stage 01: hypothesis generation.
         if st.stage == "01_source_only_hypothesis":
             st.hypotheses = self._source_only_hypothesis(st)
@@ -425,8 +445,7 @@ class FullStageAgenticStudent:
         if st.stage == "02_kg_query_planning":
             queries = self._kg_query_planning(st)
             st.add_trace("02_kg_query_planning", {"queries": queries})
-            st.stage = "04_hypothesis_verification"
-            return self._query_action(st, "02_kg_query_planning", queries, "Initial KG retrieval for hypotheses.")
+            return self._enqueue_query_action(st, "02_kg_query_planning", queries, "Initial KG retrieval for hypotheses.", "04_hypothesis_verification", budget)
 
         # Stage 04: verification after initial KG result.
         if st.stage == "04_hypothesis_verification":
@@ -441,8 +460,7 @@ class FullStageAgenticStudent:
                 st.add_trace(f"04_evidence_gap_iter{st.iteration + 1}", {"queries": gap_queries})
                 if gap_queries:
                     st.iteration += 1
-                    st.stage = "04_hypothesis_verification_iter"
-                    return self._query_action(st, f"04_evidence_gap_iter{st.iteration}", gap_queries, "Retrieve missing evidence for unresolved hypotheses.")
+                    return self._enqueue_query_action(st, f"04_evidence_gap_iter{st.iteration}", gap_queries, "Retrieve missing evidence for unresolved hypotheses.", "04_hypothesis_verification_iter", budget)
             st.stage = "05_counter_evidence_review"
 
         # Stage 04 iter verification after gap query.
@@ -456,7 +474,7 @@ class FullStageAgenticStudent:
                 st.add_trace(f"04_evidence_gap_iter{st.iteration + 1}", {"queries": gap_queries})
                 if gap_queries:
                     st.iteration += 1
-                    return self._query_action(st, f"04_evidence_gap_iter{st.iteration}", gap_queries, "Retrieve additional missing evidence.")
+                    return self._enqueue_query_action(st, f"04_evidence_gap_iter{st.iteration}", gap_queries, "Retrieve additional missing evidence.", "04_hypothesis_verification_iter", budget)
             st.stage = "05_counter_evidence_review"
 
         # Stage 05 counter review.
@@ -472,8 +490,7 @@ class FullStageAgenticStudent:
                 st.add_trace(f"05_counter_gap_iter{st.counter_iteration + 1}", {"queries": cq})
                 if cq:
                     st.counter_iteration += 1
-                    st.stage = "05_counter_gap_after_query"
-                    return self._query_action(st, f"05_counter_gap_iter{st.counter_iteration}", cq, "Retrieve counter-evidence or guard dominance evidence.")
+                    return self._enqueue_query_action(st, f"05_counter_gap_iter{st.counter_iteration}", cq, "Retrieve counter-evidence or guard dominance evidence.", "05_counter_gap_after_query", budget)
             st.stage = "06_final_adjudication"
 
         if st.stage == "05_counter_gap_after_query":
@@ -483,6 +500,12 @@ class FullStageAgenticStudent:
             st.stage = "06_final_adjudication"
 
         if st.stage == "06_final_adjudication":
+            # Hard safety gate: a research-like student run must not finalize before
+            # at least one KG-backed verification stage has happened.  If the
+            # evaluator ever reaches final without evidence, force a KG action.
+            if not any(str(t.get("stage", "")).startswith("04_hypothesis_verification") for t in st.trace) and _budget_remaining(budget) > 0:
+                st.add_trace("kg_required_before_final_hard_gate", {"reason": "no verification trace before final; forcing KG retrieval"})
+                return self._enqueue_query_action(st, "02_kg_query_planning_hard_gate", self._kg_query_planning(st), "KG evidence is required before final adjudication.", "04_hypothesis_verification", budget)
             return self._final_action(st, reason="completed_full_agentic_flow")
 
         return self._final_action(st, reason="fallback_unknown_stage")
@@ -607,23 +630,46 @@ class FullStageAgenticStudent:
         return hyps
 
     def _kg_query_planning(self, st: SampleState) -> List[Dict[str, Any]]:
-        queries: List[Dict[str, Any]] = []
+        """Plan the first external KG action.
+
+        This function must NEVER return an empty list for a normal sample with
+        query budget available.  The evaluator can only execute KG when we
+        return action='query'.  Earlier versions sometimes let LLM planning or
+        stateful dedupe remove every query, causing the student agent to jump
+        directly from 02_kg_query_planning to final_decision with queries=0.
+        """
         fn = st.fn
-        queries.append({"kind": "security_context", "target_function": fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350})
-        queries.append({"kind": "semantic_facts", "target_function": fn, "max_nodes": 300})
-        for stmt in st.facts.suspicious_statements[:2]:
-            queries.append({"kind": "evidence_slice", "target_function": fn, "target_statement": stmt[:240], "relation_depth": 4, "data_depth": 4, "control_depth": 3, "call_depth": 2, "max_nodes": 300})
-        # Family-specific additions.
-        if any(f in st.facts.families for f in ["protocol_validation", "access_control"]):
-            queries.append({"kind": "call_neighborhood", "target_function": fn, "direction": "both", "call_depth": 2, "max_nodes": 300})
-        for v in sorted(st.facts.variables)[:3]:
-            queries.append({"kind": "variable_flow", "target_function": fn, "symbol": v, "data_depth": 4, "max_nodes": 250})
-        deterministic = self._dedupe_queries(st, queries)
+        base_queries: List[Dict[str, Any]] = [
+            {"kind": "security_context", "target_function": fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350},
+            {"kind": "semantic_facts", "target_function": fn, "max_nodes": 300},
+            {"kind": "call_neighborhood", "target_function": fn, "direction": "both", "call_depth": 2, "max_nodes": 300},
+        ]
+        for stmt in st.facts.suspicious_statements[:3]:
+            base_queries.append({"kind": "evidence_slice", "target_function": fn, "target_statement": stmt[:240], "relation_depth": 4, "data_depth": 4, "control_depth": 3, "call_depth": 2, "max_nodes": 350})
+        for v in sorted(st.facts.variables)[:4]:
+            base_queries.append({"kind": "variable_flow", "target_function": fn, "symbol": v, "data_depth": 4, "max_nodes": 300})
+
+        # Ask the LLM to refine/augment, but never let it erase deterministic
+        # fallback queries.  LLM-normalized queries may update seen_query_keys;
+        # therefore final dedupe is local-only and not stateful.
+        llm_queries: List[Dict[str, Any]] = []
         if self.llm_enabled:
-            llm_queries = self._llm_query_plan(st, deterministic, "02_kg_query_planning")
-            if llm_queries:
-                return self._dedupe_queries(st, llm_queries + deterministic)
-        return deterministic
+            llm_queries = self._llm_query_plan_no_mark(st, base_queries, "02_kg_query_planning")
+
+        merged = self._merge_planned_queries(llm_queries, base_queries)
+        scheduled = self._dedupe_queries(st, merged)
+
+        # Absolute safety net: if stateful dedupe removed everything, still
+        # return fresh fallback queries with harmless query_id salt so the
+        # evaluator executes KG before any final decision.
+        if not scheduled:
+            fallback = [
+                {"kind": "security_context", "target_function": fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350, "query_id": "forced_initial_security_context"},
+                {"kind": "semantic_facts", "target_function": fn, "max_nodes": 300, "query_id": "forced_initial_semantic_facts"},
+                {"kind": "call_neighborhood", "target_function": fn, "direction": "both", "call_depth": 2, "max_nodes": 300, "query_id": "forced_initial_call_neighborhood"},
+            ]
+            scheduled = fallback
+        return scheduled
 
     def _hypothesis_verification(self, st: SampleState, iter_no: int) -> List[Verification]:
         text = (st.evidence_text + "\n" + st.source).lower()
@@ -753,7 +799,7 @@ class FullStageAgenticStudent:
         if self.llm_enabled:
             llm_queries = self._llm_evidence_gap_queries(st, deterministic)
             if llm_queries:
-                return self._dedupe_queries(st, llm_queries + deterministic)
+                return self._merge_planned_queries(llm_queries, deterministic)
         return deterministic
 
     def _counter_evidence_review(self, st: SampleState) -> List[CounterFinding]:
@@ -799,7 +845,7 @@ class FullStageAgenticStudent:
         if self.llm_enabled:
             llm_queries = self._llm_counter_gap_queries(st, deterministic)
             if llm_queries:
-                return self._dedupe_queries(st, llm_queries + deterministic)
+                return self._merge_planned_queries(llm_queries, deterministic)
         return deterministic
 
     def _final_decision(self, st: SampleState, reason: str) -> Dict[str, Any]:
@@ -821,9 +867,20 @@ class FullStageAgenticStudent:
             "saved_base_lower_bound_guard",
             "gmp_arbitrary_precision_not_c_integer_overflow",
             "proc_percent_d_not_path_traversal",
+            "dynamic_growth_guarded_buffer",
         }))
 
-        if confirmed:
+        # Precision gate copied from the research-side behavior: dynamic capacity-growth
+        # guards can downgrade raw allocator/realloc residual concerns when no stronger
+        # target-relevant memory-bound signal remains.
+        if "dynamic_growth_guarded_buffer" in st.facts.safeties and not st.facts.risks.intersection({"fixed_buffer_unbounded_write", "pointer_advance_by_multiplication", "network_receive_without_visible_source_invariant", "listening_surface_without_visible_localhost_restriction"}):
+            high_risk = False
+
+        def _verification_family(v: Verification) -> str:
+            hyp = next((h for h in st.hypotheses if h.hypothesis_id == v.hypothesis_id), None)
+            return (hyp.family if hyp else "unknown")
+
+        if confirmed and not ("dynamic_growth_guarded_buffer" in st.facts.safeties and all(_verification_family(v) == "allocation" for v in confirmed)):
             pred = 1
             status = "confirmed_vulnerable"
             confidence = 0.80
@@ -895,18 +952,145 @@ class FullStageAgenticStudent:
             out.append(q)
         return out
 
-    def _query_action(self, st: SampleState, stage: str, queries: List[Dict[str, Any]], reason: str) -> Dict[str, Any]:
+    def _merge_planned_queries(self, *query_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge already-normalized/planned query lists without reusing the stateful
+        seen_query_keys set.  This is important because _dedupe_queries marks
+        queries as scheduled.  The previous version re-deduped llm+deterministic
+        lists and accidentally removed every query, causing the student agent to
+        jump directly to final_decision with queries=0.
+        """
+        out: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for query_list in query_lists:
+            for q in query_list or []:
+                if not isinstance(q, dict) or not q.get("kind"):
+                    continue
+                key = json.dumps(q, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(q)
+        return out
+
+
+    def _normalize_direction_value(self, value: Any) -> str:
+        d = str(value or "both").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases_in = {"in", "incoming", "inbound", "caller", "callers", "caller_constraints", "callers_of", "input", "source", "sources", "upstream", "predecessor", "predecessors"}
+        aliases_out = {"out", "outgoing", "outbound", "callee", "callees", "callees_of", "sink", "sinks", "downstream", "successor", "successors"}
+        aliases_both = {"both", "all", "either", "bidirectional", "neighbors", "neighborhood", "call_neighborhood"}
+        if d in aliases_in:
+            return "in"
+        if d in aliases_out:
+            return "out"
+        if d in aliases_both:
+            return "both"
+        # Safe default: keep the query valid rather than letting the KG API abort the sample.
+        return "both"
+
+    def _sanitize_query_for_api(self, q: Dict[str, Any], st: SampleState) -> Optional[Dict[str, Any]]:
+        if not isinstance(q, dict):
+            return None
+        nq = dict(q)
+        kind = str(nq.get("kind") or "").strip()
+        if kind not in {"security_context", "semantic_facts", "evidence_slice", "variable_flow", "call_neighborhood", "function_context"}:
+            return None
+        nq["kind"] = kind
+        nq.setdefault("target_function", st.fn)
+        nq.pop("query_text", None)
+        if kind == "call_neighborhood":
+            old = nq.get("direction")
+            nq["direction"] = self._normalize_direction_value(old)
+            if old != nq["direction"]:
+                st.add_trace("query_direction_normalized", {"old": old, "new": nq["direction"], "query": {k: v for k, v in nq.items() if k != "evidence"}})
+        if kind == "variable_flow" and not nq.get("symbol"):
+            return None
+        if kind == "evidence_slice" and not nq.get("target_statement"):
+            if st.facts.suspicious_statements:
+                nq["target_statement"] = st.facts.suspicious_statements[0][:240]
+            else:
+                return None
+        nq.setdefault("max_nodes", 350)
+        return nq
+
+    def _enqueue_query_action(self, st: SampleState, stage: str, queries: List[Dict[str, Any]], reason: str, next_stage: str, budget: Dict[str, Any]) -> Dict[str, Any]:
+        """Queue a full Research-Audit-style KG query plan and execute it across
+        evaluator rounds.  The evaluator can cap queries per round; this method
+        prevents the remaining planned queries from being silently discarded.
+        """
         if not queries:
-            return self._final_action(st, reason=f"no_queries_at_{stage}")
+            queries = [
+                {"kind": "security_context", "target_function": st.fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350, "query_id": f"fallback_{stage}_security_context"},
+                {"kind": "semantic_facts", "target_function": st.fn, "max_nodes": 300, "query_id": f"fallback_{stage}_semantic_facts"},
+                {"kind": "call_neighborhood", "target_function": st.fn, "direction": "both", "call_depth": 2, "max_nodes": 300, "query_id": f"fallback_{stage}_call_neighborhood"},
+            ]
+            st.add_trace(stage + "_fallback_queries", {"reason": "empty_query_plan_replaced_with_forced_fallback", "queries": queries})
+        sanitized: List[Dict[str, Any]] = []
+        seen_sanitized: set[str] = set()
+        for q in queries:
+            sq = self._sanitize_query_for_api(q, st)
+            if not sq:
+                continue
+            key = json.dumps(sq, sort_keys=True, default=str)
+            if key in seen_sanitized:
+                continue
+            seen_sanitized.add(key)
+            sanitized.append(sq)
+        if not sanitized:
+            sanitized = [
+                {"kind": "security_context", "target_function": st.fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350, "query_id": f"fallback_{stage}_security_context"},
+                {"kind": "semantic_facts", "target_function": st.fn, "max_nodes": 300, "query_id": f"fallback_{stage}_semantic_facts"},
+                {"kind": "call_neighborhood", "target_function": st.fn, "direction": "both", "call_depth": 2, "max_nodes": 300, "query_id": f"fallback_{stage}_call_neighborhood"},
+            ]
+            st.add_trace(stage + "_sanitized_fallback_queries", {"reason": "all_planned_queries_invalid_after_sanitization", "queries": sanitized})
+        st.pending_queries = list(sanitized)
+        st.pending_stage = stage
+        st.pending_reason = reason
+        st.pending_next_stage = next_stage
+        st.add_trace(stage + "_query_queue", {"planned_queries": len(st.pending_queries), "next_stage": next_stage})
+        return self._dequeue_query_action(st, budget)
+
+    def _dequeue_query_action(self, st: SampleState, budget: Dict[str, Any]) -> Dict[str, Any]:
+        per_round = int(budget.get("max_queries_per_round") or 1)
+        remaining_budget = int(budget.get("remaining_queries") or per_round)
+        n = max(1, min(per_round, remaining_budget, len(st.pending_queries)))
+        raw_batch = st.pending_queries[:n]
+        st.pending_queries = st.pending_queries[n:]
+        queries = []
+        for q in raw_batch:
+            sq = self._sanitize_query_for_api(q, st)
+            if sq:
+                queries.append(sq)
+        if not queries and st.pending_queries:
+            # Try one more valid query from the remaining queue instead of returning an empty/invalid batch.
+            while st.pending_queries and not queries:
+                sq = self._sanitize_query_for_api(st.pending_queries.pop(0), st)
+                if sq:
+                    queries.append(sq)
+        if not queries:
+            queries = [{"kind": "semantic_facts", "target_function": st.fn, "max_nodes": 300, "query_id": f"fallback_empty_batch_{stage}"}]
+        stage = st.pending_stage or "kg_query_batch"
+        reason = st.pending_reason or "Execute queued KG queries."
+        if not st.pending_queries:
+            st.stage = st.pending_next_stage or st.stage
+        else:
+            st.stage = stage + "_drain"
+        print(
+            f"student.agent.query_action | version={STUDENT_AGENT_VERSION} | stage={stage} | batch={n} | remaining_queued={len(st.pending_queries)} | next_stage={st.pending_next_stage} | reason={reason[:100]}",
+            flush=True,
+        )
         return {
             "action": "query",
             "stage": stage,
-            "reason": reason,
+            "reason": reason + (f" queued_remaining={len(st.pending_queries)}" if st.pending_queries else ""),
             "queries": queries,
             "agentic_trace": st.trace,
             "source_facts": st.facts.as_dict(),
             "hypotheses": [h.as_dict() for h in st.hypotheses],
         }
+
+    def _query_action(self, st: SampleState, stage: str, queries: List[Dict[str, Any]], reason: str) -> Dict[str, Any]:
+        # Compatibility wrapper for any legacy call sites.
+        return self._enqueue_query_action(st, stage, queries, reason, st.stage, {"max_queries_per_round": len(queries) or 1, "remaining_queries": len(queries) or 1})
 
     def _final_action(self, st: SampleState, reason: str) -> Dict[str, Any]:
         decision = self._final_decision(st, reason)
@@ -914,6 +1098,16 @@ class FullStageAgenticStudent:
         if llm_decision:
             decision.update(llm_decision)
             decision["llm_reviewed_final_decision"] = True
+        if "dynamic_growth_guarded_buffer" in st.facts.safeties and not st.facts.risks.intersection({"fixed_buffer_unbounded_write", "pointer_advance_by_multiplication", "network_receive_without_visible_source_invariant", "listening_surface_without_visible_localhost_restriction"}):
+            decision.update({
+                "prediction": 0,
+                "prediction_bool": False,
+                "confidence": min(float(decision.get("confidence", 0.7)), 0.75),
+                "decision_status": "forced_binary_non_vulnerable",
+                "reason": "LLM residual allocation concerns were downgraded by the deterministic precision gate: visible dynamic capacity-growth/realloc guard is present and no stronger target-relevant memory-bound signal remains.",
+                "explanation": "LLM residual allocation concerns were downgraded by the deterministic precision gate: visible dynamic capacity-growth/realloc guard is present and no stronger target-relevant memory-bound signal remains.",
+                "precision_gate_override": "dynamic_growth_guarded_buffer",
+            })
         st.add_trace("06_final_adjudication", decision)
         st.add_trace("final_decision", {"prediction": decision["prediction"], "confidence": decision["confidence"], "decision_status": decision["decision_status"]})
         return {
@@ -923,6 +1117,7 @@ class FullStageAgenticStudent:
             "reason": decision["reason"],
             "decision_status": decision["decision_status"],
             "stage": "final_decision",
+            "student_solution_version": STUDENT_AGENT_VERSION,
             "agentic_trace": st.trace,
             "final_adjudication": decision,
             "llm_config": decision.get("llm_config"),
@@ -941,8 +1136,105 @@ class FullStageAgenticStudent:
             "required": required,
         }
 
+    def _normalize_llm_queries_no_mark(self, st: SampleState, raw_queries: Any) -> List[Dict[str, Any]]:
+        """Normalize LLM query suggestions without touching st.seen_query_keys."""
+        if isinstance(raw_queries, dict):
+            raw_queries = [raw_queries]
+        if not isinstance(raw_queries, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        fn = st.fn
+        for q in raw_queries:
+            if isinstance(q, str):
+                sym = q.strip().strip('`"')
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", sym):
+                    q = {"kind": "variable_flow", "target_function": fn, "symbol": sym, "data_depth": 4, "max_nodes": 300}
+                else:
+                    continue
+            if not isinstance(q, dict):
+                continue
+            kind = str(q.get("kind") or q.get("query_kind") or q.get("type") or "").strip()
+            qt = str(q.get("query_text") or "")
+            if not kind and qt:
+                if qt.startswith("security_context"):
+                    kind = "security_context"
+                elif qt.startswith("semantic_facts"):
+                    kind = "semantic_facts"
+                elif qt.startswith("evidence_slice"):
+                    kind = "evidence_slice"
+                    m = re.search(r'target_statement="([^"]+)"', qt)
+                    if m:
+                        q["target_statement"] = m.group(1)
+                elif qt.startswith("variable_flow"):
+                    kind = "variable_flow"
+                    m = re.search(r'symbol="([^"]+)"', qt)
+                    if m:
+                        q["symbol"] = m.group(1)
+                elif qt.startswith("call_neighborhood"):
+                    kind = "call_neighborhood"
+                    m = re.search(r'direction="([^"]+)"', qt)
+                    if m:
+                        q["direction"] = m.group(1)
+                elif qt.startswith("function_context"):
+                    kind = "function_context"
+            if kind not in {"security_context", "semantic_facts", "evidence_slice", "variable_flow", "call_neighborhood", "function_context"}:
+                continue
+            nq = dict(q)
+            nq["kind"] = kind
+            nq.setdefault("target_function", fn)
+            nq.pop("query_text", None)
+            if kind == "variable_flow" and not nq.get("symbol"):
+                continue
+            if kind == "evidence_slice" and not nq.get("target_statement"):
+                if st.facts.suspicious_statements:
+                    nq["target_statement"] = st.facts.suspicious_statements[0][:240]
+                else:
+                    continue
+            if kind == "call_neighborhood":
+                nq["direction"] = self._normalize_direction_value(nq.get("direction") or "both")
+            nq.setdefault("max_nodes", 350)
+            out.append(nq)
+        # local-only dedupe
+        seen: set[str] = set()
+        deduped: List[Dict[str, Any]] = []
+        for q in out:
+            key = json.dumps(q, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key); deduped.append(q)
+        return deduped
+
+    def _llm_query_plan_no_mark(self, st: SampleState, deterministic_queries: List[Dict[str, Any]], stage: str = "02_kg_query_planning") -> List[Dict[str, Any]]:
+        obj = self._llm_json({
+            "stage": stage,
+            "task": f"{stage}: plan deterministic KG queries for the target function.",
+            "function": st.fn,
+            "source_excerpt": _compact(st.source, 5000),
+            "source_facts": st.facts.as_dict(),
+            "hypotheses": [h.as_dict() for h in st.hypotheses],
+            "existing_deterministic_queries": deterministic_queries,
+            "allowed_query_kinds": ["security_context", "semantic_facts", "evidence_slice", "variable_flow", "call_neighborhood", "function_context"],
+            "query_schema_examples": [
+                {"kind": "security_context", "target_function": st.fn, "depth": 3, "call_depth": 2, "data_depth": 4, "max_nodes": 350},
+                {"kind": "evidence_slice", "target_function": st.fn, "target_statement": "<exact suspicious statement>", "relation_depth": 4, "data_depth": 4, "control_depth": 3, "call_depth": 2, "max_nodes": 350},
+                {"kind": "variable_flow", "target_function": st.fn, "symbol": "<variable>", "data_depth": 4, "max_nodes": 300},
+                {"kind": "call_neighborhood", "target_function": st.fn, "direction": "both", "call_depth": 2, "max_nodes": 350},
+            ],
+            "rules": [
+                "Use only allowed query kinds.",
+                "Do not output free-form strings like length/raw/header; wrap variables as variable_flow queries.",
+                "Prioritize caller/input-control evidence, exact guard dominance evidence, and counter-evidence for high-risk hypotheses.",
+                "Do not use labels, commit messages, sample IDs, or benchmark metadata.",
+            ],
+            "output_schema": {"queries": "list of query objects", "reason": "short string"},
+        })
+        if not isinstance(obj, dict):
+            return []
+        qs = obj.get("queries") or obj.get("follow_up_queries") or []
+        return self._normalize_llm_queries_no_mark(st, qs)
+
     def _llm_query_plan(self, st: SampleState, deterministic_queries: List[Dict[str, Any]], stage: str = "02_kg_query_planning") -> List[Dict[str, Any]]:
         obj = self._llm_json({
+            "stage": stage,
             "task": f"{stage}: plan deterministic KG queries for the target function.",
             "function": st.fn,
             "source_excerpt": _compact(st.source, 5000),
@@ -971,6 +1263,7 @@ class FullStageAgenticStudent:
 
     def _llm_verify(self, st: SampleState, deterministic: List[Verification], iter_no: int) -> Optional[List[Verification]]:
         obj = self._llm_json({
+            "stage": f"04_hypothesis_verification_iter{iter_no}",
             "task": f"04_hypothesis_verification_iter{iter_no}: verify each hypothesis using source facts and KG evidence.",
             "function": st.fn,
             "source_excerpt": _compact(st.source, 5000),
@@ -1019,6 +1312,7 @@ class FullStageAgenticStudent:
     def _llm_evidence_gap_queries(self, st: SampleState, deterministic_queries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         unresolved = [v.as_dict() for v in st.verifications if v.local_risk_present and not v.confirmed_security_vulnerability]
         obj = self._llm_json({
+            "stage": "04_evidence_gap",
             "task": "04_evidence_gap: decide whether more KG evidence is needed and propose targeted follow-up queries.",
             "function": st.fn,
             "source_facts": st.facts.as_dict(),
@@ -1151,13 +1445,14 @@ class FullStageAgenticStudent:
                 else:
                     continue
             if kind == "call_neighborhood":
-                nq["direction"] = str(nq.get("direction") or "both")
+                nq["direction"] = self._normalize_direction_value(nq.get("direction") or "both")
             nq.setdefault("max_nodes", 350)
             out.append(nq)
         return self._dedupe_queries(st, out)
 
     def _llm_final_decision(self, st: SampleState, deterministic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         prompt = {
+            "stage": "06_final_adjudication",
             "task": "Review the student agent evidence and return a binary final vulnerability decision as JSON.",
             "function": st.fn,
             "source_excerpt": _compact(st.source, 5000),
@@ -1204,6 +1499,7 @@ class FullStageAgenticStudent:
 
     def _llm_hypotheses(self, st: SampleState, fallback: List[Hypothesis]) -> Optional[List[Hypothesis]]:
         prompt = {
+            "stage": "01_source_only_hypothesis",
             "task": "Generate 3-6 concise vulnerability hypotheses from source only.",
             "function": st.fn,
             "source": _compact(st.source, 6000),
@@ -1276,7 +1572,7 @@ class FullStageAgenticStudent:
         key = self.llm_api_key
         model = self.llm_model
         task = str(payload.get("task") or "student_llm_call")[:96]
-        stage = str(payload.get("task") or "student_llm_call").split(":", 1)[0][:64]
+        stage = str(payload.get("stage") or str(payload.get("task") or "student_llm_call").split(":", 1)[0])[:64]
         if not base or not key or not model:
             print(f"student.llm.skipped | stage={stage} | task={task} | reason=missing_config | base_present={bool(base)} | model_present={bool(model)} | key_env={getattr(self, 'llm_api_key_env', '')} | key_present={bool(key)}", flush=True)
             return None
