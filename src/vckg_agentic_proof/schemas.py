@@ -247,6 +247,10 @@ class ProofObligation(BaseModel):
     family: str = "generic"
     needed_symbols: List[str] = Field(default_factory=list)
     expected_evidence: str = ""
+    # How a "proven" result affects the hypothesis. Most obligations are
+    # positive: proving the obligation supports the vulnerability hypothesis.
+    # Counter obligations are negative: proving them refutes or weakens it.
+    polarity: str = "supports_hypothesis"
 
 
 class ProofObligationVerification(BaseModel):
@@ -258,6 +262,13 @@ class ProofObligationVerification(BaseModel):
     missing_evidence: List[str] = Field(default_factory=list)
     explanation: str = ""
     confidence: float = Field(0.5, ge=0.0, le=1.0)
+    # Controller-facing interpretation. These are intentionally separate from
+    # the generic proven/refuted enum because negative obligations such as
+    # "missing guard" are easy for LLMs to invert. If omitted, the reducer
+    # derives them deterministically from the obligation polarity and result.
+    supports_hypothesis: Optional[bool] = None
+    refutes_hypothesis: Optional[bool] = None
+    result_meaning: str = ""
 
 
 class ProofObligationVerificationEnvelope(BaseModel):
@@ -270,6 +281,16 @@ class HypothesisProofLedger(BaseModel):
     obligations: List[ProofObligation] = Field(default_factory=list)
     obligation_results: List[ProofObligationVerification] = Field(default_factory=list)
     status_hint: str = "incomplete"
+    # Research-audit proof tier.  This is intentionally separate from the
+    # binary decision status: a source-level parser proof can be strong even
+    # when caller reachability is only inferred from parser/deserializer context.
+    # Values used by the controller include:
+    #   incomplete | high_signal_incomplete | confirmed_source_level_vulnerability
+    #   confirmed_reachable_vulnerability | refuted
+    proof_tier: str = "incomplete"
+    # How strongly the external/trust-boundary part was established.
+    # none | partial | source_level | caller_proven | refuted
+    trust_boundary_strength: str = "none"
     required_proven: int = 0
     required_total: int = 0
     required_missing: List[str] = Field(default_factory=list)

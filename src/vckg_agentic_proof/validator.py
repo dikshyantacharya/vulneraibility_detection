@@ -516,8 +516,24 @@ def validate_final_decision(
     if decision.prediction == FinalPrediction.vulnerable:
         decision.forced_prediction = "vulnerable"
         decision.forced_prediction_bool = True
-        decision.decision_status = "confirmed_vulnerable"
-        decision.evidence_strength = "confirmed"
+        source_level_confirmed = any(
+            getattr(h, "confirmed_security_vulnerability", False)
+            and "confirmed_source_level_vulnerability" in str(getattr(h, "explanation", ""))
+            for h in (decision.final_hypothesis_statuses or [])
+        )
+        reachable_confirmed = any(
+            getattr(h, "confirmed_security_vulnerability", False)
+            and "confirmed_reachable_vulnerability" in str(getattr(h, "explanation", ""))
+            for h in (decision.final_hypothesis_statuses or [])
+        )
+        if source_level_confirmed and not reachable_confirmed:
+            decision.decision_status = "confirmed_source_level_vulnerable"
+            decision.evidence_strength = "confirmed_source_level"
+            if "Confirmed source-level vulnerability; explicit caller/public-entry exploitability evidence is a stricter tier." not in decision.limitations:
+                decision.limitations.append("Confirmed source-level vulnerability; explicit caller/public-entry exploitability evidence is a stricter tier.")
+        else:
+            decision.decision_status = "confirmed_vulnerable"
+            decision.evidence_strength = "confirmed"
     elif decision.prediction == FinalPrediction.fixed_or_non_vulnerable:
         decision.forced_prediction = "fixed/non-vulnerable"
         decision.forced_prediction_bool = False

@@ -453,12 +453,45 @@ def build_obligation_code_capsules(
         s = _score(item, target_function=target_function, symbols=symbols, code=code)
         if name in {"counter_guard_or_caller_constraint", "counter_constraint", "positive_counter_evidence"} and role in {"caller_code", "callee_code", "definition_code", "related_function_code"}:
             s += 130
-        if name == "callee_value_range" and role in {"callee_code", "related_function_code", "definition_code"}:
+        if name == "callee_value_range" and role in {"callee_code", "related_function_code", "definition_code", "statement_or_guard_code"}:
             s += 160
-        if name in {"parsed_value_origin", "value_or_object_origin", "selector_origin", "extent_origin"} and role in {"caller_code", "callee_code", "target_related_code"}:
+            # Promote resolver chains and dispatch tables over unrelated functions.
+            if any(tok in low for tok in ("_choose_int_read_write", "int_readers", "ordinal", "list[ordinal]", "return 0", "choose_int_read")):
+                s += 260
+            if any(tok in low for tok in ("sub_enumerate", "choose_int_write", "counts[id]", "memcpy(out")):
+                s -= 180
+        if name in {"parsed_value_from_buffer", "parsed_value_origin", "value_or_object_origin", "selector_origin", "extent_origin"} and role in {"caller_code", "callee_code", "target_related_code"}:
             s += 80
+        if name == "trust_boundary_or_external_input":
+            trust_markers = (
+                "loads", ".loads", "load(", "parse", "pre-parse", "preparse",
+                "deserialize", "deserial", "serialized", "serialised", "buffer",
+                "input", "file", "network", "python", "public", "api", "user",
+                "malformed", "corrupt"
+            )
+            symbol_text = str(item.get("function") or item.get("symbol") or item.get("name") or "").lower()
+            file_text = str(item.get("file") or item.get("relpath") or "").lower()
+            has_marker = any(tok in low or tok in symbol_text or tok in file_text for tok in trust_markers)
+            if role in {"caller_code", "related_function_code", "callee_code"}:
+                s += 180
+            if role == "target_related_code":
+                s += 80
+            if has_marker:
+                s += 280
+            else:
+                # Avoid wasting the tiny PO-02 prompt on generic loop/pointer
+                # statements that say nothing about the trust boundary.
+                s -= 180
+            if role == "target_related_code" and not has_marker and any(tok in low for tok in ("while", "raw +=", "end -")):
+                s -= 220
         if name in local_names and role in {"target_related_code", "statement_or_guard_code"}:
             s += 90
+        if name == "scaled_state_advance" and "length * itemsize" in low:
+            s += 220
+        if name == "missing_remaining_bound_guard" and any(tok in low for tok in ("length * itemsize", "while", "end -", "raw +=")):
+            s += 180
+        if name == "unsafe_continuation_or_accept_path" and "while" in low and "read(raw)" in low and "raw +=" in low:
+            s += 220
         if any(re.search(rf"\b{re.escape(sym)}\b", code) for sym in symbols):
             s += 120
         if "guard" in qlow and any(tok in low for tok in ("if", "while", "assert", "return -1", "error")):

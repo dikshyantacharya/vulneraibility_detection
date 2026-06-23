@@ -18,6 +18,7 @@ from .proof_obligations import (
     build_proof_obligations,
     infer_proof_family,
     obligation_queries,
+    normalize_obligation_result,
     summarize_ledger,
     verification_from_ledger,
 )
@@ -1307,7 +1308,12 @@ def run_agentic_proof_pipeline(
                                   details={"queries": len(hyp_query_dicts), "hypothesis_id": hyp_id}))
         hyp_retrieved = kg_search(hyp_query_dicts, sample=sample, limit=config.evidence_limit_per_query) if hyp_query_dicts else []
         events.append(AgentEvent(sample_id, retrieval_stage, "done",
-                                  details={"items": len(hyp_retrieved), "hypothesis_id": hyp_id}))
+                                  details={
+                                      "items": len(hyp_retrieved),
+                                      "kg_returned_items": len(hyp_retrieved),
+                                      "accepted_new_evidence_items": len(hyp_retrieved),
+                                      "hypothesis_id": hyp_id,
+                                  }))
         retrieved.extend(hyp_retrieved)
         accumulated_evidence.extend(hyp_retrieved)
         hyp_evidence = list(accumulated_evidence)
@@ -1373,7 +1379,12 @@ def run_agentic_proof_pipeline(
                     events.append(AgentEvent(sample_id, po_query_stage, "done", details={
                         "hypothesis_id": hyp_id,
                         "obligation_id": obligation.obligation_id,
+                        # Backward-compatible field retained for old report code.
                         "items": len(po_new_evidence),
+                        # Explicit accounting fields for debugging: KG returned
+                        # these items before code-capsule filtering/deduplication.
+                        "kg_returned_items": len(po_new_evidence),
+                        "accepted_new_evidence_items": len(po_new_evidence),
                     }))
                     if po_new_evidence:
                         hyp_evidence.extend(po_new_evidence)
@@ -1414,18 +1425,20 @@ def run_agentic_proof_pipeline(
                     }
                 try:
                     from .schemas import ProofObligationVerification
-                    obligation_results.append(ProofObligationVerification.model_validate(chosen))
+                    parsed_result = ProofObligationVerification.model_validate(chosen)
                 except Exception:
                     # Keep the pipeline robust: malformed micro-result becomes not_answered.
                     from .schemas import ProofObligationVerification
-                    obligation_results.append(ProofObligationVerification.model_validate({
+                    parsed_result = ProofObligationVerification.model_validate({
                         "obligation_id": obligation.obligation_id,
                         "hypothesis_id": hyp_id,
                         "result": "not_answered",
                         "missing_evidence": ["Malformed proof-obligation verification output."],
                         "explanation": "Malformed proof-obligation verification output.",
                         "confidence": 0.0,
-                    }))
+                    })
+                normalized_result = normalize_obligation_result(obligation, parsed_result, target_source=target_source)
+                obligation_results.append(normalized_result)
                 events.append(AgentEvent(sample_id, po_verif_stage, "ledger_update", details={
                     "hypothesis_id": hyp_id,
                     "obligation_id": obligation.obligation_id,
@@ -1435,8 +1448,11 @@ def run_agentic_proof_pipeline(
                     "evidence_ids": obligation_results[-1].evidence_ids,
                     "counter_evidence_ids": obligation_results[-1].counter_evidence_ids,
                     "missing_evidence": obligation_results[-1].missing_evidence,
+                    "supports_hypothesis": getattr(obligation_results[-1], "supports_hypothesis", None),
+                    "refutes_hypothesis": getattr(obligation_results[-1], "refutes_hypothesis", None),
+                    "result_meaning": getattr(obligation_results[-1], "result_meaning", ""),
                 }))
-            ledger = summarize_ledger(hyp_id, family, obligations, obligation_results)
+            ledger = summarize_ledger(hyp_id, family, obligations, obligation_results, target_source=target_source)
             latest_verification = verification_from_ledger(hypothesis, ledger)
             latest_verification, gate_notes = _gate_single_verification(latest_verification, hyp_evidence)
             if gate_notes:
@@ -1449,6 +1465,8 @@ def run_agentic_proof_pipeline(
                 "required_total": ledger.required_total,
                 "required_missing": ledger.required_missing,
                 "status_hint": ledger.status_hint,
+                "proof_tier": getattr(ledger, "proof_tier", None),
+                "trust_boundary_strength": getattr(ledger, "trust_boundary_strength", None),
                 "supporting_evidence_ids": ledger.supporting_evidence_ids,
                 "counter_evidence_ids": ledger.counter_evidence_ids,
                 "derived_status": latest_verification.get("status"),

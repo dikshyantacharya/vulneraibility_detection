@@ -642,9 +642,12 @@ def proof_obligation_verification_prompt(
             "You are a micro proof-obligation verifier for C/C++ security auditing. "
             "Answer exactly one narrow proof question using only the provided source-code capsules. "
             "Do not decide the entire vulnerability hypothesis. Do not speculate from missing evidence. "
-            "Return proven only when the code directly establishes this obligation. Return refuted only when positive source code contradicts this obligation. "
+            "Return proven only when the code directly establishes this exact obligation. Return refuted only when positive source code contradicts this exact obligation. "
+            "For negative safety obligations such as missing_remaining_bound_guard, proven means the required guard is absent; refuted means a concrete dominating guard exists. "
+            "For scaled_state_advance, answer only whether the data-dependent scaled advance exists; do not demand bounds, alignment, or safety evidence. "
+            "For unsafe_continuation_or_accept_path, a next loop iteration or parser-state reuse counts as later use; do not require a separate post-loop dereference. "
             "Return partially_proven when the capsule supports the obligation but one sub-element remains missing. Return not_answered when the capsules do not answer it. "
-            "Cite only capsule_id values from the source-code bundle. Never use graph scores, semantic labels, or unstated assumptions as proof."
+            "Fill supports_hypothesis/refutes_hypothesis if present in the schema. Cite only capsule_id values from the source-code bundle. Never use graph scores, semantic labels, or unstated assumptions as proof."
         )},
         {"role": "user", "content": (
             f"{COMMON_TAG_CONTRACT}\n\n"
@@ -655,6 +658,8 @@ def proof_obligation_verification_prompt(
             f"SOURCE CODE CAPSULES FOR THIS OBLIGATION:\n{compact_json(code_bundle, 10000)}\n\n"
             "Return exactly one object in verifications for the current obligation. "
             "Use result = proven | refuted | partially_proven | not_answered. "
+            "Interpret polarity exactly: if obligation.polarity is supports_hypothesis, a proven result supports the vulnerability; if it is refutes_hypothesis, a proven result is counter-evidence. "
+            "For missing_* obligations, missing safety checks are vulnerability support, not refutation. "
             "If result is not proven, list the precise missing_evidence needed for this obligation only."
         )},
     ]
