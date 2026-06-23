@@ -66,6 +66,48 @@ def _has_fact(evidence_items: Iterable[Any] | None, fact_type: str) -> bool:
     return fact_type in _source_fact_types(evidence_items)
 
 
+def _proof_tier_of_hypothesis(h: Any) -> str:
+    tier = str(getattr(h, "proof_tier", "") or "").strip()
+    if tier:
+        return tier
+    text = " ".join(str(getattr(h, k, "") or "") for k in ("explanation", "relevance_reason"))
+    for candidate in (
+        "confirmed_reachable_vulnerability",
+        "confirmed_source_level_vulnerability",
+        "high_signal_incomplete",
+        "refuted",
+    ):
+        if candidate in text:
+            return candidate
+    return "unknown"
+
+
+def _is_confirmed_tier(tier: str) -> bool:
+    return tier in {"confirmed_source_level_vulnerability", "confirmed_reachable_vulnerability"}
+
+
+def _counter_status_is_unsupported_for_tier(counter_status: Any, h: Any) -> bool:
+    """Counter-review recommendations only reject proof tiers when supported by
+    concrete refuting evidence. The structured CounterEvidenceReview currently
+    has no tier field, so a recommendation to downgrade source-level confirmation
+    is treated as advisory unless the hypothesis itself carries counter evidence.
+    """
+    if counter_status not in _UNSUPPORTED_COUNTER_STATUSES:
+        return False
+    tier = _proof_tier_of_hypothesis(h)
+    if _is_confirmed_tier(tier):
+        # Counter review can still be reflected as limitations, but not erase a
+        # completed proof tier without concrete counter evidence attached to the
+        # hypothesis. This mirrors the tier-aware controller logic.
+        return bool(getattr(h, "counter_evidence_ids", []) and counter_status in {
+            HypothesisStatus.refuted_by_guard,
+            HypothesisStatus.refuted_by_caller_constraint,
+            HypothesisStatus.refuted_by_patch_or_changed_logic,
+            HypothesisStatus.irrelevant_to_target_function,
+        })
+    return True
+
+
 def _joined_evidence_text(evidence_items: Iterable[Any] | None) -> str:
     parts: list[str] = []
     for item in evidence_items or []:
@@ -369,14 +411,22 @@ def validate_final_decision(
 
     usable_confirmed = []
     for h in decision.final_hypothesis_statuses:
-        if not (h.status == HypothesisStatus.confirmed_vulnerability and h.confirmed_security_vulnerability and h.proof.complete()):
+        tier = _proof_tier_of_hypothesis(h)
+        tier_confirmed = _is_confirmed_tier(tier)
+        if not (
+            h.status == HypothesisStatus.confirmed_vulnerability
+            and h.confirmed_security_vulnerability
+            and (h.proof.complete() or tier_confirmed)
+        ):
             continue
         counter_status = counter_by_h.get(h.hypothesis_id)
-        if counter_status in _UNSUPPORTED_COUNTER_STATUSES:
-            notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: counter-evidence review recommends {counter_status.value}.")
+        if _counter_status_is_unsupported_for_tier(counter_status, h):
+            notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: counter-evidence review recommends {counter_status.value} with concrete counter evidence.")
             continue
+        elif counter_status in _UNSUPPORTED_COUNTER_STATUSES and tier_confirmed:
+            notes.append(f"Preserved confirmed hypothesis {h.hypothesis_id}: proof_tier={tier} and counter-review did not provide tier-erasing counter evidence.")
         proof = h.proof
-        if any(_looks_non_specific(x) for x in [proof.input_control, proof.dangerous_operation, proof.missing_or_failed_guard, proof.unsafe_use, proof.security_impact]):
+        if not tier_confirmed and any(_looks_non_specific(x) for x in [proof.input_control, proof.dangerous_operation, proof.missing_or_failed_guard, proof.unsafe_use, proof.security_impact]):
             notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: proof chain contains generic or non-specific fields.")
             continue
         cited = {str(x) for x in (proof.cited_evidence_ids or []) if str(x).strip()}
@@ -399,6 +449,23 @@ def validate_final_decision(
             notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: {residual_reason}.")
             continue
         usable_confirmed.append(h)
+
+    # Proof tiers are controller-derived and take precedence over the final
+    # adjudicator's conservative fallback.  If a hypothesis completed a confirmed
+    # tier, the final decision must remain vulnerable and must report that tier.
+    if usable_confirmed and decision.prediction != FinalPrediction.vulnerable:
+        chosen = usable_confirmed[0]
+        tier = _proof_tier_of_hypothesis(chosen)
+        notes.append(f"Upgraded final prediction from {decision.prediction.value} using accepted proof tier {tier} on {chosen.hypothesis_id}.")
+        decision.prediction = FinalPrediction.vulnerable
+        decision.local_risk_present = True
+        decision.confirmed_security_vulnerability = True
+        decision.confidence = max(float(decision.confidence or 0.0), 0.75 if tier == "confirmed_source_level_vulnerability" else 0.85)
+        if decision.minimum_vulnerability_proof is None or not decision.minimum_vulnerability_proof.complete():
+            decision.minimum_vulnerability_proof = chosen.proof
+        if not decision.decisive_evidence_ids:
+            decision.decisive_evidence_ids = list(dict.fromkeys((chosen.proof.cited_evidence_ids or []) + (getattr(chosen, "supporting_evidence_ids", []) or [])))[:20]
+        modified = True
 
     if decision.prediction == FinalPrediction.vulnerable:
         if not usable_confirmed:
@@ -518,12 +585,12 @@ def validate_final_decision(
         decision.forced_prediction_bool = True
         source_level_confirmed = any(
             getattr(h, "confirmed_security_vulnerability", False)
-            and "confirmed_source_level_vulnerability" in str(getattr(h, "explanation", ""))
+            and _proof_tier_of_hypothesis(h) == "confirmed_source_level_vulnerability"
             for h in (decision.final_hypothesis_statuses or [])
         )
         reachable_confirmed = any(
             getattr(h, "confirmed_security_vulnerability", False)
-            and "confirmed_reachable_vulnerability" in str(getattr(h, "explanation", ""))
+            and _proof_tier_of_hypothesis(h) == "confirmed_reachable_vulnerability"
             for h in (decision.final_hypothesis_statuses or [])
         )
         if source_level_confirmed and not reachable_confirmed:

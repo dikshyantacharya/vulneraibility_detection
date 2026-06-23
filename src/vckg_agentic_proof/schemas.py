@@ -124,6 +124,12 @@ class HypothesisVerification(BaseModel):
     # old artifacts backward compatible and do not require the LLM to emit them.
     target_relevance: str = "unknown"  # high | medium | low | unrelated | unknown
     relevance_reason: str = ""
+    # First-class proof-ledger tier fields. These make the later counter-review
+    # and final validator consume the controller's typed proof state instead of
+    # reparsing free-text explanations.
+    proof_tier: str = "unknown"  # incomplete | high_signal_incomplete | confirmed_source_level_vulnerability | confirmed_reachable_vulnerability | refuted
+    trust_boundary_strength: str = "none"  # none | partial | source_level | caller_proven | refuted
+    accepted_confirmed: bool = False
 
 class CounterEvidenceFinding(BaseModel):
     hypothesis_id: str

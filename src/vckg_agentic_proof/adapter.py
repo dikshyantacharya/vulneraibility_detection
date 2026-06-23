@@ -811,6 +811,44 @@ def _verification_missing_is_blocking(missing: List[Any] | None) -> bool:
     return bool([m for m in (missing or []) if str(m).strip()])
 
 
+def _proof_tier_of_verification(v: Dict[str, Any]) -> str:
+    tier = str(v.get("proof_tier") or "").strip()
+    if tier:
+        return tier
+    text = " ".join(str(v.get(k) or "") for k in ("explanation", "relevance_reason"))
+    for candidate in (
+        "confirmed_reachable_vulnerability",
+        "confirmed_source_level_vulnerability",
+        "high_signal_incomplete",
+        "refuted",
+    ):
+        if candidate in text:
+            return candidate
+    return "unknown"
+
+
+def _is_confirmed_proof_tier(tier: str) -> bool:
+    return tier in {"confirmed_source_level_vulnerability", "confirmed_reachable_vulnerability"}
+
+
+def _counter_finding_has_concrete_refutation(f: Dict[str, Any]) -> bool:
+    """Return true only for counter-review findings that can erase a proof tier."""
+    text = " ".join(str(f.get(k) or "") for k in ("strongest_counterargument", "refutes_or_weakens", "recommended_status")).lower()
+    counter_ids = [str(x).strip() for x in (f.get("counter_evidence_ids") or []) if str(x).strip()]
+    negative_uncertainty = (
+        "missing", "not shown", "not proven", "unproven", "unknown", "no capsule",
+        "lacks explicit", "insufficient", "cannot confirm", "not answered", "partial",
+    )
+    positive_refutation = (
+        "dominating guard", "positive guard", "bounds check", "range check", "overflow check",
+        "makes the dangerous state unreachable", "cannot overflow", "fully bounded",
+        "safe invariant", "refutes", "prevents", "rejects invalid", "return before",
+    )
+    if any(m in text for m in negative_uncertainty) and not any(m in text for m in positive_refutation):
+        return False
+    return bool(counter_ids) and any(m in text for m in positive_refutation)
+
+
 def _gate_single_verification(verification: Dict[str, Any], evidence: List[Dict[str, Any]] | None) -> tuple[Dict[str, Any], List[str]]:
     """Apply a deterministic proof gate to one LLM verification object.
 
@@ -839,10 +877,12 @@ def _gate_single_verification(verification: Dict[str, Any], evidence: List[Dict[
         reasons.append("proof_has_no_cited_evidence_ids")
     if missing_ids:
         reasons.append(f"proof_cites_unknown_evidence_ids={missing_ids[:8]}")
-    if _verification_missing_is_blocking(v.get("missing_evidence") or []):
-        reasons.append("verification_still_lists_missing_evidence")
-    if any(marker in uncertainty for marker in ("unproven", "unknown", "no evidence", "not proven", "assumed", "unclear")):
-        reasons.append("input_control_field_is_uncertain")
+    tier = _proof_tier_of_verification(v)
+    if not _is_confirmed_proof_tier(tier):
+        if _verification_missing_is_blocking(v.get("missing_evidence") or []):
+            reasons.append("verification_still_lists_missing_evidence")
+        if any(marker in uncertainty for marker in ("unproven", "unknown", "no evidence", "not proven", "assumed", "unclear")):
+            reasons.append("input_control_field_is_uncertain")
 
     if reasons:
         old_status = v.get("status")
@@ -859,12 +899,12 @@ def _apply_counter_review_to_verifications(
     verifications: Dict[str, Any],
     counter_review: Any,
 ) -> tuple[Dict[str, Any], List[str]]:
-    """Downgrade/annotate hypothesis states using counter-review output.
+    """Downgrade/annotate hypothesis states using tier-aware counter-review.
 
-    This prevents a raw per-hypothesis confirmation from remaining final if a
-    later defense pass found a relevant guard, caller constraint, or other
-    counter-evidence.  The controller uses this normalized proof state for the
-    final adjudicator and report.
+    Counter-review may refute a hypothesis only with positive source evidence
+    that protects the same value/object and dominates the same dangerous
+    operation, or proves the dangerous state unreachable. Missing stricter
+    reachability/callee evidence must not erase a completed source-level proof.
     """
     findings = []
     if hasattr(counter_review, "model_dump"):
@@ -889,9 +929,17 @@ def _apply_counter_review_to_verifications(
         HypothesisStatus.irrelevant_to_target_function.value,
         HypothesisStatus.insufficient_evidence.value,
     }
+    refuting_statuses = {
+        HypothesisStatus.refuted_by_guard.value,
+        HypothesisStatus.refuted_by_caller_constraint.value,
+        HypothesisStatus.refuted_by_patch_or_changed_logic.value,
+        HypothesisStatus.irrelevant_to_target_function.value,
+    }
+
     for item in list((verifications or {}).get("verifications") or []):
         v = dict(item or {})
         hid = str(v.get("hypothesis_id") or "").strip()
+        tier = _proof_tier_of_verification(v)
         for f in by_h.get(hid, []):
             rec = f.get("recommended_status")
             rec_val = rec.value if hasattr(rec, "value") else str(rec or "")
@@ -900,26 +948,43 @@ def _apply_counter_review_to_verifications(
             if counter_ids:
                 merged = list(dict.fromkeys(list(v.get("counter_evidence_ids") or []) + counter_ids))
                 v["counter_evidence_ids"] = merged
-            if rec_val in unsupported and (
+
+            wants_downgrade = rec_val in unsupported and (
                 v.get("status") == HypothesisStatus.confirmed_vulnerability.value
                 or v.get("confirmed_security_vulnerability")
                 or "refut" in refutes
                 or "weaken" in refutes
-            ):
-                old = v.get("status")
-                v["status"] = rec_val
-                v["confirmed_security_vulnerability"] = False
-                if rec_val in {HypothesisStatus.refuted_by_guard.value, HypothesisStatus.refuted_by_caller_constraint.value, HypothesisStatus.refuted_by_patch_or_changed_logic.value, HypothesisStatus.irrelevant_to_target_function.value}:
-                    v["local_risk_present"] = False
-                    v["missing_evidence"] = []
-                else:
-                    miss = list(v.get("missing_evidence") or [])
-                    miss.append("Counter-review downgraded the raw confirmation; proof state is not accepted_confirmed.")
-                    v["missing_evidence"] = miss
-                notes.append(f"counter_review_updated {hid}: {old} -> {rec_val}")
+            )
+            if not wants_downgrade:
+                continue
+
+            concrete_refutation = _counter_finding_has_concrete_refutation(f)
+            if _is_confirmed_proof_tier(tier) and not concrete_refutation:
+                v["status"] = HypothesisStatus.confirmed_vulnerability.value
+                v["confirmed_security_vulnerability"] = True
+                v["accepted_confirmed"] = True
+                notes.append(
+                    f"counter_review_preserved {hid}: tier={tier}; finding lacked concrete same-operation counter-evidence"
+                )
+                continue
+
+            old = v.get("status")
+            v["status"] = rec_val
+            v["confirmed_security_vulnerability"] = False
+            v["accepted_confirmed"] = False
+            if rec_val in refuting_statuses:
+                v["local_risk_present"] = False
+                v["proof_tier"] = "refuted"
+                v["missing_evidence"] = []
+            else:
+                miss = list(v.get("missing_evidence") or [])
+                miss.append("Counter-review downgraded the confirmation with concrete counter-evidence; proof state is not accepted_confirmed.")
+                v["missing_evidence"] = miss
+                if _is_confirmed_proof_tier(tier):
+                    v["proof_tier"] = "high_signal_incomplete"
+            notes.append(f"counter_review_updated {hid}: {old} -> {rec_val}")
         out_items.append(v)
     return {"verifications": out_items}, notes
-
 
 @dataclass
 class AgenticProofConfig:

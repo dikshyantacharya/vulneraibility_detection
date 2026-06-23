@@ -179,3 +179,57 @@ def test_parser_context_trust_boundary_gives_source_level_confirmation_without_c
     assert verification["status"] == "confirmed_vulnerability"
     assert verification["confirmed_security_vulnerability"] is True
     assert "confirmed_source_level_vulnerability" in verification["explanation"]
+
+
+def test_family_assignment_uses_hypothesis_not_target_source_for_secondary_issues():
+    src = """
+    int count_rows(void * raw, int length_power, int itemsize) {
+      uint64_t length = read(raw);
+      raw += length * itemsize;
+      while (raw <= end - (1 << length_power)) {}
+    }
+    """
+    signed_hyp = {
+        "hypothesis_id": "HYP-02",
+        "title": "Signed integer misinterpretation in read leading to negative length",
+        "affected_code_region": "uint64_t length = read(raw);",
+        "risk_summary": "If read returns a signed negative value, conversion to uint64_t yields a huge length.",
+    }
+    selector_hyp = {
+        "hypothesis_id": "HYP-03",
+        "title": "Insufficient bounds checking for length_power leading to out-of-bounds read",
+        "affected_code_region": "while (raw <= end - (1 << length_power))",
+        "risk_summary": "length_power controls a shift and dispatch width without a domain guard.",
+    }
+    assert infer_proof_family(signed_hyp, src) == "callee_return_signedness_or_value_range"
+    assert infer_proof_family(selector_hyp, src) == "selector_shift_domain_or_dispatch_bounds"
+    assert "return_signedness_or_value_range" in [o.name for o in build_proof_obligations(signed_hyp, src)]
+    assert "shift_or_dispatch_expression" in [o.name for o in build_proof_obligations(selector_hyp, src)]
+
+
+def test_missing_guard_inversion_is_fixed_even_when_llm_says_refuted():
+    hyp = {
+        "hypothesis_id": "HYP-02",
+        "title": "signed read value later used unsafely",
+        "affected_code_region": "uint64_t length = read(raw);",
+        "risk_summary": "returned length is converted and later used without a post-read range check",
+    }
+    src = """
+    uint64_t length = read(raw);
+    raw += length * itemsize;
+    """
+    obligations = build_proof_obligations(hyp, src)
+    missing = next(o for o in obligations if o.name == "missing_post_read_range_check")
+    result = ProofObligationVerification(
+        obligation_id=missing.obligation_id,
+        hypothesis_id="HYP-02",
+        result="refuted",
+        evidence_ids=["TARGET-SOURCE"],
+        missing_evidence=["guard ensuring length * itemsize <= remaining_space", "overflow check for length * itemsize"],
+        explanation="No dominating guard exists after read(raw); the code does not validate length before pointer arithmetic.",
+    )
+    ledger = summarize_ledger("HYP-02", missing.family, obligations, [result], target_source=src)
+    normalized = ledger.obligation_results[0]
+    assert normalized.result == "proven"
+    assert normalized.supports_hypothesis is True
+    assert normalized.refutes_hypothesis is False

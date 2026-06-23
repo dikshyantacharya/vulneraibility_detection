@@ -408,6 +408,8 @@ def counter_evidence_prompt(
         {"role": "system", "content": (
             "You are the defense reviewer. Try to falsify each non-refuted hypothesis using only concrete source code. "
             "Positive counter-evidence must protect the same value/object and dominate the same dangerous operation, or must show a caller/callee invariant that makes the dangerous state unreachable. "
+            "Be proof-tier aware: confirmed_source_level_vulnerability means the local source-code vulnerability mechanism is proven; missing stricter caller/I/O exploitability evidence is a limitation, not a refutation. "
+            "Recommend downgrading a confirmed proof tier only when you can cite concrete counter-evidence that contradicts one of its required obligations. "
             "Missing proof weakens confirmation but is not itself safety. Do not use graph scores, summaries, or unstated assumptions. "
             "If counter-evidence only weakens the proof, say weakens rather than refutes."
         )},
@@ -445,7 +447,8 @@ def final_decision_prompt(
             "Final adjudicator. Output compact valid JSON only inside <answer>. "
             "You MUST choose exactly one binary prediction: vulnerable or fixed/non-vulnerable. "
             "Use only the structured verifications, counter-review findings, and source-code evidence capsules. "
-            "Choose vulnerable only when at least one hypothesis has a complete cited proof after proof-gate validation: input/control source, dangerous operation, missing/failed dominating guard, reachable unsafe use, and security impact. "
+            "Choose vulnerable when at least one hypothesis has a complete cited proof after proof-gate validation: input/control source, dangerous operation, missing/failed dominating guard, reachable unsafe use, and security impact. "
+            "Also choose vulnerable when a verification carries proof_tier=confirmed_source_level_vulnerability or proof_tier=confirmed_reachable_vulnerability; preserve that tier in decision_status/evidence_strength instead of downgrading to forced binary. "
             "Choose fixed/non-vulnerable when hypotheses are refuted by positive code evidence or remain unproven after the bounded per-hypothesis retrieval loop; local risk without complete proof is not confirmed vulnerability. "
             "Never treat missing attacker-control evidence alone as safety evidence, and never use dataset labels, commit messages, graph scores, or raw metadata. "
             "For each final_hypothesis_statuses entry, always output a proof object; never output proof:null. Cite evidence IDs only."

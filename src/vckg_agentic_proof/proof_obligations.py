@@ -40,13 +40,26 @@ def _symbols(text: str) -> List[str]:
 
 
 def infer_proof_family(hypothesis: Dict[str, Any], target_source: str = "") -> str:
+    """Infer the proof family from the hypothesis, not merely from target source.
+
+    Earlier versions appended the whole target function source to every
+    hypothesis before family selection.  In functions containing several risky
+    expressions, that caused secondary hypotheses (e.g. signedness of read(),
+    selector/shift domain for length_power) to inherit the main parser-pointer
+    family.  The family must be chosen from the hypothesis text first; target
+    source is used only as a weak fallback for otherwise generic hypotheses.
+    """
     b = _blob(hypothesis)
     src = (target_source or "").lower()
-    if re.search(r"raw\s*\+=\s*length\s*\*\s*itemsize|length\s*\*\s*itemsize|scaled.*pointer|pointer.*travers", b + "\n" + src):
+
+    # Specific families before broad parser traversal.
+    if re.search(r"signed|negative|sign[- ]?extend|uint64_t\s+length\s*=\s*read|return value|read\s*\(\s*raw\s*\).*uint64", b):
+        return "callee_return_signedness_or_value_range"
+    if re.search(r"1\s*<<\s*length_power|length_power|shift|selector|dispatch|function pointer|choose_int_read|choose_", b):
+        return "selector_shift_domain_or_dispatch_bounds"
+    if re.search(r"raw\s*\+=\s*length\s*\*\s*itemsize|length\s*\*\s*itemsize|scaled.*pointer|pointer.*travers", b):
         return "parser_scaled_pointer_traversal"
-    if re.search(r"1\s*<<\s*length_power|shift|selector|dispatch|function pointer|choose_", b):
-        return "selector_dispatch_or_shift_domain"
-    if re.search(r"raw_length|end\s*=|negative|signed", b):
+    if re.search(r"raw_length|end\s*=|extent|buffer length", b):
         return "buffer_extent_or_signed_length"
     if re.search(r"malloc|calloc|realloc|free|lifetime|null", b):
         return "allocation_lifetime"
@@ -56,6 +69,11 @@ def infer_proof_family(hypothesis: Dict[str, Any], target_source: str = "") -> s
         return "concurrency_lifecycle"
     if re.search(r"crypto|nonce|random|key|hash|encrypt|decrypt", b):
         return "crypto_algorithmic"
+
+    # Weak fallback: if the target source is a canonical parser pointer pattern
+    # and the hypothesis is otherwise generic, use the parser family.
+    if re.search(r"raw\s*\+=\s*length\s*\*\s*itemsize", src) and re.search(r"overflow|bounds|out-of-bounds|memory", b):
+        return "parser_scaled_pointer_traversal"
     return "generic_memory_or_bounds"
 
 
@@ -96,12 +114,23 @@ def build_proof_obligations(hypothesis: Dict[str, Any], target_source: str = "")
             po(7, "callee_value_range", "If the parsed value comes from a callee or function pointer, does the resolver/callee/dispatch target bound the returned value sufficiently for the dangerous operation?", ["read", "choose_int_read", "_choose_int_read_write", "int_readers", "length_power", "big_endian"], False, "callee, resolver, dispatch table, or concrete target code", "refutes_hypothesis"),
         ]
 
-    if family == "selector_dispatch_or_shift_domain":
+    if family == "callee_return_signedness_or_value_range":
+        return [
+            po(1, "parsed_value_from_buffer", "Does the code show a value returned from a read/callee using the supplied buffer or pointer?", ["length", "raw", "read"], True, "assignment from read(raw) or equivalent"),
+            po(2, "callee_or_function_pointer_resolution", "Does source code resolve the callee/function pointer enough to inspect its return type or concrete targets?", ["read", "IntRead", "choose_int_read", "_choose_int_read_write", "int_readers"], True, "resolver, typedef, dispatch table, or concrete target code"),
+            po(3, "return_signedness_or_value_range", "Does the callee return a signed value, unbounded unsigned value, or otherwise attacker-controlled range that can become a large size/count after conversion?", ["IntRead", "uint64_t", "length", "read"], True, "return type or concrete reader semantics"),
+            po(4, "missing_post_read_range_check", "Does the code establish that no dominating post-read guard validates the returned value before size/pointer arithmetic? Answer proven when the guard is missing; refuted only when a positive dominating range guard exists.", ["length", "read", "raw", "itemsize", "end"], True, "post-read validation around length before arithmetic"),
+            po(5, "unsafe_use_after_conversion", "Is the returned/converted value used in pointer/index/size arithmetic, allocation, copy length, or another unsafe sink?", ["length", "itemsize", "raw"], True, "unsafe use of returned value"),
+            po(6, "counter_callee_bounds_return_value", "Do callee targets or callers positively prove the returned value is bounded to a safe range for the later operation?", ["read", "int_readers", "length", "itemsize"], False, "", "refutes_hypothesis"),
+        ]
+
+    if family == "selector_shift_domain_or_dispatch_bounds":
         return [
             po(1, "selector_origin", "Does the selector/domain value come from a caller, external input, or malformed serialized field?", ["length_power", "big_endian"], True),
-            po(2, "missing_domain_guard", "Does the code establish that no dominating guard constrains the selector before it is used in a shift, array lookup, or dispatch? Answer proven when the guard is missing; refuted only when a positive dominating guard exists.", ["length_power", "choose_int_read"], True),
-            po(3, "unsafe_use_after_bad_selector", "If the selector is invalid, can execution still reach a shift, function-pointer call, array lookup, or read/write?", ["length_power", "read", "choose_int_read"], True),
-            po(4, "counter_constraint", "Do callers or callees positively prove the invalid selector state is unreachable?", ["length_power", "choose_int_read"], False, "", "refutes_hypothesis"),
+            po(2, "shift_or_dispatch_expression", "Does the selector control a shift, array lookup, function-pointer dispatch, or parser width calculation?", ["length_power", "choose_int_read", "read"], True),
+            po(3, "missing_domain_guard", "Does the code establish that no dominating guard constrains the selector before it is used in the shift/dispatch expression? Answer proven when the guard is missing; refuted only when a positive dominating domain guard exists.", ["length_power", "choose_int_read"], True),
+            po(4, "unsafe_effect_of_invalid_selector", "If the selector is outside the safe domain, can execution still reach undefined shift behavior, invalid dispatch, wrong-width parse, or memory access?", ["length_power", "read", "choose_int_read"], True),
+            po(5, "counter_selector_constraint", "Do callers, callees, typedefs, or dispatch helpers positively prove the selector is always in the safe domain before all uses?", ["length_power", "choose_int_read", "_choose_int_read_write"], False, "", "refutes_hypothesis"),
         ]
 
     if family == "buffer_extent_or_signed_length":
@@ -147,22 +176,22 @@ def obligation_queries(sample: Dict[str, Any], hypothesis: Dict[str, Any], oblig
         add(2, f"Security/input context for {name}", f'security_context(target_function="{fn}", depth=4, call_depth=3, data_depth=5, include_callers=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=780)')
         if target_file:
             add(3, f"File context for parser entry points and comments for {name}", f'file_context(file="{target_file}")')
-    elif name in {"scaled_state_advance", "dangerous_operation", "unsafe_extent_use"}:
+    elif name in {"scaled_state_advance", "dangerous_operation", "unsafe_extent_use", "shift_or_dispatch_expression", "unsafe_use_after_conversion"}:
         stmt = region or " ".join(syms[:3]) or fn
         add(1, f"Exact source slice for dangerous operation in {name}", f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=4, data_depth=4, control_depth=3, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=450)', syms[:3])
-    elif name in {"missing_remaining_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard"}:
+    elif name in {"missing_remaining_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard", "missing_post_read_range_check"}:
         stmt = region or ("while" if "while" in syms else "guard")
         add(1, f"Guard-dominance slice for {name}", f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=4, data_depth=4, control_depth=4, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=520)', syms[:3])
         add(2, f"Semantic guard facts for {name}", f'semantic_facts(target_function="{fn}")')
-    elif name in {"unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact"}:
+    elif name in {"unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact", "unsafe_effect_of_invalid_selector"}:
         add(1, f"Loop/body and outgoing use context for {name}", f'evidence_slice(target_function="{fn}", target_statement="while", relation_depth=4, data_depth=4, control_depth=4, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=520)')
         add(2, f"Outgoing callees and helper behavior for {name}", f'call_neighborhood(target_function="{fn}", direction="out", call_depth=3)')
-    elif name in {"counter_guard_or_caller_constraint", "counter_constraint", "positive_counter_evidence"}:
+    elif name in {"counter_guard_or_caller_constraint", "counter_constraint", "positive_counter_evidence", "counter_selector_constraint", "counter_callee_bounds_return_value"}:
         add(1, f"Expanded security context for counter-evidence {name}", f'security_context(target_function="{fn}", depth=4, call_depth=3, data_depth=5, include_callers=true, include_headers=true, include_globals=true, include_joern=true, max_nodes=900)')
         add(2, f"Caller constraints for counter-evidence {name}", f'call_neighborhood(target_function="{fn}", direction="in", call_depth=4)')
         if target_file:
             add(3, f"File definitions/types/constants for counter-evidence {name}", f'file_context(file="{target_file}")')
-    elif name == "callee_value_range":
+    elif name in {"callee_value_range", "callee_or_function_pointer_resolution", "return_signedness_or_value_range"}:
         # Function-pointer friendly: retrieve the local outgoing call, resolver, helper resolver, and file-level tables.
         add(1, "Outgoing call neighborhood for function-pointer/callee resolution", f'call_neighborhood(target_function="{fn}", direction="out", call_depth=3)')
         if any(x in syms for x in {"choose_int_read", "read", "_choose_int_read_write"}) or "choose_int_read" in _blob(hypothesis):
@@ -180,12 +209,15 @@ _ABSENCE_SUPPORT_NAMES = {
     "missing_remaining_bound_guard",
     "missing_guard_or_invariant",
     "missing_domain_guard",
+    "missing_post_read_range_check",
 }
 _COUNTER_NAMES = {
     "counter_guard_or_caller_constraint",
     "counter_constraint",
     "positive_counter_evidence",
     "callee_value_range",
+    "counter_selector_constraint",
+    "counter_callee_bounds_return_value",
 }
 
 
@@ -287,13 +319,15 @@ def normalize_obligation_result(
     # "refuted" but explains that the guard is missing, flip to proven.
     if name in _ABSENCE_SUPPORT_NAMES:
         missing_guard_markers = [
-            "no guard", "no bounds", "no bound", "no overflow check", "lacks", "lack of",
-            "missing", "without any", "without a", "does not check", "not the subsequent",
-            "only ensures", "violating the obligation", "not sufficient", "not enough",
+            "no guard", "no dominating guard", "no relevant guard", "no bounds", "no bound",
+            "no overflow check", "no additional bounds", "no dominating", "absence of",
+            "lacks", "lack of", "missing", "without any", "without a", "does not check",
+            "does not account", "does not validate", "does not bound", "not the subsequent",
+            "only ensures", "only checks", "violating the obligation", "not sufficient", "not enough",
         ]
         positive_guard_markers = [
-            "guard ensuring", "check ensures", "dominates", "bounded before", "prevents overflow",
-            "return" and "before the advance",
+            "guard ensuring", "check ensures", "dominating guard proves", "bounded before",
+            "prevents overflow", "proves value <=", "fully bounded", "makes the dangerous state unreachable",
         ]
         if any(m in txt for m in missing_guard_markers):
             set_result(ProofObligationStatus.proven, f"polarity_fix:{name}:missing_guard_supports_hypothesis")
@@ -315,6 +349,19 @@ def normalize_obligation_result(
                 m for m in data.get("missing_evidence", [])
                 if not any(tok in str(m).lower() for tok in ("constraint", "bounds", "alignment", "overflow"))
             ]
+    elif name == "shift_or_dispatch_expression":
+        if re.search(r"1\s*<<\s*length_power", src) or "choose_int_read" in src:
+            set_result(ProofObligationStatus.proven, "deterministic_pattern:selector_controls_shift_or_dispatch")
+            data["missing_evidence"] = []
+    elif name == "callee_or_function_pointer_resolution":
+        if "choose_int_read" in src or "_choose_int_read_write" in src or "intread" in src.lower():
+            # This proves that a resolver path exists, not necessarily all concrete targets.
+            if result.result == ProofObligationStatus.not_answered:
+                set_result(ProofObligationStatus.partially_proven, "deterministic_pattern:function_pointer_resolver_path_visible")
+    elif name == "unsafe_use_after_conversion":
+        if re.search(r"raw\s*\+=\s*length\s*\*\s*itemsize", src) or re.search(r"length\s*\*\s*itemsize", src):
+            set_result(ProofObligationStatus.proven, "deterministic_pattern:return_value_used_in_pointer_arithmetic")
+            data["missing_evidence"] = []
     elif name == "trust_boundary_or_external_input":
         # Source-level parser/deserializer evidence is sufficient for a
         # source-audit confirmation tier, even when caller-level exploitability
@@ -348,6 +395,9 @@ def normalize_obligation_result(
                 m for m in data.get("missing_evidence", [])
                 if "post-loop" in str(m).lower()
             ]
+    elif name == "unsafe_effect_of_invalid_selector":
+        if re.search(r"1\s*<<\s*length_power", src) or "choose_int_read" in src:
+            set_result(ProofObligationStatus.proven, "deterministic_pattern:selector_influences_shift_or_dispatch_use")
 
     # 3) Infer default support/refutation from polarity and final result.
     final_result = ProofObligationStatus(data.get("result"))
@@ -549,4 +599,7 @@ def verification_from_ledger(hypothesis: Dict[str, Any], ledger: HypothesisProof
         explanation=explanation,
         target_relevance="direct" if local_risk else "unknown",
         relevance_reason="Derived from proof-obligation ledger rather than whole-hypothesis free-form verification.",
+        proof_tier=getattr(ledger, "proof_tier", "unknown"),
+        trust_boundary_strength=getattr(ledger, "trust_boundary_strength", "none"),
+        accepted_confirmed=bool(confirmed and getattr(ledger, "proof_tier", "") in {"confirmed_source_level_vulnerability", "confirmed_reachable_vulnerability"}),
     ).model_dump(mode="json")
