@@ -492,6 +492,9 @@ class AgenticProofRuntimeConfig(BaseModel):
     # time on later hypotheses when the binary vulnerability decision is already
     # source-grounded.
     stop_on_confirmed_vulnerability: bool = True
+    # binary | reachable | exhaustive.  Use exhaustive for architecture testing
+    # when later hypotheses should be checked even after an accepted confirmed proof.
+    audit_mode: str = "binary"
     enable_counter_evidence_loop: bool = False
     max_counter_iterations: int = 2
 

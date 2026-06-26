@@ -429,7 +429,7 @@ def build_obligation_code_capsules(
     # Always include the target source only for obligations where local context is
     # itself the evidence. Otherwise prefer slices/callees/callers first to avoid
     # repeating the full function in every micro-call.
-    local_names = {"scaled_state_advance", "missing_remaining_bound_guard", "unsafe_continuation_or_accept_path", "dangerous_operation", "missing_guard_or_invariant", "domain_guard", "unsafe_extent_use"}
+    local_names = {"scaled_state_advance", "missing_remaining_bound_guard", "missing_pre_advance_bound_guard", "unsafe_continuation_or_accept_path", "unblocked_unsafe_continuation_or_accept_path", "dangerous_operation", "missing_guard_or_invariant", "domain_guard", "unsafe_extent_use"}
     if target_source.strip() and (name in local_names or not raw):
         selected.append({
             "capsule_id": "TARGET-SOURCE",
@@ -488,10 +488,12 @@ def build_obligation_code_capsules(
             s += 90
         if name == "scaled_state_advance" and "length * itemsize" in low:
             s += 220
-        if name == "missing_remaining_bound_guard" and any(tok in low for tok in ("length * itemsize", "while", "end -", "raw +=")):
+        if name in {"missing_remaining_bound_guard", "missing_pre_advance_bound_guard"} and any(tok in low for tok in ("length * itemsize", "while", "end -", "raw +=")):
             s += 180
-        if name == "unsafe_continuation_or_accept_path" and "while" in low and "read(raw)" in low and "raw +=" in low:
+        if name in {"unsafe_continuation_or_accept_path", "unblocked_unsafe_continuation_or_accept_path"} and "while" in low and "read(raw)" in low and "raw +=" in low:
             s += 220
+        if name in {"unblocked_unsafe_continuation_or_accept_path", "counter_guard_or_caller_constraint"} and any(tok in low for tok in ("raw >= start", "start = raw", "raw == end", "return -1")):
+            s += 260
         if any(re.search(rf"\b{re.escape(sym)}\b", code) for sym in symbols):
             s += 120
         if "guard" in qlow and any(tok in low for tok in ("if", "while", "assert", "return -1", "error")):

@@ -646,9 +646,9 @@ def proof_obligation_verification_prompt(
             "Answer exactly one narrow proof question using only the provided source-code capsules. "
             "Do not decide the entire vulnerability hypothesis. Do not speculate from missing evidence. "
             "Return proven only when the code directly establishes this exact obligation. Return refuted only when positive source code contradicts this exact obligation. "
-            "For negative safety obligations such as missing_remaining_bound_guard, proven means the required guard is absent; refuted means a concrete dominating guard exists. "
+            "For negative safety obligations such as missing_remaining_bound_guard or missing_pre_advance_bound_guard, proven means the required guard is absent; refuted means a concrete dominating guard exists. "
             "For scaled_state_advance, answer only whether the data-dependent scaled advance exists; do not demand bounds, alignment, or safety evidence. "
-            "For unsafe_continuation_or_accept_path, a next loop iteration or parser-state reuse counts as later use; do not require a separate post-loop dereference. "
+            "For unblocked_unsafe_continuation_or_accept_path, do not merely ask whether the state is reused; decide whether a corrupted advanced state can reach later use without a post-advance invariant such as a saved-base lower-bound guard plus exact-end rejection. "
             "Return partially_proven when the capsule supports the obligation but one sub-element remains missing. Return not_answered when the capsules do not answer it. "
             "Fill supports_hypothesis/refutes_hypothesis if present in the schema. Cite only capsule_id values from the source-code bundle. Never use graph scores, semantic labels, or unstated assumptions as proof."
         )},

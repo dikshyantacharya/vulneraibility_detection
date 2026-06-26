@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any, Iterable, List
+import re
 from .schemas import FinalDecision, FinalPrediction, HypothesisStatus, CounterEvidenceReview
 
 _UNSUPPORTED_COUNTER_STATUSES = {
@@ -44,10 +45,14 @@ def _source_fact_types(evidence_items: Iterable[Any] | None) -> set[str]:
         ft = meta.get("fact_type") if isinstance(meta, dict) else None
         if ft:
             fact_types.add(str(ft))
-        low = text.lower()
+        low = text.lower().replace("`", "")
         if "pointer wraparound guard" in low or "wraparound-to-lower-address" in low:
             fact_types.add("pointer_wraparound_lower_bound_guard")
-        if ("exact-end guard" in low or "exact-end" in low or "exact end" in low) and ("return `-1`" in low or "return -1" in low or "error return" in low):
+        if re.search(r"\b(?:void\s*\*\s*)?start\s*=\s*raw\b", low) and re.search(r"\braw\s*>=\s*start\b|\bstart\s*<=\s*raw\b", low):
+            fact_types.add("pointer_wraparound_lower_bound_guard")
+        if ("exact-end guard" in low or "exact-end" in low or "exact end" in low) and ("return -1" in low or "error return" in low):
+            fact_types.add("exact_end_success_else_error")
+        if re.search(r"if\s*\(\s*raw\s*==\s*end\s*\)\s*return", low) and re.search(r"return\s*-\s*1\s*;", low):
             fact_types.add("exact_end_success_else_error")
         if ft == "exact_end_accept_else_error":
             fact_types.add("exact_end_success_else_error")
@@ -449,6 +454,25 @@ def validate_final_decision(
             notes.append(f"Rejected confirmed hypothesis {h.hypothesis_id}: {residual_reason}.")
             continue
         usable_confirmed.append(h)
+
+    # Carry the strongest accepted proof tier to top-level decision fields so the
+    # dashboard and final_prediction.json cannot lose the controller's proof state.
+    tier_rank = {"confirmed_reachable_vulnerability": 3, "confirmed_source_level_vulnerability": 2, "high_signal_incomplete": 1}
+    strongest_confirmed = None
+    if usable_confirmed:
+        strongest_confirmed = max(usable_confirmed, key=lambda h: tier_rank.get(_proof_tier_of_hypothesis(h), 0))
+        final_tier = _proof_tier_of_hypothesis(strongest_confirmed)
+        final_trust = str(getattr(strongest_confirmed, "trust_boundary_strength", "none") or "none")
+        accepted_ids = [str(h.hypothesis_id) for h in usable_confirmed]
+        if getattr(decision, "final_proof_tier", "unknown") != final_tier:
+            decision.final_proof_tier = final_tier
+            modified = True
+        if getattr(decision, "final_trust_boundary_strength", "none") != final_trust:
+            decision.final_trust_boundary_strength = final_trust
+            modified = True
+        if list(getattr(decision, "accepted_confirmed_hypotheses", []) or []) != accepted_ids:
+            decision.accepted_confirmed_hypotheses = accepted_ids
+            modified = True
 
     # Proof tiers are controller-derived and take precedence over the final
     # adjudicator's conservative fallback.  If a hypothesis completed a confirmed

@@ -233,3 +233,63 @@ def test_missing_guard_inversion_is_fixed_even_when_llm_says_refuted():
     assert normalized.result == "proven"
     assert normalized.supports_hypothesis is True
     assert normalized.refutes_hypothesis is False
+
+
+def test_parser_family_priority_over_callee_return_when_sink_is_scaled_pointer_advance():
+    src = """
+    int count_rows(void *raw, int raw_length, int itemsize) {
+      uint64_t length = read(raw);
+      raw += length * itemsize;
+      return 0;
+    }
+    """
+    hyp = {
+        "hypothesis_id": "HYP-01",
+        "title": "Integer overflow in row length calculation leading to heap buffer overflow",
+        "affected_code_region": "raw += length * itemsize;",
+        "risk_summary": "Does read return values that could cause length * itemsize overflow?",
+    }
+    assert infer_proof_family(hyp, src) == "parser_scaled_pointer_traversal"
+
+
+def test_post_advance_lower_bound_guard_refutes_wraparound_continuation():
+    hyp = {
+        "hypothesis_id": "HYP-01",
+        "title": "parsed length controls raw pointer advance",
+        "affected_code_region": "raw += length * itemsize;",
+        "risk_summary": "length * itemsize can wrap raw below the original buffer",
+    }
+    fixed_src = """
+    int count_rows(void * raw, int raw_length, int length_power, int itemsize) {
+      /* Pre-parse data fed to RaggedArray.loads(). */
+      void * start = raw;
+      void * end = raw + raw_length;
+      while (raw <= end - (1 << length_power) && raw >= start) {
+        uint64_t length = read(raw);
+        raw += (1 << length_power);
+        raw += length * itemsize;
+      }
+      if (raw == end)
+        return rows;
+      return -1;
+    }
+    """
+    obligations = build_proof_obligations(hyp, fixed_src)
+    results = []
+    for o in obligations:
+        if o.required:
+            results.append(ProofObligationVerification(
+                obligation_id=o.obligation_id,
+                hypothesis_id="HYP-01",
+                result="proven",
+                evidence_ids=["TARGET-SOURCE"],
+                explanation=o.name,
+                confidence=0.8,
+            ))
+    ledger = summarize_ledger("HYP-01", "parser_scaled_pointer_traversal", obligations, results, target_source=fixed_src)
+    verification = verification_from_ledger(hyp, ledger)
+    assert ledger.status_hint == "refuted"
+    assert ledger.proof_tier == "refuted"
+    assert "TARGET-SOURCE" in ledger.counter_evidence_ids
+    assert verification["status"] == "refuted_by_guard"
+

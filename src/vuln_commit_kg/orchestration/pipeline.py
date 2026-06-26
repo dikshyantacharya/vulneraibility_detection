@@ -930,6 +930,7 @@ class CommitKGPipeline:
             stop_when_no_new_queries=bool(getattr(ap_cfg, "stop_when_no_new_queries", True)),
             stop_when_all_hypotheses_resolved=bool(getattr(ap_cfg, "stop_when_all_hypotheses_resolved", True)),
             stop_on_confirmed_vulnerability=bool(getattr(ap_cfg, "stop_on_confirmed_vulnerability", True)),
+            audit_mode=str(getattr(ap_cfg, "audit_mode", "binary") or "binary"),
             enable_proof_obligation_ledger=bool(getattr(ap_cfg, "enable_proof_obligation_ledger", True)),
             max_obligations_per_hypothesis=int(getattr(ap_cfg, "max_obligations_per_hypothesis", 8) or 8),
             max_queries_per_obligation=int(getattr(ap_cfg, "max_queries_per_obligation", 3) or 3),
@@ -1449,6 +1450,9 @@ class CommitKGPipeline:
             residual_uncertainty=list(decision.residual_uncertainty or []),
             final_hypothesis_statuses=[h.model_dump(mode="json") if hasattr(h, "model_dump") else dict(h) for h in (decision.final_hypothesis_statuses or [])],
             normalization_warnings=list(decision.normalization_warnings or []),
+            final_proof_tier=getattr(decision, "final_proof_tier", None),
+            final_trust_boundary_strength=getattr(decision, "final_trust_boundary_strength", None),
+            accepted_confirmed_hypotheses=list(getattr(decision, "accepted_confirmed_hypotheses", []) or []),
         )
         pred.raw_response = str(final_json)
         if self.live:

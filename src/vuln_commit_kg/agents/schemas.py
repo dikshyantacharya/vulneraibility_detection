@@ -364,6 +364,9 @@ class Prediction(BaseModel):
     residual_uncertainty: list[str] = Field(default_factory=list)
     final_hypothesis_statuses: list[dict] = Field(default_factory=list)
     normalization_warnings: list[str] = Field(default_factory=list)
+    final_proof_tier: str | None = None
+    final_trust_boundary_strength: str | None = None
+    accepted_confirmed_hypotheses: list[str] = Field(default_factory=list)
 
 
 class AgentTrace(BaseModel):

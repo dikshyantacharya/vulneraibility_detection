@@ -51,6 +51,90 @@ def _make_emergency_fallback_decision(error_msg: str) -> FinalDecision:
     )
 
 
+
+
+def _sync_final_decision_with_controller_verifications(
+    decision: FinalDecision,
+    controller_verifications: Dict[str, Any] | List[Dict[str, Any]] | None,
+) -> tuple[FinalDecision, List[str], bool]:
+    """Overlay final LLM hypothesis statuses with controller proof-state truth.
+
+    Stage 06 is a summarizer/adjudicator, not the owner of proof-tier state.  In
+    earlier runs the LLM kept the confirmed status but dropped fields such as
+    proof_tier, trust_boundary_strength, and accepted_confirmed, producing a
+    confusing report where the controller accepted HYP-01 but the serialized
+    final_hypothesis_statuses said accepted_confirmed=false.  This function uses
+    the per-hypothesis controller objects as the canonical source for those
+    fields and appends missing confirmed hypotheses if Stage 06 omitted them.
+    """
+    if isinstance(controller_verifications, dict):
+        raw_controller = list(controller_verifications.get("verifications") or [])
+    else:
+        raw_controller = list(controller_verifications or [])
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for item in raw_controller:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump(mode="json")
+        if not isinstance(item, dict):
+            continue
+        hid = str(item.get("hypothesis_id") or "").strip()
+        if hid:
+            by_id[hid] = dict(item)
+    if not by_id:
+        return decision, [], False
+
+    notes: List[str] = []
+    modified = False
+    merged: List[HypothesisVerification] = []
+    seen: set[str] = set()
+    for existing in list(decision.final_hypothesis_statuses or []):
+        data = existing.model_dump(mode="json") if hasattr(existing, "model_dump") else dict(existing)
+        hid = str(data.get("hypothesis_id") or "").strip()
+        ctrl = by_id.get(hid)
+        if ctrl:
+            before = {k: data.get(k) for k in ("proof_tier", "trust_boundary_strength", "accepted_confirmed", "status", "confirmed_security_vulnerability")}
+            # Controller proof state is canonical.  Preserve Stage-06 explanatory
+            # text only when the controller lacks it.
+            for key in (
+                "status", "local_risk_present", "confirmed_security_vulnerability",
+                "proof_tier", "trust_boundary_strength", "accepted_confirmed",
+                "supporting_evidence_ids", "counter_evidence_ids", "missing_evidence",
+            ):
+                if key in ctrl:
+                    data[key] = ctrl.get(key)
+            if ctrl.get("proof"):
+                data["proof"] = ctrl.get("proof")
+            if ctrl.get("explanation"):
+                data["explanation"] = ctrl.get("explanation")
+            after = {k: data.get(k) for k in ("proof_tier", "trust_boundary_strength", "accepted_confirmed", "status", "confirmed_security_vulnerability")}
+            if before != after:
+                notes.append(f"synced_final_hypothesis_status {hid}: {before} -> {after}")
+                modified = True
+            seen.add(hid)
+        merged.append(HypothesisVerification.model_validate(data))
+
+    for hid, ctrl in by_id.items():
+        if hid in seen:
+            continue
+        if ctrl.get("status") == HypothesisStatus.confirmed_vulnerability.value or ctrl.get("confirmed_security_vulnerability"):
+            merged.append(HypothesisVerification.model_validate(ctrl))
+            notes.append(f"appended_controller_confirmed_hypothesis {hid} to final_hypothesis_statuses")
+            modified = True
+
+    decision.final_hypothesis_statuses = merged
+    # If any accepted controller hypothesis exists, make the final decision start
+    # from vulnerable before validator tier-mapping.  The validator will still
+    # enforce evidence IDs and counter-review constraints.
+    if any(h.accepted_confirmed and h.confirmed_security_vulnerability for h in merged):
+        if decision.prediction != FinalPrediction.vulnerable or not decision.confirmed_security_vulnerability:
+            decision.prediction = FinalPrediction.vulnerable
+            decision.confirmed_security_vulnerability = True
+            decision.local_risk_present = True
+            decision.confidence = max(float(decision.confidence or 0.0), 0.85)
+            notes.append("promoted_final_decision_from_accepted_controller_hypothesis")
+            modified = True
+    return decision, notes, modified
+
 def _make_fallback_decision_from_verifications(
     error_msg: str,
     verifications: Any,
@@ -333,6 +417,96 @@ def _hypothesis_normalization_signature(h: Dict[str, Any]) -> str:
     return f"{vclass}:{':'.join(sorted(set(flat_ids))[:8])}"
 
 
+
+
+def _canonicalize_hypothesis_for_review(h: Dict[str, Any], target_source: str = "") -> tuple[Dict[str, Any], Dict[str, Any] | None]:
+    """Return a canonical review hypothesis while preserving raw LLM wording.
+
+    The Stage-01 hypothesis is useful for discovery, but it can overstate proof
+    obligations (for example "attacker controls itemsize") or use an imprecise
+    impact class.  Downstream proof-family logic should operate on a concise
+    family-normalized hypothesis while the original text remains available for
+    traceability.
+    """
+    out = dict(h or {})
+    hid = str(out.get("hypothesis_id") or "").strip() or "HYP-UNKNOWN"
+    family = infer_proof_family(out, target_source)
+    changed: list[str] = []
+
+    def keep_raw(field: str) -> None:
+        raw_key = f"raw_{field}"
+        if raw_key not in out and out.get(field) is not None:
+            out[raw_key] = out.get(field)
+
+    for field in ("title", "risk_summary", "attacker_model", "affected_code_region", "vulnerability_class", "required_proof_questions"):
+        keep_raw(field)
+
+    out["proof_family"] = family
+
+    if family == "parser_scaled_pointer_traversal":
+        out["title"] = "Parsed length controls scaled parser pointer advance without remaining-space guard"
+        out["vulnerability_class"] = out.get("vulnerability_class") or "memory safety"
+        out["affected_code_region"] = "raw += length * itemsize;"
+        out["attacker_model"] = (
+            "Malformed serialized/parser input controls the parsed length value; "
+            "itemsize need not itself be attacker-controlled, but no shown invariant may prove "
+            "length * itemsize and the subsequent pointer advance are bounded by remaining input."
+        )
+        out["risk_summary"] = (
+            "A length/count parsed from the raw buffer is multiplied by itemsize and added to the parser state pointer. "
+            "If no dominating guard proves length <= remaining_space / itemsize and prevents product/add overflow, "
+            "the raw pointer can wrap or move outside the intended buffer and be reused by the parser in a later read or accept path."
+        )
+        out["required_proof_questions"] = [
+            "Is a length/count/offset value parsed from the supplied raw buffer?",
+            "Does source context show this raw buffer is parser/deserializer or otherwise malformed external input?",
+            "Does the parsed value control a scaled pointer/index/state advance such as raw += length * itemsize?",
+            "Is there no dominating remaining-space/product-overflow guard before the advance?",
+            "Can the advanced parser state affect a later loop iteration, read/write, dereference, or accept/reject decision?",
+            "Is there any positive caller/callee invariant that fully bounds this dangerous state?",
+        ]
+        changed.append("parser_scaled_pointer_traversal")
+    elif family == "callee_return_signedness_or_value_range":
+        out["title"] = "Callee or function-pointer return value is used as an unchecked size/count"
+        out["affected_code_region"] = out.get("affected_code_region") or "read(raw)"
+        out["risk_summary"] = (
+            "A value returned by a callee or function pointer is interpreted as a size/count/offset and later used in pointer, index, allocation, or copy arithmetic. "
+            "The proof must resolve the callee/dispatch target, establish its signedness or value range, and check whether a post-read range guard dominates the unsafe use."
+        )
+        out["required_proof_questions"] = [
+            "Can the callee/function pointer target be resolved sufficiently to inspect return type or value range?",
+            "Can the returned value become negative, sign-extended, truncated, or otherwise too large after conversion?",
+            "Is the returned value used in pointer/index/size arithmetic or another unsafe sink?",
+            "Is there no dominating post-read range guard before that unsafe use?",
+            "Do concrete callee targets or callers positively bound the returned value to a safe range?",
+        ]
+        changed.append("callee_return_signedness_or_value_range")
+    elif family == "selector_shift_domain_or_dispatch_bounds":
+        out["title"] = "Selector controls shift or dispatch without a proven safe-domain guard"
+        out["affected_code_region"] = out.get("affected_code_region") or "selector-controlled shift/dispatch expression"
+        out["risk_summary"] = (
+            "A selector such as length_power controls a shift, width calculation, array lookup, or function-pointer dispatch. "
+            "The proof must establish selector origin, required safe domain, whether a guard dominates every use, and whether invalid selector values can reach unsafe shift/dispatch or memory access behavior."
+        )
+        out["required_proof_questions"] = [
+            "Where does the selector value come from?",
+            "Which shift, width calculation, dispatch, or lookup does it control?",
+            "What safe domain is required for that operation?",
+            "Does a dominating guard constrain the selector before every unsafe use?",
+            "Can invalid selector values still reach undefined shift, invalid dispatch, wrong-width parse, or memory access?",
+        ]
+        changed.append("selector_shift_domain_or_dispatch_bounds")
+
+    if changed:
+        note = {
+            "hypothesis_id": hid,
+            "action": "canonicalized_for_review",
+            "proof_family": family,
+            "canonical_title": out.get("title"),
+        }
+        return out, note
+    return out, None
+
 def _normalize_hypotheses_for_sequential_review(
     hypotheses: List[Dict[str, Any]],
     target_source: str,
@@ -392,11 +566,16 @@ def _normalize_hypotheses_for_sequential_review(
                 "dropped_hypothesis_id": dropped_id,
             })
     kept = sorted(by_sig.values(), key=score, reverse=True)
+    canonical_kept: List[Dict[str, Any]] = []
     # Re-number only if ids are missing. Preserve original IDs for report continuity.
     for i, h in enumerate(kept, start=1):
         if not str(h.get("hypothesis_id") or "").strip():
             h["hypothesis_id"] = f"HYP-{i:02d}"
-    return kept, notes
+        canon, canon_note = _canonicalize_hypothesis_for_review(h, target_source)
+        canonical_kept.append(canon)
+        if canon_note is not None:
+            notes.append(canon_note)
+    return canonical_kept, notes
 
 def _all_hypotheses_resolved(verifications: Dict[str, Any]) -> bool:
     items = verifications.get("verifications") or []
@@ -1016,6 +1195,10 @@ class AgenticProofConfig:
     max_obligations_per_hypothesis: int = 8
     max_queries_per_obligation: int = 3
     stop_on_confirmed_vulnerability: bool = True
+    # binary: stop after accepted source-level/reachable confirmation.
+    # reachable: stop only after accepted reachable confirmation.
+    # exhaustive: verify all normalized hypotheses even after confirmation.
+    audit_mode: str = "binary"
     # Other
     temperature: float = 0.0
     provider_extra_body: Dict[str, Any] = field(
@@ -1879,8 +2062,18 @@ def run_agentic_proof_pipeline(
                                            "accepted_confirmed": bool(accepted_confirmed_hypotheses and accepted_confirmed_hypotheses[-1] == hyp_id),
                                            "stop_reason": hyp_stop_reason}))
         loop_stop_reason = hyp_stop_reason or loop_stop_reason
+        audit_mode = str(getattr(config, "audit_mode", "binary") or "binary").lower()
+        latest_tier = _proof_tier_of_verification(latest_verification or {})
+        should_stop_for_mode = (
+            audit_mode != "exhaustive"
+            and (
+                audit_mode != "reachable"
+                or latest_tier == "confirmed_reachable_vulnerability"
+            )
+        )
         if (
             config.stop_on_confirmed_vulnerability
+            and should_stop_for_mode
             and accepted_confirmed_hypotheses
             and accepted_confirmed_hypotheses[-1] == hyp_id
         ):
@@ -1889,8 +2082,22 @@ def run_agentic_proof_pipeline(
                 "hypothesis_id": hyp_id,
                 "accepted_confirmed_hypotheses": list(accepted_confirmed_hypotheses),
                 "remaining_hypotheses_skipped": max(0, len(hypotheses_list) - hyp_index),
+                "audit_mode": audit_mode,
+                "proof_tier": latest_tier,
             }))
             break
+        if (
+            config.stop_on_confirmed_vulnerability
+            and accepted_confirmed_hypotheses
+            and accepted_confirmed_hypotheses[-1] == hyp_id
+            and not should_stop_for_mode
+        ):
+            events.append(AgentEvent(sample_id, "02_04_per_hypothesis_loop", "continue_after_confirmation", details={
+                "hypothesis_id": hyp_id,
+                "audit_mode": audit_mode,
+                "proof_tier": latest_tier,
+                "reason": "audit_mode_requires_remaining_hypotheses",
+            }))
 
     query_plan = KGQueryPlan(queries=all_query_models)
     verifications: Dict[str, Any] = {"verifications": final_verification_items}
@@ -2082,9 +2289,13 @@ def run_agentic_proof_pipeline(
             text, FinalDecision,
             llm_repair=_repair_llm(llm_generate, config, sample_id, events, "06_final_adjudication"),
         )
+        decision, sync_notes, sync_modified = _sync_final_decision_with_controller_verifications(decision, verifications)
         decision, notes, modified = validate_final_decision(
             decision, evidence_items=accumulated_evidence, counter_review=counter_review
         )
+        if sync_notes:
+            notes = list(sync_notes) + list(notes)
+        modified = bool(modified or sync_modified)
         events.append(AgentEvent(sample_id, "06_final_adjudication", "validated", details={
             "validator_notes": list(notes), "modified": bool(modified),
             "prediction": decision.prediction.value, "confidence": decision.confidence,
@@ -2136,9 +2347,13 @@ def run_agentic_proof_pipeline(
                 text, FinalDecision,
                 llm_repair=_repair_llm(llm_generate, config, sample_id, events, "07_schema_consistency_repair"),
             )
+            repaired_decision, sync_notes2, sync_modified2 = _sync_final_decision_with_controller_verifications(repaired_decision, verifications)
             decision, notes2, modified2 = validate_final_decision(
                 repaired_decision, evidence_items=accumulated_evidence, counter_review=counter_review
             )
+            if sync_notes2:
+                notes2 = list(sync_notes2) + list(notes2)
+            modified2 = bool(modified2 or sync_modified2)
             notes.extend(notes2)
             events.append(AgentEvent(sample_id, "07_schema_consistency_repair", "validated", details={
                 "validator_notes": list(notes2), "modified": bool(modified2),

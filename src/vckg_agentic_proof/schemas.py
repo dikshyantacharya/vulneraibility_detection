@@ -166,6 +166,10 @@ class FinalDecision(BaseModel):
     loop_stop_reason: Optional[str] = None
     final_decision_source: Optional[str] = None
     normalization_warnings: List[str] = Field(default_factory=list)
+    # Top-level proof-tier summary copied from the strongest accepted hypothesis.
+    final_proof_tier: str = "unknown"
+    final_trust_boundary_strength: str = "none"
+    accepted_confirmed_hypotheses: List[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

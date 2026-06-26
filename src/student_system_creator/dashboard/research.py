@@ -1764,6 +1764,9 @@ class ResearchInventory:
         _kv("confidence", fp.get("confidence") or "—")
         _kv("decision_status", fp.get("decision_status") or "—")
         _kv("evidence_strength", fp.get("evidence_strength") or "—")
+        _kv("final_proof_tier", fp.get("final_proof_tier") or "—")
+        _kv("final_trust_boundary_strength", fp.get("final_trust_boundary_strength") or "—")
+        _kv("accepted_confirmed_hypotheses", fp.get("accepted_confirmed_hypotheses") or "—")
         _kv("forced_prediction_bool", fp.get("forced_prediction_bool") if fp.get("forced_prediction_bool") is not None else "—")
         _kv("why_forced_binary", fp.get("why_forced_binary") or "—")
         commit_msg = sample_json.get("commit_message")
@@ -1807,6 +1810,9 @@ class ResearchInventory:
             _sec("FINAL VALIDATOR / BINARY NORMALIZATION")
             _kv("decision_status", fp.get("decision_status") or "—")
             _kv("evidence_strength", fp.get("evidence_strength") or "—")
+            _kv("final_proof_tier", fp.get("final_proof_tier") or "—")
+            _kv("final_trust_boundary_strength", fp.get("final_trust_boundary_strength") or "—")
+            _kv("accepted_confirmed_hypotheses", fp.get("accepted_confirmed_hypotheses") or "—")
             _kv("forced_prediction", fp.get("forced_prediction") or "—")
             _kv("forced_prediction_bool", fp.get("forced_prediction_bool") if fp.get("forced_prediction_bool") is not None else "—")
             _kv("why_forced_binary", fp.get("why_forced_binary") or "—")
@@ -1867,8 +1873,12 @@ class ResearchInventory:
                     miss = h.get("missing_evidence") or []
                     support = h.get("supporting_evidence_ids") or []
                     counter = h.get("counter_evidence_ids") or []
+                    tier = h.get("proof_tier") or "—"
+                    trust = h.get("trust_boundary_strength") or "—"
+                    accepted = h.get("accepted_confirmed")
                     lines.append(
                         f"    {hid}: status={status} confirmed={confirmed} local_risk={local} "
+                        f"tier={tier} trust={trust} accepted={accepted} "
                         f"missing={len(miss)} supporting={support[:5]} counter={counter[:5]}"
                     )
                     expl = str(h.get("explanation") or "").strip()

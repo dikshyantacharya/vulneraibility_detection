@@ -61,3 +61,50 @@ def test_final_validator_maps_source_level_tier_to_confirmed_source_level_status
     assert decision.evidence_strength == "confirmed_source_level"
     assert decision.forced_prediction_bool is True
     assert decision.confirmed_security_vulnerability is True
+
+from vckg_agentic_proof.adapter import _sync_final_decision_with_controller_verifications, AgenticProofConfig
+from vckg_agentic_proof.adapter import _normalize_hypotheses_for_sequential_review
+
+
+def test_final_decision_sync_preserves_controller_proof_tier_fields():
+    controller = _confirmed_source_verification()
+    stale = {**controller, "proof_tier": "unknown", "trust_boundary_strength": "none", "accepted_confirmed": False}
+    decision = FinalDecision(
+        prediction=FinalPrediction.vulnerable,
+        confidence=0.8,
+        local_risk_present=True,
+        confirmed_security_vulnerability=True,
+        final_hypothesis_statuses=[HypothesisVerification.model_validate(stale)],
+        explanation="Stage 06 dropped typed controller state.",
+    )
+    synced, notes, modified = _sync_final_decision_with_controller_verifications(decision, {"verifications": [controller]})
+    h = synced.final_hypothesis_statuses[0]
+    assert modified is True
+    assert h.proof_tier == "confirmed_source_level_vulnerability"
+    assert h.trust_boundary_strength == "source_level"
+    assert h.accepted_confirmed is True
+    assert any("synced_final_hypothesis_status" in n for n in notes)
+
+
+def test_normalizer_rewrites_parser_pointer_hypothesis_to_canonical_review_text():
+    raw = [{
+        "hypothesis_id": "HYP-01",
+        "title": "Integer overflow in row-length calculation enables out-of-bounds read/write",
+        "vulnerability_class": "memory safety",
+        "affected_code_region": "raw += length * itemsize;",
+        "attacker_model": "Attacker controls length and itemsize",
+        "risk_summary": "If length * itemsize overflows, raw advances incorrectly.",
+        "required_proof_questions": ["is itemsize attacker controlled?"],
+    }]
+    src = "uint64_t length = read(raw); raw += length * itemsize;"
+    normalized, notes = _normalize_hypotheses_for_sequential_review(raw, src)
+    h = normalized[0]
+    assert h["proof_family"] == "parser_scaled_pointer_traversal"
+    assert "raw_title" in h
+    assert "itemsize need not itself be attacker-controlled" in h["attacker_model"]
+    assert any(n.get("action") == "canonicalized_for_review" for n in notes)
+
+
+def test_agentic_config_exposes_exhaustive_audit_mode():
+    cfg = AgenticProofConfig(audit_mode="exhaustive")
+    assert cfg.audit_mode == "exhaustive"

@@ -52,13 +52,26 @@ def infer_proof_family(hypothesis: Dict[str, Any], target_source: str = "") -> s
     b = _blob(hypothesis)
     src = (target_source or "").lower()
 
-    # Specific families before broad parser traversal.
-    if re.search(r"signed|negative|sign[- ]?extend|uint64_t\s+length\s*=\s*read|return value|read\s*\(\s*raw\s*\).*uint64", b):
-        return "callee_return_signedness_or_value_range"
+    # Sink/root-cause signatures have priority over secondary implementation
+    # details.  If the hypothesis points at a parsed-length scaled pointer/state
+    # advance, classify it as parser traversal even when the value is obtained
+    # through a callee/function pointer.  Callee-return resolution then becomes
+    # optional counter-evidence for that family rather than the main proof.
+    parser_sink = re.search(
+        r"raw\s*\+=\s*length\s*\*\s*itemsize|length\s*\*\s*itemsize|"
+        r"scaled.*pointer|pointer.*travers|pointer.*advance|parser.*pointer",
+        b,
+    )
+    if parser_sink:
+        return "parser_scaled_pointer_traversal"
+
+    # Selector/dispatch/shift hypotheses are distinct from parser payload-length
+    # traversal unless the main sink above was present.
     if re.search(r"1\s*<<\s*length_power|length_power|shift|selector|dispatch|function pointer|choose_int_read|choose_", b):
         return "selector_shift_domain_or_dispatch_bounds"
-    if re.search(r"raw\s*\+=\s*length\s*\*\s*itemsize|length\s*\*\s*itemsize|scaled.*pointer|pointer.*travers", b):
-        return "parser_scaled_pointer_traversal"
+
+    if re.search(r"signed|negative|sign[- ]?extend|uint64_t\s+length\s*=\s*read|return value|read\s*\(\s*raw\s*\).*uint64", b):
+        return "callee_return_signedness_or_value_range"
     if re.search(r"raw_length|end\s*=|extent|buffer length", b):
         return "buffer_extent_or_signed_length"
     if re.search(r"malloc|calloc|realloc|free|lifetime|null", b):
@@ -108,9 +121,9 @@ def build_proof_obligations(hypothesis: Dict[str, Any], target_source: str = "")
             po(1, "parsed_value_from_buffer", "Does the code show a length/count/offset value read or parsed from the supplied buffer/pointer? This does not require proving external attacker control.", ["length", "raw", "read"], True, "assignment from read/callee using raw"),
             po(2, "trust_boundary_or_external_input", "Does caller/context/comment/source code show the buffer may represent external, serialized, file, network, user, or otherwise malformed input?", ["raw", "raw_length", "loads", "load"], True, "caller or public parser entry point showing external serialized data"),
             po(3, "scaled_state_advance", "Does that parsed/malformed value control a scaled pointer/index/state advance? Only decide whether the data-dependent advance exists; do not judge whether it is safe.", ["length", "itemsize", "raw"], True, "raw += length * itemsize or equivalent"),
-            po(4, "missing_remaining_bound_guard", "Does the code establish that the required safety guard is missing before the state advance? For this negative safety obligation: answer proven when no dominating remaining-space/product-overflow guard exists; answer refuted only if a positive dominating guard proves value <= remaining_space / scale and prevents product/add overflow.", ["length", "itemsize", "raw", "end", "raw_length"], True, "guard/slice around dangerous advance"),
-            po(5, "unsafe_continuation_or_accept_path", "After the pointer/index/state is advanced, can the same parser state influence a next loop iteration, next read/write, dereference, or final accept/reject decision? A next-iteration read in the same loop counts as later use.", ["raw", "read", "while", "end"], True, "loop continuation, next-iteration read, or later accept path after advance"),
-            po(6, "counter_guard_or_caller_constraint", "Is there positive source evidence from callers/callees/definitions that makes the dangerous state unreachable or fully bounded?", ["raw_length", "itemsize", "length_power", "choose_int_read"], False, "caller/callee constraints or guards", "refutes_hypothesis"),
+            po(4, "missing_remaining_bound_guard", "Does the code establish that no dominating pre-advance guard bounds the scaled advance before the state update? For this negative safety obligation: answer proven when no pre-advance remaining-space/product-overflow guard exists; answer refuted only if a positive dominating guard proves value <= remaining_space / scale and prevents product/add overflow before the update.", ["length", "itemsize", "raw", "end", "raw_length"], True, "pre-advance guard/slice around dangerous advance"),
+            po(5, "unsafe_continuation_or_accept_path", "After the pointer/index/state is advanced, can a corrupted advanced state reach the next loop iteration, next read/write, dereference, or final accept path without being blocked by a post-advance state invariant? A next-iteration read counts as later use only if no relevant guard blocks the corrupted state before that use.", ["raw", "start", "read", "while", "end"], True, "loop continuation, next-iteration read, post-advance state guard, or final accept/reject path"),
+            po(6, "counter_guard_or_caller_constraint", "Is there positive source evidence from the target function, callers, callees, or definitions that makes the dangerous state unreachable or fully bounded, including post-advance lower/upper-bound state guards before the next use?", ["raw_length", "itemsize", "length_power", "start", "end", "choose_int_read"], False, "target-local/caller/callee constraints or guards", "refutes_hypothesis"),
             po(7, "callee_value_range", "If the parsed value comes from a callee or function pointer, does the resolver/callee/dispatch target bound the returned value sufficiently for the dangerous operation?", ["read", "choose_int_read", "_choose_int_read_write", "int_readers", "length_power", "big_endian"], False, "callee, resolver, dispatch table, or concrete target code", "refutes_hypothesis"),
         ]
 
@@ -179,11 +192,11 @@ def obligation_queries(sample: Dict[str, Any], hypothesis: Dict[str, Any], oblig
     elif name in {"scaled_state_advance", "dangerous_operation", "unsafe_extent_use", "shift_or_dispatch_expression", "unsafe_use_after_conversion"}:
         stmt = region or " ".join(syms[:3]) or fn
         add(1, f"Exact source slice for dangerous operation in {name}", f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=4, data_depth=4, control_depth=3, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=450)', syms[:3])
-    elif name in {"missing_remaining_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard", "missing_post_read_range_check"}:
+    elif name in {"missing_remaining_bound_guard", "missing_pre_advance_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard", "missing_post_read_range_check"}:
         stmt = region or ("while" if "while" in syms else "guard")
         add(1, f"Guard-dominance slice for {name}", f'evidence_slice(target_function="{fn}", target_statement="{stmt}", relation_depth=4, data_depth=4, control_depth=4, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=520)', syms[:3])
         add(2, f"Semantic guard facts for {name}", f'semantic_facts(target_function="{fn}")')
-    elif name in {"unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact", "unsafe_effect_of_invalid_selector"}:
+    elif name in {"unsafe_continuation_or_accept_path", "unblocked_unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact", "unsafe_effect_of_invalid_selector"}:
         add(1, f"Loop/body and outgoing use context for {name}", f'evidence_slice(target_function="{fn}", target_statement="while", relation_depth=4, data_depth=4, control_depth=4, call_depth=2, include_defs=true, include_uses=true, include_guards=true, include_callees=true, include_headers=true, include_globals=true, max_nodes=520)')
         add(2, f"Outgoing callees and helper behavior for {name}", f'call_neighborhood(target_function="{fn}", direction="out", call_depth=3)')
     elif name in {"counter_guard_or_caller_constraint", "counter_constraint", "positive_counter_evidence", "counter_selector_constraint", "counter_callee_bounds_return_value"}:
@@ -207,6 +220,7 @@ def obligation_queries(sample: Dict[str, Any], hypothesis: Dict[str, Any], oblig
 
 _ABSENCE_SUPPORT_NAMES = {
     "missing_remaining_bound_guard",
+    "missing_pre_advance_bound_guard",
     "missing_guard_or_invariant",
     "missing_domain_guard",
     "missing_post_read_range_check",
@@ -229,8 +243,25 @@ _TRUST_BOUNDARY_SOURCE_MARKERS = (
 )
 _CALLER_PROVEN_MARKERS = (
     "caller", "public", "api", "python", "binding", "entry", "exposed",
-    "file", "network", "user", "ipc", "socket", "request",
+    "network", "user", "ipc", "socket", "request",
 )
+
+
+def _has_post_advance_wraparound_state_guard(text: str) -> bool:
+    """Generic parser-state safety pattern for wraparound/backward traversal.
+
+    A pre-advance product guard is not the only valid safety evidence.  Some
+    parsers save the original state pointer and require the updated state to be
+    at/above that base before the next read/use.  Combined with an exact-end
+    success check and error return, this is counter-evidence for the classic
+    wraparound-to-lower-address parser traversal bug.
+    """
+    low = (text or "").lower().replace("`", "")
+    has_start_assignment = bool(re.search(r"\b(?:void\s*\*\s*)?start\s*=\s*raw\b", low))
+    has_lower_bound_guard = bool(re.search(r"\braw\s*>=\s*start\b|\bstart\s*<=\s*raw\b", low))
+    has_exact_end_accept = bool(re.search(r"if\s*\(\s*raw\s*==\s*end\s*\)\s*return", low))
+    has_error_reject = bool(re.search(r"return\s*-\s*1\s*;|valueerror|error return|return\s+null", low))
+    return has_start_assignment and has_lower_bound_guard and has_exact_end_accept and has_error_reject
 
 
 def _has_parser_trust_boundary_marker(text: str) -> bool:
@@ -259,11 +290,21 @@ def _trust_boundary_strength(result: ProofObligationVerification, *, target_sour
     low = text.lower().replace("`", "")
     if result.refutes_hypothesis:
         return "refuted"
-    caller_negative_markers = ("missing caller", "no caller", "absent caller", "without caller", "direct caller code is missing", "caller code is missing", "no capsule confirms", "not confirm")
+    caller_negative_markers = (
+        "missing caller", "no caller", "absent caller", "without caller",
+        "direct caller code is missing", "caller code is missing", "no capsule confirms",
+        "not confirm", "no direct evidence", "direct evidence", "explicit trust boundary evidence is missing",
+        "unclear trust boundary", "strongly implying external input", "likely external",
+    )
+    caller_positive = any(m in low for m in (
+        "caller passes", "caller supplies", "called by", "public api", "python binding",
+        "entry point", "exposed api", "api receives", "function receives", "loads(buffer",
+    ))
+    external_positive = any(m in low for m in ("untrusted", "user", "network", "socket", "request", "file input", "external buffer", "external serialized"))
     if (
         not any(m in low for m in caller_negative_markers)
-        and any(m in low for m in _CALLER_PROVEN_MARKERS)
-        and any(m in low for m in ("external", "untrusted", "user", "file", "network", "public", "api", "binding", "caller"))
+        and caller_positive
+        and external_positive
     ):
         if result.result in {ProofObligationStatus.proven, ProofObligationStatus.partially_proven}:
             return "caller_proven"
@@ -384,13 +425,18 @@ def normalize_obligation_result(
             elif result.result == ProofObligationStatus.partially_proven:
                 set_result(ProofObligationStatus.proven, "trust_boundary:source_level_parser_deserializer_context")
                 data["missing_evidence"] = []
-    elif name == "unsafe_continuation_or_accept_path":
+    elif name in {"unsafe_continuation_or_accept_path", "unblocked_unsafe_continuation_or_accept_path"}:
         # A parser loop that reads from raw at the top and advances raw in the body
-        # can use the advanced state on the next iteration if the loop condition is
-        # still satisfied. This is a valid continuation/use path even without a
-        # separate post-loop dereference.
-        if "while" in low_src and re.search(r"read\s*\(\s*raw\s*\)", src) and re.search(r"raw\s*\+=", src):
-            set_result(ProofObligationStatus.proven, "deterministic_pattern:loop_state_next_iteration_use")
+        # can use the advanced state on the next iteration only if no target-local
+        # state invariant blocks the corrupted/wrapped state before that next use.
+        # The generic fixed-pattern is: save start=raw, require raw>=start in the
+        # loop condition, and accept only exact raw==end, otherwise return error.
+        if _has_post_advance_wraparound_state_guard(src):
+            set_result(ProofObligationStatus.refuted, "state_transition_guard:post_advance_lower_bound_plus_exact_end_reject_refutes_wraparound_continuation")
+            data["counter_evidence_ids"] = list(dict.fromkeys((data.get("counter_evidence_ids") or []) + ["TARGET-SOURCE"]))
+            data["missing_evidence"] = []
+        elif "while" in low_src and re.search(r"read\s*\(\s*raw\s*\)", src) and re.search(r"raw\s*\+=", src):
+            set_result(ProofObligationStatus.proven, "deterministic_pattern:loop_state_next_iteration_use_without_post_advance_guard")
             data["missing_evidence"] = [
                 m for m in data.get("missing_evidence", [])
                 if "post-loop" in str(m).lower()
@@ -398,6 +444,12 @@ def normalize_obligation_result(
     elif name == "unsafe_effect_of_invalid_selector":
         if re.search(r"1\s*<<\s*length_power", src) or "choose_int_read" in src:
             set_result(ProofObligationStatus.proven, "deterministic_pattern:selector_influences_shift_or_dispatch_use")
+
+    if name in {"counter_guard_or_caller_constraint", "positive_counter_evidence", "counter_constraint"}:
+        if _has_post_advance_wraparound_state_guard(src):
+            set_result(ProofObligationStatus.proven, "counter_evidence:post_advance_lower_bound_guard_plus_exact_end_reject")
+            data["counter_evidence_ids"] = list(dict.fromkeys((data.get("counter_evidence_ids") or []) + ["TARGET-SOURCE"]))
+            data["missing_evidence"] = []
 
     # 3) Infer default support/refutation from polarity and final result.
     final_result = ProofObligationStatus(data.get("result"))
@@ -493,7 +545,7 @@ def summarize_ledger(
             proof_tier = "confirmed_reachable_vulnerability"
         else:
             proof_tier = "confirmed_reachable_vulnerability"
-    elif required_proven >= 3 and any(o.name in {"missing_remaining_bound_guard", "missing_guard_or_invariant", "missing_domain_guard"} and (by_oid.get(o.obligation_id) and by_oid[o.obligation_id].supports_hypothesis) for o in obligations):
+    elif required_proven >= 3 and any(o.name in {"missing_remaining_bound_guard", "missing_pre_advance_bound_guard", "missing_guard_or_invariant", "missing_domain_guard"} and (by_oid.get(o.obligation_id) and by_oid[o.obligation_id].supports_hypothesis) for o in obligations):
         # Useful diagnostic state: strong local chain but one high-level context
         # element, often trust-boundary/callee details, is still missing.
         status_hint = "high_signal_incomplete"
@@ -550,7 +602,7 @@ def verification_from_ledger(hypothesis: Dict[str, Any], ledger: HypothesisProof
                     parts.append(r.explanation or o.name)
         return "; ".join(parts)[:650]
 
-    unsafe_text = explain(["unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact"])
+    unsafe_text = explain(["unsafe_continuation_or_accept_path", "unblocked_unsafe_continuation_or_accept_path", "unsafe_use_after_bad_selector", "reachable_unsafe_use_or_impact"])
     impact_text = "; ".join([
         r.explanation for r in ledger.obligation_results
         if r.result == ProofObligationStatus.proven
@@ -566,7 +618,7 @@ def verification_from_ledger(hypothesis: Dict[str, Any], ledger: HypothesisProof
     proof = MinimumVulnerabilityProof(
         input_control=explain(["parsed_value_from_buffer", "trust_boundary_or_external_input", "parsed_value_origin", "value_or_object_origin", "selector_origin", "extent_origin"]),
         dangerous_operation=explain(["scaled_state_advance", "dangerous_operation", "unsafe_extent_use"]),
-        missing_or_failed_guard=explain(["missing_remaining_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard"]),
+        missing_or_failed_guard=explain(["missing_remaining_bound_guard", "missing_pre_advance_bound_guard", "missing_guard_or_invariant", "missing_domain_guard", "domain_guard", "extent_guard"]),
         unsafe_use=unsafe_text,
         security_impact=impact_text,
         cited_evidence_ids=ledger.supporting_evidence_ids[:20],
