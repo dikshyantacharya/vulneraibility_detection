@@ -24,7 +24,7 @@ def statement_metrics(samples: Sequence[SecVulEvalSample], preds: Sequence[Predi
         p = pred_by_id.get(s.sample_id)
         if not p:
             continue
-        gold = split_gold_statements(s.changed_statements)
+        gold = split_gold_statements(getattr(s, "changed_statements", None))
         pred = [vs.statement or "" for vs in p.vuln_statements if vs.statement]
         sample_matched = 0
         used_pred = set()

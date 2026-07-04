@@ -118,6 +118,7 @@ class SecVulEvalSample(BaseModel):
     is_vulnerable: bool = False
     cve_list: list[str] = Field(default_factory=list)
     cwe_list: list[str] = Field(default_factory=list)
+    changed_statements: str | None = None
 
     @model_validator(mode="before")
     @classmethod
